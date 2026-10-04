@@ -1,0 +1,19 @@
+{
+  "scope": "portable metadata refresh, no native rendering or SSH",
+  "cases": {
+    "1000": {
+      "median_seconds": {
+        "original": 0.004329379997216165,
+        "model": 0.0017181699979119003
+      },
+      "speedup": 2.5197623066854153
+    },
+    "20000": {
+      "median_seconds": {
+        "original": 0.08334895999869332,
+        "model": 0.0209342599962838
+      },
+      "speedup": 3.9814619677738423
+    }
+  }
+}

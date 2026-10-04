@@ -1,0 +1,2 @@
+# Preserve deployment bytes so manifest SHA-256 checksums survive Git checkout.
+* -text

@@ -1,0 +1,11 @@
+{
+  "scope": "hidden Tk widget microbenchmark; no visible frame-rate or SSH claim",
+  "tabs": 12,
+  "rebuilds": 20,
+  "repeats": 5,
+  "median_ms": {
+    "recreate": 977.0834000082687,
+    "retained": 128.4628000576049
+  },
+  "speedup": 7.60596374647079
+}

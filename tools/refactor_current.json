@@ -1,0 +1,331 @@
+{
+  "duplicate_tree_files": [],
+  "largest_modules": [
+    {
+      "classes": 4,
+      "functions": 26,
+      "lines": 1723,
+      "methods": 45,
+      "parse_error": false,
+      "path": "WinUx/platform/native_dialog_host.py"
+    },
+    {
+      "classes": 12,
+      "functions": 27,
+      "lines": 1693,
+      "methods": 44,
+      "parse_error": false,
+      "path": "WinUx/dialogs/modern.py"
+    },
+    {
+      "classes": 1,
+      "functions": 2,
+      "lines": 1563,
+      "methods": 59,
+      "parse_error": false,
+      "path": "WinUx/view.py"
+    },
+    {
+      "classes": 1,
+      "functions": 1,
+      "lines": 1545,
+      "methods": 197,
+      "parse_error": false,
+      "path": "WinUx/controller.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 1527,
+      "methods": 59,
+      "parse_error": false,
+      "path": "WinUx/ui/splitter_layout.py"
+    },
+    {
+      "classes": 1,
+      "functions": 5,
+      "lines": 1498,
+      "methods": 85,
+      "parse_error": false,
+      "path": "WinUx/components/explorer_list_view.py"
+    },
+    {
+      "classes": 2,
+      "functions": 1,
+      "lines": 1069,
+      "methods": 71,
+      "parse_error": false,
+      "path": "WinUx/services/server_notepad_process.py"
+    },
+    {
+      "classes": 4,
+      "functions": 0,
+      "lines": 887,
+      "methods": 28,
+      "parse_error": false,
+      "path": "WinUx/services/remote_transfer.py"
+    },
+    {
+      "classes": 2,
+      "functions": 0,
+      "lines": 880,
+      "methods": 59,
+      "parse_error": false,
+      "path": "WinUx/components/file_panel.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 848,
+      "methods": 58,
+      "parse_error": false,
+      "path": "WinUx/services/server_notepad_editor.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 834,
+      "methods": 26,
+      "parse_error": false,
+      "path": "WinUx/components/explorer_rendering.py"
+    },
+    {
+      "classes": 2,
+      "functions": 1,
+      "lines": 816,
+      "methods": 69,
+      "parse_error": false,
+      "path": "WinUx/dialogs/console_form.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 800,
+      "methods": 31,
+      "parse_error": false,
+      "path": "WinUx/ui/plot_docking.py"
+    },
+    {
+      "classes": 2,
+      "functions": 0,
+      "lines": 779,
+      "methods": 33,
+      "parse_error": false,
+      "path": "WinUx/components/dock_widget.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 778,
+      "methods": 37,
+      "parse_error": false,
+      "path": "WinUx/components/job_plots.py"
+    },
+    {
+      "classes": 2,
+      "functions": 1,
+      "lines": 769,
+      "methods": 35,
+      "parse_error": false,
+      "path": "WinUx/server_model.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 751,
+      "methods": 41,
+      "parse_error": false,
+      "path": "WinUx/components/dock_manager.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 745,
+      "methods": 31,
+      "parse_error": false,
+      "path": "WinUx/services/remote_jobs.py"
+    },
+    {
+      "classes": 3,
+      "functions": 5,
+      "lines": 730,
+      "methods": 14,
+      "parse_error": false,
+      "path": "WinUx/components/shared_scroller.py"
+    },
+    {
+      "classes": 2,
+      "functions": 0,
+      "lines": 689,
+      "methods": 22,
+      "parse_error": false,
+      "path": "WinUx/components/explorer_rename_textbox.py"
+    }
+  ],
+  "most_methods": [
+    {
+      "classes": 1,
+      "functions": 1,
+      "lines": 1545,
+      "methods": 197,
+      "parse_error": false,
+      "path": "WinUx/controller.py"
+    },
+    {
+      "classes": 1,
+      "functions": 5,
+      "lines": 1498,
+      "methods": 85,
+      "parse_error": false,
+      "path": "WinUx/components/explorer_list_view.py"
+    },
+    {
+      "classes": 2,
+      "functions": 1,
+      "lines": 1069,
+      "methods": 71,
+      "parse_error": false,
+      "path": "WinUx/services/server_notepad_process.py"
+    },
+    {
+      "classes": 2,
+      "functions": 1,
+      "lines": 816,
+      "methods": 69,
+      "parse_error": false,
+      "path": "WinUx/dialogs/console_form.py"
+    },
+    {
+      "classes": 17,
+      "functions": 0,
+      "lines": 376,
+      "methods": 62,
+      "parse_error": false,
+      "path": "WinUx/dialogs/floating_adapters.py"
+    },
+    {
+      "classes": 1,
+      "functions": 2,
+      "lines": 1563,
+      "methods": 59,
+      "parse_error": false,
+      "path": "WinUx/view.py"
+    },
+    {
+      "classes": 2,
+      "functions": 0,
+      "lines": 880,
+      "methods": 59,
+      "parse_error": false,
+      "path": "WinUx/components/file_panel.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 1527,
+      "methods": 59,
+      "parse_error": false,
+      "path": "WinUx/ui/splitter_layout.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 848,
+      "methods": 58,
+      "parse_error": false,
+      "path": "WinUx/services/server_notepad_editor.py"
+    },
+    {
+      "classes": 4,
+      "functions": 26,
+      "lines": 1723,
+      "methods": 45,
+      "parse_error": false,
+      "path": "WinUx/platform/native_dialog_host.py"
+    },
+    {
+      "classes": 12,
+      "functions": 27,
+      "lines": 1693,
+      "methods": 44,
+      "parse_error": false,
+      "path": "WinUx/dialogs/modern.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 751,
+      "methods": 41,
+      "parse_error": false,
+      "path": "WinUx/components/dock_manager.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 778,
+      "methods": 37,
+      "parse_error": false,
+      "path": "WinUx/components/job_plots.py"
+    },
+    {
+      "classes": 3,
+      "functions": 0,
+      "lines": 409,
+      "methods": 37,
+      "parse_error": false,
+      "path": "WinUx/dialogs/logic/transfer.py"
+    },
+    {
+      "classes": 2,
+      "functions": 1,
+      "lines": 769,
+      "methods": 35,
+      "parse_error": false,
+      "path": "WinUx/server_model.py"
+    },
+    {
+      "classes": 2,
+      "functions": 0,
+      "lines": 779,
+      "methods": 33,
+      "parse_error": false,
+      "path": "WinUx/components/dock_widget.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 745,
+      "methods": 31,
+      "parse_error": false,
+      "path": "WinUx/services/remote_jobs.py"
+    },
+    {
+      "classes": 1,
+      "functions": 0,
+      "lines": 800,
+      "methods": 31,
+      "parse_error": false,
+      "path": "WinUx/ui/plot_docking.py"
+    },
+    {
+      "classes": 1,
+      "functions": 1,
+      "lines": 629,
+      "methods": 30,
+      "parse_error": false,
+      "path": "WinUx/dialogs/server_notepad_dialog.py"
+    },
+    {
+      "classes": 6,
+      "functions": 0,
+      "lines": 197,
+      "methods": 30,
+      "parse_error": false,
+      "path": "WinUx/widgets/controls.py"
+    }
+  ],
+  "python_files": 201,
+  "python_lines": 51848,
+  "test_modules": 85,
+  "version": "1.6.10"
+}

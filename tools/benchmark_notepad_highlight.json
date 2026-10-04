@@ -1,0 +1,12 @@
+{
+  "scope": "100 repeated identical viewport passes; Python boundary, no Tk render/IPC",
+  "without_snapshot_cache": {
+    "median_seconds": 0.125762699986808,
+    "tag_writes": 50700
+  },
+  "with_snapshot_cache": {
+    "median_seconds": 0.0016262000426650047,
+    "tag_writes": 507
+  },
+  "write_reduction_percent": 99.0
+}

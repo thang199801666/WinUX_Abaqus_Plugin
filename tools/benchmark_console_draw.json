@@ -1,0 +1,21 @@
+{
+  "scope": "native DPG item dispatch with injected viewport metrics; no GPU frames or SSH",
+  "updates": 60,
+  "transcript_lines": 100,
+  "repeats": 5,
+  "median_ms": {
+    "repaint_on_blink": 15.022099949419498,
+    "caret_only": 2.135500079020858
+  },
+  "calls": {
+    "repaint_on_blink": {
+      "text_creations": 1080,
+      "deletions": 1080
+    },
+    "caret_only": {
+      "text_creations": 0,
+      "deletions": 0
+    }
+  },
+  "speedup": 7.034464712502956
+}
