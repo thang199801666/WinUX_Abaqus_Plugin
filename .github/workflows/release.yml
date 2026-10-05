@@ -1,0 +1,46 @@
+name: Publish WinUx Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install pytest
+      - name: Run portable updater tests
+        run: python -m pytest tests/test_winux_child_update.py tests/test_winux_shared_launcher.py tests/test_github_update_provider_phase17.py tests/test_github_release_integration.py tests/test_versioned_install_phase18.py tests/test_phase20_public_github_cache_quarantine.py tests/test_phase21_update_policy_diagnostics.py -q
+      - name: Validate release tag matches pinned product version
+        shell: pwsh
+        run: |
+          $version = (Get-Content VERSION).Trim()
+          $expected = "v$version"
+          if ($env:GITHUB_REF_NAME -ne $expected) {
+            throw "Release tag $env:GITHUB_REF_NAME does not match pinned VERSION $expected. Update VERSION only when an explicit product-version change is requested."
+          }
+      - name: Validate source
+        run: python -m compileall -q .
+      - name: Build FULL package
+        shell: pwsh
+        run: |
+          python tools/build_github_release.py . --output-dir "$env:RUNNER_TEMP/winux-release" --tag "$env:GITHUB_REF_NAME"
+          if ($LASTEXITCODE -ne 0) { throw "WinUx release packaging failed." }
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            ${{ runner.temp }}/winux-release/WinUx_*_FULL.zip
+            ${{ runner.temp }}/winux-release/WinUx_*_FULL.zip.sha256
+            ${{ runner.temp }}/winux-release/winux-release.json

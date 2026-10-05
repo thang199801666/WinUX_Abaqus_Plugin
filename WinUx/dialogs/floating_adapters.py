@@ -119,7 +119,24 @@ class ODBXYResultDialog(FloatingDialogController):
 
 class SettingsDialog(FloatingDialogController):
     def __init__(self, view):
-        super().__init__(view, "settings", "Settings", width=700, height=440, modal=True)
+        super().__init__(view, "settings", "Settings", width=760, height=520, modal=True)
+
+    def handle_event(self, event, message):
+        if event != "install_update":
+            return
+        import os
+        from winux_launcher import launch_winux
+        project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+        def worker():
+            try:
+                launch_winux(project_dir=project_dir, existing_pid=os.getpid(), install_update=True)
+            except Exception as exc:
+                self.post("update_launch_failed", str(exc))
+            else:
+                self.view.after(0, self.destroy)
+
+        threading.Thread(target=worker, name="winux-install-update", daemon=True).start()
 
 
 class DiagnosticsDialog(FloatingDialogController):
@@ -226,7 +243,7 @@ class LocalFolderDialog(ResultDialog):
         super().__init__(
             view, "local_folder", "Open Folder",
             {"initial": str(initial or "")},
-            width=560, height=430, modal=True, resizable=True,
+            width=780, height=500, modal=True, resizable=True,
         )
 
 

@@ -90,7 +90,7 @@ class WinUXView(
     # Compatibility value retained for older integrations; no longer used by
     # the Local/Server splitter implementation.
     FILE_PANEL_SPLITTER_HIT_PADDING = 6
-    FILE_STATUS_HEIGHT = 22
+    FILE_STATUS_HEIGHT = 20
     APP_PADDING = 4
     DOCK_SNAP_DISTANCE = 56
 
@@ -273,8 +273,17 @@ class WinUXView(
                 dpg.add_theme_color(dpg.mvThemeCol_ResizeGrip, (0, 0, 0, 0))
                 dpg.add_theme_color(dpg.mvThemeCol_ResizeGripHovered, (0, 0, 0, 0))
                 dpg.add_theme_color(dpg.mvThemeCol_ResizeGripActive, (0, 0, 0, 0))
-                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 8)
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, QtFusionPalette.WINDOW)
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBg, QtFusionPalette.TITLE)
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, QtFusionPalette.TITLE_ACTIVE)
+                dpg.add_theme_color(dpg.mvThemeCol_TitleBgCollapsed, QtFusionPalette.TITLE)
+                dpg.add_theme_color(dpg.mvThemeCol_Text, QtFusionPalette.TEXT)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 1)
                 dpg.add_theme_style(dpg.mvStyleVar_WindowBorderSize, 1)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
+                title_align = getattr(dpg, "mvStyleVar_WindowTitleAlign", None)
+                if title_align is not None:
+                    dpg.add_theme_style(title_align, 0.0, 0.5)
 
         with dpg.window(
             tag="winux_primary", label="WinUX",
@@ -738,19 +747,19 @@ class WinUXView(
     def _add_icon_menu_item(parent, label, icon_name, callback):
         """Add one fixed-width menu command with a context-menu-sized icon."""
         with dpg.group(
-                parent=parent, horizontal=True, horizontal_spacing=6):
+                parent=parent, horizontal=True, horizontal_spacing=7):
             texture = ResourceTextures.get(icon_name)
             if texture:
                 dpg.add_image(
-                    texture, width=16, height=16, track_offset=0.5)
+                    texture, width=18, height=18, track_offset=0.5)
             else:
-                dpg.add_spacer(width=16, height=16)
+                dpg.add_spacer(width=18, height=18)
             # A native menu item sizes itself from its content over successive
             # frames when it shares a row with another widget. An explicitly
             # sized selectable gives the popup its final width immediately.
             return dpg.add_selectable(
                 label=label,
-                width=190,
+                width=188,
                 callback=WinUXView._run_icon_menu_item,
                 user_data=callback,
             )
@@ -758,15 +767,15 @@ class WinUXView(
     @staticmethod
     def _add_icon_toggle_menu_item(parent, label, icon_name, checked, callback):
         with dpg.group(
-                parent=parent, horizontal=True, horizontal_spacing=6):
+                parent=parent, horizontal=True, horizontal_spacing=7):
             texture = ResourceTextures.get(icon_name)
             if texture:
                 dpg.add_image(
-                    texture, width=16, height=16, track_offset=0.5)
+                    texture, width=18, height=18, track_offset=0.5)
             else:
-                dpg.add_spacer(width=16, height=16)
+                dpg.add_spacer(width=18, height=18)
             return dpg.add_selectable(
-                label=label, width=190, default_value=bool(checked),
+                label=label, width=188, default_value=bool(checked),
                 callback=WinUXView._run_icon_toggle_menu_item,
                 user_data=callback,
             )

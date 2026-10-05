@@ -15,9 +15,16 @@ class JobScheduleDialog(QtDialog):
         with dpg.table(parent=self.content, header_row=True, scrollY=True, height=-30,
                        width=-1, resizable=True, row_background=True, freeze_rows=1,
                        borders_innerH=True, borders_outerH=True,
-                       borders_innerV=True, borders_outerV=True) as self.table:
-            for label in ("Job", "Action", "Scheduled time", "Remaining", "Status", "Commands"):
-                dpg.add_table_column(label=label)
+                       borders_innerV=True, borders_outerV=True,
+                       policy=dpg.mvTable_SizingStretchProp) as self.table:
+            columns = (("Job", None), ("Action", 92), ("Scheduled time", 164),
+                       ("Remaining", 94), ("Status", 96), ("Commands", 152))
+            for label, width in columns:
+                if width is None:
+                    dpg.add_table_column(label=label, width_stretch=True, init_width_or_weight=1)
+                else:
+                    dpg.add_table_column(label=label, width_fixed=True, init_width_or_weight=width)
+            self.style_table(self.table)
         self.status = self.status_text("Updates automatically")
         self.button_box([("Refresh", self.refresh, "secondary", False),
                          ("Close", self.destroy, "secondary", False)])
@@ -47,11 +54,11 @@ class JobScheduleDialog(QtDialog):
                     with dpg.group(horizontal=True, horizontal_spacing=DialogMetrics.BUTTON_GAP) as command_group:
                         edit = self.action(
                             "Edit", lambda kind=kind, key=key: self.request_action("edit", kind, key),
-                            "secondary", parent=command_group,
+                            "secondary", parent=command_group, width=64,
                         )
                         cancel = self.action(
                             "Cancel", lambda kind=kind, key=key: self.request_action("cancel", kind, key),
-                            "danger", parent=command_group,
+                            "danger", parent=command_group, width=72,
                         )
                     self._row_items.append((cells, edit, cancel))
         rebuilt = identities != previous

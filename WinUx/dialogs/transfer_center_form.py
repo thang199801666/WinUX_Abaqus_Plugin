@@ -5,6 +5,7 @@ import threading
 import dearpygui.dearpygui as dpg
 from .qt_dialog import QtDialog
 from .theme import DialogMetrics
+from ..widgets.imgui_qt_style import transfer_row_theme, form_row_theme
 from .logic.transfer import TransferCenterLogic, TransferTaskHandle, TransferItemRow
 
 _TransferItemRow = TransferItemRow
@@ -56,25 +57,39 @@ class TransferCenterDialog(TransferCenterLogic, QtDialog):
     def handle_command(self, command, *args):
         if command == "add_row":
             row_id, operation, name = args
-            with dpg.group(parent=self.content) as group:
-                title = dpg.add_text("{}: {}".format(operation, name))
-                with dpg.table(header_row=False, width=-1):
-                    dpg.add_table_column(width_stretch=True)
-                    dpg.add_table_column(width_fixed=True, init_width_or_weight=94)
-                    with dpg.table_row() as row_parent:
-                        progress = self.progress_bar(
-                            0.0, parent=row_parent, overlay="0%")
-                        action = self.action(
-                            "Cancel",
-                            lambda _row_id=row_id: self._request_row_action(_row_id),
-                            "secondary",
-                            False,
-                            parent=row_parent,
-                            width=94,
-                            height=DialogMetrics.BUTTON_HEIGHT,
-                        )
-                stats = self.status_text("Queued", parent=group, wrap=650)
-                dpg.add_separator()
+            group = dpg.add_child_window(
+                parent=self.content, width=-1, height=72, border=True,
+                no_scrollbar=True, no_scroll_with_mouse=True,
+            )
+            dpg.bind_item_theme(group, transfer_row_theme(dpg))
+            title = dpg.add_text("{}: {}".format(operation, name), parent=group)
+            table = dpg.add_table(
+                parent=group, header_row=False, width=-1,
+                policy=dpg.mvTable_SizingStretchProp, pad_outerX=False,
+                borders_innerH=False, borders_outerH=False,
+                borders_innerV=False, borders_outerV=False,
+            )
+            dpg.bind_item_theme(table, form_row_theme(dpg))
+            dpg.add_table_column(parent=table, width_stretch=True)
+            dpg.add_table_column(parent=table, width_fixed=True, init_width_or_weight=86)
+            with dpg.table_row(parent=table) as row_parent:
+                progress = self.progress_bar(0.0, parent=row_parent, overlay="0%")
+                # Keep the progress surface on the same Qt/Fusion control height
+                # as the row action button.  Dear ImGui otherwise derives the
+                # progress height from the current font/frame metrics, which is
+                # a few pixels shorter than QPushButton and makes the row look
+                # vertically misaligned.
+                dpg.configure_item(progress, height=DialogMetrics.BUTTON_HEIGHT)
+                action = self.action(
+                    "Cancel",
+                    lambda _row_id=row_id: self._request_row_action(_row_id),
+                    "secondary",
+                    False,
+                    parent=row_parent,
+                    width=86,
+                    height=DialogMetrics.BUTTON_HEIGHT,
+                )
+            stats = self.status_text("Queued", parent=group, wrap=650)
             self.row_widgets[row_id] = {"group": group, "title": title,
                 "progress": progress, "stats": stats, "action": action,
                 "operation": operation, "name": name, "status": "Queued", "statistics": ""}

@@ -9,6 +9,7 @@ from .explorer_list_view import ExplorerListView, ListViewItem
 from .toolbar import (
     FileToolbar, ResourceTextures, file_status_bar_theme, file_status_text_theme,
 )
+from ..widgets.imgui_qt_style import panel_surface_theme
 
 
 class ValueProxy:
@@ -31,7 +32,7 @@ class FilePanel:
 
     # --- Thống nhất kích thước chuẩn ---
     TOOLBAR_HEIGHT = 34
-    STATUS_HEIGHT = 22
+    STATUS_HEIGHT = 20
     BACKGROUND_COLOR = (255, 255, 255, 255)
     TEXT_COLOR = (30, 30, 30, 255)
     BORDER_COLOR = (220, 220, 220, 255)
@@ -103,6 +104,9 @@ class FilePanel:
             no_scrollbar=True,
             no_scroll_with_mouse=True,
         )
+        dpg.bind_item_theme(
+            self.body, panel_surface_theme(
+                dpg, bordered=False, compact=True, alternate=False))
 
         if self.has_status:
             # A dedicated fixed-height child prevents the status text from being
@@ -387,7 +391,7 @@ class FilePanel:
         # Use the same metrics and header contract as ImGuiDataGridView.  The
         # file renderer remains specialized for Shell icons/drag/drop/rename,
         # but visually behaves like a compact QTreeView/QHeaderView.
-        listview.set_metrics(row_height=24, header_height=28, cell_padding=6)
+        listview.set_metrics(row_height=23, header_height=26, cell_padding=6)
         listview.setAlternatingRowColors(False)
         listview.setShowGrid(False)
         header = listview.horizontalHeader()
@@ -443,8 +447,12 @@ class FilePanel:
         if self.panel_id == "local":
             # Works with the complete ListView selection, so Ctrl/Shift click
             # can upload many files/folders in one batch.
-            menu.append((
-                "Upload selected   F5", "command:upload_selected", icon("Upload")))
+            menu.append({
+                "label": "Upload selected",
+                "action": "command:upload_selected",
+                "icon": icon("Upload"),
+                "shortcut": "F5",
+            })
             menu.append({
                 "id": "quick_upload_group",
                 "label": "Quick Upload",
@@ -455,9 +463,12 @@ class FilePanel:
                 ],
             })
         else:
-            menu.append((
-                "Download selected   F5", "command:download_selected",
-                icon("Download")))
+            menu.append({
+                "label": "Download selected",
+                "action": "command:download_selected",
+                "icon": icon("Download"),
+                "shortcut": "F5",
+            })
             menu.append({
                 "id": "quick_download_group",
                 "label": "Quick Download",
@@ -473,8 +484,9 @@ class FilePanel:
         if self.panel_id == "server":
             menu.append({
                 "id": "server_notepad_edit",
-                "label": "Edit in WinUx Notepad   F4",
+                "label": "Edit in WinUx Notepad",
                 "action": "edit_server_file",
+                "shortcut": "F4",
                 "icon": icon("Edit"),
                 "enabled": False,
             })
@@ -484,11 +496,42 @@ class FilePanel:
             ("Cut", "command:cut", icon("Cut")),
             ("Paste", "command:paste", icon("Paste")),
             ("---", None),
-            ("Rename   F2", "command:rename", icon("Rename")),
-            ("Delete   Del", "command:delete", icon("Delete")),
-            ("New Folder   F7", "command:new_folder", icon("Folder")),
-            ("New File", "command:new_file", icon("New")),
-            ("Refresh   Ctrl+R", "command:refresh", icon("Refresh")),
+            {
+                "label": "Rename",
+                "action": "command:rename",
+                "icon": icon("Rename"),
+                "shortcut": "F2",
+            },
+            {
+                "label": "Delete",
+                "action": "command:delete",
+                "icon": icon("Delete"),
+                "shortcut": "Del",
+            },
+            {
+                "id": "new_group",
+                "label": "New",
+                "icon": icon("New"),
+                "children": [
+                    {
+                        "label": "New Folder",
+                        "action": "command:new_folder",
+                        "icon": icon("Folder"),
+                        "shortcut": "F7",
+                    },
+                    {
+                        "label": "New File",
+                        "action": "command:new_file",
+                        "icon": icon("New"),
+                    },
+                ],
+            },
+            {
+                "label": "Refresh",
+                "action": "command:refresh",
+                "icon": icon("Refresh"),
+                "shortcut": "Ctrl+R",
+            },
         ])
         return menu
 

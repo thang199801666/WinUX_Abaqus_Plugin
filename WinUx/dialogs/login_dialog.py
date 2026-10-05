@@ -16,7 +16,7 @@ class LoginDialog(FloatingDialogController):
         # other WinUx dialog.  Qt names refer only to reusable visual/behavior
         # contracts; there is no Qt or Tk widget backend.
         super().__init__(view, "login", "SSH Login", {"initial": self.preferences.load()},
-                         width=420, height=252, modal=True, resizable=False)
+                         width=420, height=226, modal=True, resizable=False)
 
     def handle_event(self, event, message):
         if event == "submit" and not self._busy:

@@ -94,7 +94,8 @@ class NavigationController:
                         # Shell alignment is also wire I/O; keep it off the UI
                         # thread.  Failure is non-fatal for directory browsing.
                         try:
-                            self.server.set_shell_directory(path)
+                            # rev30: do not inject automatic cd commands into the user SSH console.
+                            pass
                         except Exception:
                             pass
                     except Exception as exc:
@@ -203,6 +204,15 @@ class NavigationController:
             path, items, self.server.host,
             record_history=bool(record_history))
         self.app._server_current_path = path
+        # Keep the interactive SSH console cwd aligned with the folder shown in
+        # Server Files. The model suppresses only this app-generated command
+        # echo; the resulting shell prompt remains visible.
+        try:
+            self.server.set_shell_directory(path)
+        except Exception:
+            # Directory browsing must remain usable even if the interactive
+            # shell is temporarily unavailable during reconnect.
+            pass
         self.app.navigation_preferences.save_server(
             self.server.host, self.server.username, path)
         try:

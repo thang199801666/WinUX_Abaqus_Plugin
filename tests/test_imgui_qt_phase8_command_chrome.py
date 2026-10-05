@@ -28,21 +28,22 @@ def test_main_menu_uses_shared_theme_with_pre_migration_command_row_geometry():
     assert "def resource_menu_theme" in toolbar
     assert "menu_theme = resource_menu_theme()" in view
     assert "dpg.bind_item_theme(menu_bar, menu_theme)" in view
-    assert "horizontal_spacing=6" in view
-    assert "width=190" in view
+    assert "horizontal_spacing=7" in view
+    assert "width=184" in view
 
 
 def test_dock_controls_and_popup_use_shared_command_chrome():
     source = DOCK.read_text(encoding="utf-8")
     assert "dock_control_theme(dpg, close=False)" in source
     assert "dock_control_theme(dpg, close=True)" in source
-    assert "menu_bar_theme(dpg)" in source
+    assert "from ..widgets import QMenu" in source
+    assert "self._title_menu_obj = QMenu(" in source
 
 
 def test_job_plot_toolbar_uses_shared_qt_style_controls():
     source = PLOTS.read_text(encoding="utf-8")
     for token in (
-        "tool_bar_theme(dpg)", "line_edit_theme(dpg)",
+        "panel_header_theme(dpg)", "line_edit_theme(dpg)",
         "command_button_theme(dpg)",
     ):
         assert token in source

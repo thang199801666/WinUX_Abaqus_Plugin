@@ -7,6 +7,27 @@ import os
 from .native_dialog_host import ensure_owner_visible, restore_owner_foreground
 
 
+_OWNER_FOCUS_GENERATIONS = {}
+
+
+def cancel_owner_focus_return(owner_hwnd):
+    """Invalidate any deferred focus repair queued for one WinUx owner.
+
+    A new dialog show must cancel the previous dialog's delayed close repair;
+    otherwise a stale retry can raise the main viewport above the newly opened
+    dialog and make focus appear to jump or disappear.
+    """
+    try:
+        owner = int(owner_hwnd or 0)
+    except Exception:
+        owner = 0
+    if not owner:
+        return 0
+    generation = int(_OWNER_FOCUS_GENERATIONS.get(owner, 0)) + 1
+    _OWNER_FOCUS_GENERATIONS[owner] = generation
+    return generation
+
+
 def foreground_hwnd():
     if os.name != "nt":
         return 0
@@ -86,9 +107,11 @@ def queue_owner_focus(dialog, force=False, foreground=foreground_hwnd, state=win
 
     dialog._focus_return_generation = getattr(dialog, "_focus_return_generation", 0) + 1
     generation = dialog._focus_return_generation
+    owner_generation = cancel_owner_focus_return(dialog._owner_hwnd)
 
     def attempt_focus(attempt=0):
         if (generation != dialog._focus_return_generation
+                or owner_generation != _OWNER_FOCUS_GENERATIONS.get(int(dialog._owner_hwnd or 0), 0)
                 or getattr(dialog.view, "_floating_focus_suppressed", False)
                 or not getattr(dialog.view, "winfo_exists", lambda: True)()):
             return
@@ -124,7 +147,7 @@ def queue_owner_focus(dialog, force=False, foreground=foreground_hwnd, state=win
             # the owner.  That would recreate the one-frame main-window flash.
             if current not in (*closing_hwnds, dialog._owner_hwnd, 0):
                 return
-            if attempt < 100:
+            if attempt < 32:
                 dialog.view.after(25, attempt_focus, attempt + 1)
             return
 
@@ -136,21 +159,27 @@ def queue_owner_focus(dialog, force=False, foreground=foreground_hwnd, state=win
         owner_state = state(dialog._owner_hwnd)
         if not owner_state[0]:
             return
-        if not owner_state[1] and (owner_was_visible or explicit_return):
+        # Reuse the foreground snapshot captured at the beginning of this
+        # attempt. Re-querying between visibility and activation checks creates
+        # a race where different foreground owners are observed in one logical
+        # transaction and also causes redundant Win32 calls.
+        may_repair_visibility = explicit_return or current in (0, dialog._owner_hwnd, *closing_hwnds)
+        if (not owner_state[1] and (owner_was_visible or explicit_return)
+                and may_repair_visibility):
             ensure_owner_visible(dialog._owner_hwnd)
             owner_state = state(dialog._owner_hwnd)
 
         # Focus is stronger than visibility. Respect an unrelated application
         # that became foreground during teardown unless this is an explicit
-        # workflow completion such as successful Login.
-        current = foreground()
+        # workflow completion such as successful Login. The same foreground
+        # snapshot is intentionally used for this entire attempt.
         if (current not in (0, dialog._owner_hwnd, *closing_hwnds)
                 and not (explicit_return or force)):
             return
         if not all(owner_state):
             # The owner may still be disabled for a few milliseconds while the
             # modal reference count is unwinding. Retry without changing Z-order.
-            if attempt < 100 and owner_state[0]:
+            if attempt < 32 and owner_state[0]:
                 dialog.view.after(25, attempt_focus, attempt + 1)
             return
 
@@ -166,7 +195,7 @@ def queue_owner_focus(dialog, force=False, foreground=foreground_hwnd, state=win
         current = foreground()
         if current == dialog._owner_hwnd or (not current and keyboard(dialog._owner_hwnd)):
             return
-        if attempt < 100:
+        if attempt < 32:
             dialog.view.after(25, attempt_focus, attempt + 1)
 
     dialog.view.after(0, attempt_focus)

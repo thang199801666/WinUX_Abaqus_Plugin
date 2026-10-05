@@ -111,5 +111,12 @@ class ExplorerHeaderView:
             return None
         return self._resize_modes.get(column["key"], self.Interactive)
 
+    def setAutoWidth(self, enabled):
+        self._view.set_auto_width(enabled)
+        return self
+
+    def autoWidth(self):
+        return self._view.auto_width()
+
 
 __all__ = ["ExplorerHeaderView"]

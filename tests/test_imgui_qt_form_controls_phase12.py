@@ -56,7 +56,8 @@ def test_login_busy_state_updates_retained_control_themes_not_only_native_enable
 def test_combo_and_spin_subcontrol_glyphs_are_centered_without_nested_focus_frame():
     combo = _read("components/qt_combo_box.py")
     style = _read("widgets/imgui_qt_style.py")
-    assert 'mvStyleVar_ButtonTextAlign' in combo
+    assert 'with dpg.theme_component(dpg.mvCombo):' in combo
+    assert 'dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 2, 4)' in combo
     assert 'dpg.add_theme_color(dpg.mvThemeCol_NavHighlight, face)' in combo
     assert 'mvStyleVar_ButtonTextAlign' in style
     assert 'backend.add_theme_color(backend.mvThemeCol_NavHighlight, face)' in style

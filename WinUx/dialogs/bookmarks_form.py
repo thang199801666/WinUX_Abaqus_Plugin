@@ -13,13 +13,17 @@ class BookmarksDialog(QtDialog):
         super().__init__(view, "Bookmarks", 670, 360, modal=False)
         self.preferred_size = (640, 145 + 21 * max(1, min(10, len(entries or []))))
         self.header("Navigation bookmarks", "Saved Local and Server folders. Double-click to open.")
-        self.table = QtTable(self.content, ("Location", "Name", "Path"), height=-30,
-                             on_activate=lambda key: self._open_selected())
+        self.table = QtTable(self.content, (
+            {"key": "location", "label": "Location", "width": 86, "sortable": False},
+            {"key": "name", "label": "Name", "stretch": 0.9, "sortable": False},
+            {"key": "path", "label": "Path", "stretch": 2.4, "sortable": False},
+        ), height=-30, on_activate=lambda key: self._open_selected())
         self.status = self.status_text()
         self.button_box([("Rename", self._rename_selected, "secondary", False),
                          ("Remove", self._remove_selected, "danger", False),
                          ("Open", self._open_selected, "primary", True),
-                         ("Close", self.destroy, "secondary", False)])
+                         ("Close", self.destroy, "secondary", False)],
+                        status_item=self.status)
         self.refresh(entries)
         self.shortcuts[(dpg.mvKey_F2, False)] = self._rename_selected
         self.shortcuts[(dpg.mvKey_Delete, False)] = self._remove_selected

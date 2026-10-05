@@ -174,8 +174,9 @@ class TerminalBufferTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "WinUx" / "dialogs" / "console_form.py").read_text(encoding="utf-8")
         for token in ("add_mouse_drag_handler", "add_mouse_release_handler", "mvMouseButton_Right", "_selected_text", "_select_all", "_clear_console"):
             self.assertIn(token, source)
+        self.assertIn("QMenu((", source)
         for label in ("Copy", "Paste", "Select All", "Clear"):
-            self.assertIn('label="{}"'.format(label), source)
+            self.assertIn('"label": "{}"'.format(label), source)
 
     def test_console_close_cleanup_does_not_reference_removed_click_registry(self):
         source = (Path(__file__).resolve().parents[1] / "WinUx" / "dialogs" / "console_form.py").read_text(encoding="utf-8")

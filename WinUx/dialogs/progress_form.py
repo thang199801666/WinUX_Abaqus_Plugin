@@ -4,6 +4,7 @@ import time
 import dearpygui.dearpygui as dpg
 from .qt_dialog import QtDialog
 from .logic.formatting import format_size, format_time
+from .theme import error_text_theme, muted_text_theme
 from ..widgets import QLabel, QProgressBar
 
 
@@ -15,17 +16,21 @@ class ProgressDialog(QtDialog):
         self.started_at = time.monotonic()
         self._failed = False
         self._cancelling = False
-        super().__init__(view, self.operation, 510, 225, modal=False)
-        self.preferred_size = (500, 205)
+        super().__init__(view, self.operation, 510, 210, modal=False)
+        self.preferred_size = (500, 192)
         self.header(self.operation, "Transfer progress")
         self._current_label = self.own_widget(QLabel("Preparing transfer...", parent=self.content, after=view.after))
         self._current_progress = self.own_widget(QProgressBar(parent=self.content, after=view.after))
+        dpg.add_spacer(parent=self.content, height=2)
         self._overall_label = self.own_widget(QLabel("Overall: 0.0%", parent=self.content, after=view.after))
         self._overall_progress = self.own_widget(QProgressBar(parent=self.content, after=view.after))
         self.current, self.current_bar = self._current_label.tag, self._current_progress.tag
         self.overall, self.overall_bar = self._overall_label.tag, self._overall_progress.tag
         self.stats = self.status_text("Speed: --   Estimated time: --")
-        self.action_button = self.button_box([("Cancel", self.cancel, "secondary", False)])[0]
+        self.action_button = self.button_box(
+            [("Cancel", self.cancel, "secondary", False)],
+            status_item=self.stats,
+        )[0]
 
     def update_progress(self, name, current_done, current_total, overall_done, overall_total):
         current_ratio = max(0, min(1, float(current_done or 0) / max(1, float(current_total or 0))))
@@ -49,10 +54,21 @@ class ProgressDialog(QtDialog):
             self._failed = True
             dpg.set_value(self.current, "{} failed".format(self.operation))
             dpg.set_value(self.stats, args[0])
+            self._current_progress.setState("error")
+            self._overall_progress.setState("error")
+            self._current_progress.setFormat("Failed")
+            self._overall_progress.setFormat("Failed")
+            dpg.bind_item_theme(self.current, error_text_theme())
+            dpg.bind_item_theme(self.stats, error_text_theme())
             dpg.configure_item(self.action_button, label="Close", enabled=True, callback=lambda: self.destroy())
         elif command == "cancelling":
             self._cancelling = True
             dpg.set_value(self.current, "Cancelling...")
+            dpg.set_value(self.stats, "Waiting for the current transfer operation to stop...")
+            self._current_progress.setState("paused")
+            self._overall_progress.setState("paused")
+            dpg.bind_item_theme(self.current, muted_text_theme())
+            dpg.bind_item_theme(self.stats, muted_text_theme())
             dpg.configure_item(self.action_button, enabled=False)
 
     def complete(self):

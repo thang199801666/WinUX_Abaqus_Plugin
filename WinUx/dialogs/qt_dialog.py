@@ -11,11 +11,11 @@ from .theme import (
     secondary_button_theme, danger_button_theme, surface_theme, footer_theme, body_theme,
     muted_text_theme, error_text_theme, navigation_theme,
     bind_combo_style, refresh_combo_theme,
-    line_edit_shell_theme, line_edit_editor_theme,
+    line_edit_shell_theme, line_edit_editor_theme, plain_text_edit_theme,
 )
 from ..components.explorer_list_view import register_modal_window, unregister_modal_window
 from ..runtime.latest_call import LatestCallQueue
-from ..widgets.imgui_qt_style import METRICS, form_row_theme
+from ..widgets.imgui_qt_style import METRICS, form_row_theme, form_label_cell_theme
 from ..widgets import (
     QObject, QPushButton, ImGuiLineEdit, ImGuiSpinBox, ImGuiDoubleSpinBox,
     ImGuiGroupBox, ImGuiCheckBox, ImGuiRadioButtonGroup, ImGuiProgressBar,
@@ -220,7 +220,7 @@ class QtDialog(DialogBase):
     def action_width(label):
         return max(DialogMetrics.BUTTON_WIDTH, len(label) * 7 + 16)
 
-    def button_box(self, actions, left_actions=(), status_item=None):
+    def button_box(self, actions, left_actions=(), status_item=None, status_left_padding=0):
         """QDialogButtonBox-like layout with auxiliary actions on the left.
 
         The old footer placed status text and auxiliary buttons in the same
@@ -273,8 +273,18 @@ class QtDialog(DialogBase):
                     self.left_buttons = []
                 if status_item is not None:
                     with dpg.group(horizontal=True) as status_host:
+                        # Keep status/help text visually separated from auxiliary
+                        # footer actions.  Qt's button-box layouts leave breathing
+                        # room between the left action cluster and the expanding
+                        # status slot; Dear ImGui tables otherwise place the text
+                        # almost flush against the preceding button.
+                        status_pad = max(0, int(status_left_padding or 0))
+                        if status_pad:
+                            dpg.add_spacer(width=status_pad)
                         dpg.move_item(status_item, parent=status_host)
-                        dpg.configure_item(status_item, wrap=max(80, self.width-left_width-right_width-60))
+                        dpg.configure_item(
+                            status_item,
+                            wrap=max(80, self.width-left_width-right_width-60-status_pad))
                 else:
                     dpg.add_spacer(width=1)
                 with dpg.group(horizontal=True, horizontal_spacing=DialogMetrics.BUTTON_GAP) as group:
@@ -282,6 +292,84 @@ class QtDialog(DialogBase):
                         self.action(label, callback, role, default, group)
                         for label, callback, role, default in actions
                     ]
+
+    def form_layout(self, parent=None, *, label_width=None):
+        """Create one shared QFormLayout-like table for multiple fields.
+
+        Using one table for an entire form is important: a separate Dear ImGui
+        table for every row inherits vertical item spacing between tables and
+        makes compact dialogs look disconnected.  This helper centralizes one
+        label column and one stretching editor column, matching Qt's
+        QFormLayout much more closely.
+        """
+        table = dpg.add_table(
+            parent=parent or self.content,
+            header_row=False, width=-1,
+            policy=dpg.mvTable_SizingStretchProp, pad_outerX=False,
+            borders_innerH=False, borders_outerH=False,
+            borders_innerV=False, borders_outerV=False,
+        )
+        dpg.add_table_column(
+            parent=table, width_fixed=True,
+            init_width_or_weight=int(label_width or DialogMetrics.LABEL_WIDTH))
+        dpg.add_table_column(parent=table, width_stretch=True)
+        dpg.bind_item_theme(table, form_row_theme(dpg))
+        return table
+
+    def form_layout_row(self, table, label, builder):
+        """Append one label/editor row to ``form_layout`` and return editor."""
+        with dpg.table_row(parent=table):
+            label_cell = dpg.add_child_window(
+                width=-1, height=DialogMetrics.CONTROL_HEIGHT, border=False,
+                no_scrollbar=True, no_scroll_with_mouse=True,
+            )
+            dpg.bind_item_theme(label_cell, form_label_cell_theme(dpg))
+            if label:
+                dpg.add_text(str(label), parent=label_cell)
+            with dpg.group() as editor_cell:
+                return builder(editor_cell)
+
+    def summary_grid(self, items, parent=None, *, columns=2, label_width=72):
+        """Create a compact read-only Qt property/summary grid.
+
+        Summary blocks used to be hand-written four-column Dear ImGui tables.
+        Keeping them here gives every dialog the same label/value spacing and
+        prevents one-off tables from drifting away from the QFormLayout
+        metrics used by editable forms. ``items`` is an iterable of
+        ``(label, value)`` pairs laid out left-to-right across ``columns``
+        logical fields per row.
+        """
+        pairs = [(str(label), "-" if value is None else str(value))
+                 for label, value in items]
+        logical_columns = max(1, int(columns or 1))
+        table = dpg.add_table(
+            parent=parent or self.content, header_row=False, width=-1,
+            policy=dpg.mvTable_SizingStretchProp, pad_outerX=False,
+            borders_innerH=False, borders_outerH=False,
+            borders_innerV=False, borders_outerV=False,
+        )
+        for _ in range(logical_columns):
+            dpg.add_table_column(
+                parent=table, width_fixed=True,
+                init_width_or_weight=max(44, int(label_width)))
+            dpg.add_table_column(parent=table, width_stretch=True)
+        try:
+            dpg.bind_item_theme(table, form_row_theme(dpg))
+        except Exception:
+            pass
+        for offset in range(0, len(pairs), logical_columns):
+            row_items = pairs[offset:offset + logical_columns]
+            with dpg.table_row(parent=table):
+                for index in range(logical_columns):
+                    if index < len(row_items):
+                        label, value = row_items[index]
+                        label_item = dpg.add_text(label)
+                        dpg.bind_item_theme(label_item, muted_text_theme())
+                        dpg.add_text(value)
+                    else:
+                        dpg.add_text("")
+                        dpg.add_text("")
+        return table
 
     def labeled_widget(self, label, builder, parent=None):
         """One QFormLayout-style row with a shared label column width."""
@@ -390,21 +478,42 @@ class QtDialog(DialogBase):
         native_parent = options.pop("parent", parent)
         multiline = bool(options.get("multiline", False))
         if multiline:
-            # Multi-line editors intentionally stay raw because callers may
-            # depend on arbitrary height/tab-input flags.  They still receive
-            # the shared Qt/Fusion visual contract from dialog_theme().
-            options.setdefault("default_value", str(value))
-            options.setdefault("width", requested_width)
-            options.setdefault("auto_select_all", False)
-            if native_parent is not None:
-                options["parent"] = native_parent
-            return dpg.add_input_text(**options)
+            options.pop("multiline", None)
+            return self.plain_text_edit(
+                value, parent=native_parent, width=requested_width, **options)
 
         widget = self.own_widget(ImGuiLineEdit(
             str(value), parent=native_parent, after=self.view.after, backend=dpg,
             width=requested_width, **options))
         self._control_wrappers[widget.tag] = widget
         return widget.tag
+
+
+    def plain_text_edit(self, value="", parent=None, *, width=-1, height=-1,
+                        readonly=False, **kwargs):
+        """Create a shared QPlainTextEdit-like multiline editor.
+
+        The native Dear ImGui input remains the real text/selection/scroll
+        owner.  This helper only standardizes its frame, padding and scrollbar
+        chrome so diagnostics/log/result views no longer look like raw ImGui
+        widgets.
+        """
+        options = dict(kwargs)
+        options.setdefault("default_value", str(value))
+        options.setdefault("width", int(width))
+        options.setdefault("height", int(height))
+        options.setdefault("multiline", True)
+        options.setdefault("readonly", bool(readonly))
+        options.setdefault("auto_select_all", False)
+        options.setdefault("no_horizontal_scroll", False)
+        if parent is not None:
+            options["parent"] = parent
+        item = dpg.add_input_text(**options)
+        try:
+            dpg.bind_item_theme(item, plain_text_edit_theme())
+        except Exception:
+            pass
+        return item
 
 
     def spin_int(self, value=0, parent=None, *, minimum=None, maximum=None,
@@ -523,6 +632,86 @@ class QtDialog(DialogBase):
                     dpg.bind_item_theme(item, line_edit_editor_theme(disabled=not enabled))
                     self._refresh_line_edit_shell(item)
 
+    def style_table(self, table):
+        """Apply the shared QTableView/QHeaderView chrome to a raw DPG table.
+
+        Editable dialog grids (Job Manager / Schedule) cannot use
+        ``QtDataGridView`` because their cells host live widgets.  They still
+        need the same palette, header padding, borders and scrollbar metrics
+        as the retained item-view layer.  Keep that contract in one helper
+        instead of allowing each dialog to invent its own ImGui table style.
+        """
+        try:
+            from ..widgets.item_views import qt_item_view_theme
+            dpg.bind_item_theme(table, qt_item_view_theme(dpg))
+        except Exception:
+            pass
+        return table
+
+    def message_box_body(self, heading, message, *, intent="info", detail=None, parent=None):
+        """Build a compact QMessageBox-like content row from DPG primitives.
+
+        The icon is vector geometry rather than a font symbol so Windows font
+        fallback cannot turn warning/question glyphs into boxes or diamonds.
+        Title-bar ownership stays with QDialog; this helper owns only the
+        familiar icon + heading + message body arrangement.
+        """
+        parent = parent or self.content
+        table = dpg.add_table(
+            parent=parent, header_row=False, width=-1,
+            policy=dpg.mvTable_SizingStretchProp, pad_outerX=False,
+            borders_innerH=False, borders_outerH=False,
+            borders_innerV=False, borders_outerV=False,
+        )
+        dpg.add_table_column(parent=table, width_fixed=True, init_width_or_weight=42)
+        dpg.add_table_column(parent=table, width_stretch=True, init_width_or_weight=1.0)
+        palette = {
+            "error": (196, 43, 28, 255),
+            "danger": (196, 43, 28, 255),
+            "delete": (196, 43, 28, 255),
+            "warning": (205, 132, 0, 255),
+            "warn": (205, 132, 0, 255),
+            "question": (0, 105, 180, 255),
+            "info": (0, 120, 215, 255),
+        }
+        role = str(intent or "info").lower()
+        color = palette.get(role, palette["info"])
+        with dpg.table_row(parent=table):
+            canvas = dpg.add_drawlist(width=36, height=36)
+            cx, cy = 18, 18
+            if role in ("warning", "warn"):
+                dpg.draw_triangle((18, 3), (33, 31), (3, 31), color=color, fill=color, parent=canvas)
+                dpg.draw_line((18, 11), (18, 22), color=(255,255,255,255), thickness=2.0, parent=canvas)
+                dpg.draw_circle((18, 27), 1.6, color=(255,255,255,255), fill=(255,255,255,255), parent=canvas)
+            else:
+                dpg.draw_circle((cx, cy), 15, color=color, fill=color, parent=canvas)
+                white = (255, 255, 255, 255)
+                if role in ("error", "danger", "delete"):
+                    dpg.draw_line((12, 12), (24, 24), color=white, thickness=2.0, parent=canvas)
+                    dpg.draw_line((24, 12), (12, 24), color=white, thickness=2.0, parent=canvas)
+                elif role == "question":
+                    dpg.draw_line((13, 12), (16, 9), color=white, thickness=2.0, parent=canvas)
+                    dpg.draw_line((16, 9), (21, 9), color=white, thickness=2.0, parent=canvas)
+                    dpg.draw_line((21, 9), (24, 12), color=white, thickness=2.0, parent=canvas)
+                    dpg.draw_line((24, 12), (24, 15), color=white, thickness=2.0, parent=canvas)
+                    dpg.draw_line((24, 15), (18, 20), color=white, thickness=2.0, parent=canvas)
+                    dpg.draw_line((18, 20), (18, 22), color=white, thickness=2.0, parent=canvas)
+                    dpg.draw_circle((18, 27), 1.5, color=white, fill=white, parent=canvas)
+                else:
+                    dpg.draw_circle((18, 11), 1.6, color=white, fill=white, parent=canvas)
+                    dpg.draw_line((18, 16), (18, 27), color=white, thickness=2.0, parent=canvas)
+            with dpg.group() as body:
+                title_item = dpg.add_text(str(heading or ""), wrap=max(260, self.width - 110))
+                font = getattr(self.view, "heading_font", None)
+                if font:
+                    dpg.bind_item_font(title_item, font)
+                dpg.add_spacer(height=2)
+                dpg.add_text(str(message or ""), wrap=max(260, self.width - 110))
+                if detail:
+                    dpg.add_spacer(height=2)
+                    self.note(detail, parent=body, wrap=max(260, self.width - 110))
+        return table
+
     def field(self, label, value="", parent=None, **kwargs):
         return self.labeled_widget(
             label,
@@ -536,10 +725,33 @@ class QtDialog(DialogBase):
         return item
 
     def status_text(self, text="", parent=None, error=False, wrap=0):
-        """Create a uniform one-line status/error slot for dialog feedback."""
-        item = dpg.add_text(str(text), parent=parent or self.content, wrap=wrap)
+        """Create a uniform QLabel-like status/error slot.
+
+        Empty validation errors should not reserve a blank row in a compact Qt
+        form.  Ordinary informational status text remains visible even when
+        empty because callers may update it continuously.
+        """
+        value = str(text or "")
+        item = dpg.add_text(value, parent=parent or self.content, wrap=wrap)
         dpg.bind_item_theme(item, error_text_theme() if error else muted_text_theme())
+        if error and not value:
+            dpg.configure_item(item, show=False)
         return item
+
+    def set_status_text(self, item, text, *, error=None):
+        """Update a retained status QLabel and collapse empty error feedback."""
+        if item is None or not dpg.does_item_exist(item):
+            return False
+        value = str(text or "")
+        dpg.set_value(item, value)
+        if error is not None:
+            dpg.bind_item_theme(
+                item, error_text_theme() if bool(error) else muted_text_theme())
+        # Validation/error labels collapse when clear; informational labels stay
+        # allocated unless the caller explicitly requests error semantics.
+        if error is True:
+            dpg.configure_item(item, show=bool(value))
+        return True
 
     def navigation_panel(self, width=None, parent=None):
         panel = dpg.add_child_window(
@@ -552,14 +764,18 @@ class QtDialog(DialogBase):
 
     def header(self, title, subtitle="", parent=None):
         """Compact Qt page heading used consistently by all dialog pages."""
-        with dpg.group(parent=parent or self.content) as header:
+        with dpg.group(parent=parent or self.content, horizontal_spacing=0) as header:
             heading = dpg.add_text(title)
             font = getattr(self.view, "heading_font", None)
             if font:
                 dpg.bind_item_font(heading, font)
             if subtitle:
                 self.note(subtitle, parent=header, wrap=max(320, self.width-72))
+            # A single light separator gives Settings pages the same visual
+            # hierarchy as a QWidget page without introducing a card/header
+            # background that would make the dialog look like Dear ImGui.
             dpg.add_separator()
+            dpg.add_spacer(height=2)
         return header
 
     @contextmanager
@@ -569,12 +785,10 @@ class QtDialog(DialogBase):
             title, parent=parent or self.content, after=self.view.after, backend=dpg,
             width=-1, auto_resize_y=True,
         ))
-        font = getattr(self.view, "heading_font", None)
-        if font:
-            try:
-                dpg.bind_item_font(box.title_label, font)
-            except Exception:
-                pass
+        # QGroupBox captions use the application/body font.  Reserve the
+        # larger heading font for the page title above the separator; using it
+        # for every Settings section made the page look like stacked ImGui
+        # cards rather than a native Qt preferences page.
         with box:
             yield box.content
 
@@ -597,6 +811,33 @@ class QtDialog(DialogBase):
     def own_widget(self, widget):
         widget.setParent(self._widget_owner)
         return widget
+
+    def _restore_embedded_owner_focus(self):
+        """Return Dear ImGui navigation focus to the main client safely.
+
+        Embedded QDialogs share the application's native viewport.  Deleting a
+        focused modal window can leave ImGui's nav focus attached to an item
+        that no longer exists, so keyboard input appears lost until the user
+        clicks the main window.  Restore only when no newer embedded/floating
+        dialog is visible; this mirrors Qt's parent activation semantics without
+        stealing OS foreground focus from another application.
+        """
+        if getattr(self.view, "_floating_focus_suppressed", False):
+            return
+        try:
+            for dialog in tuple(_DIALOGS):
+                if dialog is self or not dialog.winfo_exists():
+                    continue
+                if dpg.does_item_exist(dialog.tag) and dpg.is_item_shown(dialog.tag):
+                    return
+            for dialog in tuple(getattr(self.view, "_floating_dialogs", ())):
+                if (not getattr(dialog, "_closed", False)
+                        and getattr(dialog, "_visible", False)):
+                    return
+            if dpg.does_item_exist("winux_primary"):
+                dpg.focus_item("winux_primary")
+        except Exception:
+            pass
 
     def delete_owned_item(self, item):
         """Release wrappers before replacing a native row/container subtree."""
@@ -634,6 +875,9 @@ class QtDialog(DialogBase):
         self._line_edit_shells.clear()
         self._control_wrappers.clear()
         super().destroy()
+        # Run after the modal item has been hidden/deleted on the UI queue.
+        # A later dialog show will be detected and blocks this restoration.
+        self.view.after(0, self._restore_embedded_owner_focus)
         if registry or control_registries:
             def cleanup():
                 if registry and dpg.does_item_exist(registry):

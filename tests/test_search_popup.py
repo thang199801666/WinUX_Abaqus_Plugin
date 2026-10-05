@@ -13,7 +13,7 @@ class SearchPopupTests(unittest.TestCase):
         source = TOOLBAR.read_text(encoding="utf-8")
         self.assertIn("self.search_popup = dpg.add_child_window", source)
         self.assertIn("parent=self.container", source)
-        self.assertIn("SEARCH_ROW_HEIGHT = 36", source)
+        self.assertIn("SEARCH_ROW_HEIGHT = 32", source)
         self.assertIn("self.panel.toolbar_height_changed()", source)
         self.assertNotIn("_search_popup_position", source)
 

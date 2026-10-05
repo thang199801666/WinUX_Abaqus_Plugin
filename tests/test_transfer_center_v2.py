@@ -36,8 +36,9 @@ class TransferCenterV2Tests(unittest.TestCase):
 
     def test_context_menu_exposes_multi_file_upload_and_download(self):
         source = FILE_PANEL.read_text(encoding="utf-8")
-        self.assertIn('"Upload selected   F5"', source)
-        self.assertIn('"Download selected   F5"', source)
+        self.assertIn('"label": "Upload selected"', source)
+        self.assertIn('"label": "Download selected"', source)
+        self.assertGreaterEqual(source.count('"shortcut": "F5"'), 2)
         self.assertIn('"command:upload_selected"', source)
         self.assertIn('"command:download_selected"', source)
 
@@ -59,8 +60,8 @@ class TransferCenterV2Tests(unittest.TestCase):
 
     def test_cancel_button_shares_progress_row(self):
         source = TRANSFER.read_text(encoding="utf-8")
-        self.assertIn("with dpg.table_row() as row_parent:", source)
-        row = source.split("with dpg.table_row() as row_parent:", 1)[1].split("stats =", 1)[0]
+        self.assertIn("with dpg.table_row(parent=table) as row_parent:", source)
+        row = source.split("with dpg.table_row(parent=table) as row_parent:", 1)[1].split("stats =", 1)[0]
         self.assertIn("self.progress_bar(", row)
         self.assertIn("action = self.action(", row)
         self.assertIn("parent=row_parent", row)

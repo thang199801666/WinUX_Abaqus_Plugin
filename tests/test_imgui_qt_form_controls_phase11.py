@@ -8,24 +8,20 @@ def _read(relative):
     return (WINUX / relative).read_text(encoding="utf-8")
 
 
-def test_combo_popup_is_positioned_while_hidden_and_clamped_to_viewport():
+def test_combo_uses_native_begincombo_popup_instead_of_manual_overlay_geometry():
     source = _read("components/qt_combo_box.py")
-    assert "def _popup_geometry" in source
-    assert "get_viewport_client_width" in source
-    assert "get_viewport_client_height" in source
-    assert "show=False" in source
-    assert "dpg.set_item_pos(self._popup" in source
-    assert "popup_y = below_y if" in source
+    assert "self.button = dpg.add_combo(" in source
+    assert "no_preview=True" in source
+    assert "def _popup_geometry" not in source
+    assert "dpg.set_item_pos(self._popup" not in source
 
 
-def test_combo_popup_keyboard_highlight_commits_only_on_enter():
+def test_combo_keyboard_index_navigation_remains_on_editable_input():
     source = _read("components/qt_combo_box.py")
-    assert "self._popup_index" in source
-    assert "def _move_popup_highlight" in source
-    assert '("mvKey_Return", self._return_pressed)' in source
-    assert "self._sync_popup_selection(self._popup_index)" in source
-    assert "self.set_current_text(self.items[index], emit=True)" in source
-
+    assert "def _up_pressed" in source
+    assert "def _down_pressed" in source
+    assert "self.set_current_index" in source
+    assert '("mvKey_F4", self._f4_pressed)' in source
 
 def test_combo_exposes_qcombobox_max_visible_items_contract():
     source = _read("components/qt_combo_box.py")
@@ -47,13 +43,13 @@ def test_spinbox_uses_compact_zero_gap_button_stack():
 def test_form_labels_get_qformlayout_vertical_alignment_inset():
     style = _read("widgets/imgui_qt_style.py")
     dialog = _read("dialogs/qt_dialog.py")
-    assert "form_label_top_pad: int = 3" in style
+    assert "form_label_top_pad: int = 4" in style
     assert "height=METRICS.form_label_top_pad" in dialog
 
 
 def test_checkbox_indicator_keeps_compact_qt_spacing():
     style = _read("widgets/imgui_qt_style.py")
-    assert "check_size: int = 15" in style
+    assert "check_size: int = 14" in style
     assert "mvStyleVar_ItemInnerSpacing, 6, 4" in style
 
 

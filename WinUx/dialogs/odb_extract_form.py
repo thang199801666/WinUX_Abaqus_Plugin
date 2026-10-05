@@ -16,25 +16,42 @@ class ODBExtractDialog(QtDialog):
         self._items = list(self.catalog.get("historyOutputs") or [])
         self._items_by_id = {str(item.get("id")): item for item in self._items}
         self._x_ids, self._y_ids = [], []
-        super().__init__(view, "Extract ODB History Data", 1000, 650)
+        super().__init__(view, "Extract ODB History Data", 980, 590)
         self.header("Extract History Output", "Select X and Y sources to create all combinations.")
-        self.history = QtTable(self.content, ("Output Variables", "Points"), height=190, multiple=True)
+        self.history = QtTable(self.content, ("Output Variables", "Points"), height=205, multiple=True)
         self.history.set_rows([(str(item.get("id")), (_item_label(item), item.get("points", 0))) for item in self._items])
+
+        # X/Y selection panes share one layout row.  The old vertical stack
+        # made a simple selection workflow feel like three unrelated panels;
+        # placing them side-by-side mirrors a compact Qt splitter/form without
+        # introducing another dock or custom widget.
+        axes_layout = dpg.add_table(
+            parent=self.content, header_row=False, width=-1,
+            policy=dpg.mvTable_SizingStretchProp, pad_outerX=False,
+            borders_innerH=False, borders_outerH=False,
+            borders_innerV=False, borders_outerV=False,
+        )
+        dpg.add_table_column(parent=axes_layout, width_stretch=True, init_width_or_weight=1.0)
+        dpg.add_table_column(parent=axes_layout, width_stretch=True, init_width_or_weight=1.0)
         self.axes = {}
-        for axis in ("x", "y"):
-            with dpg.group(horizontal=True, horizontal_spacing=DialogMetrics.BUTTON_GAP, parent=self.content) as axis_actions:
-                self.action(
-                    "Add to {}".format(axis.upper()), lambda axis=axis: self._add_selected(axis),
-                    "secondary", parent=axis_actions,
-                )
-                self.action(
-                    "Remove {}".format(axis.upper()), lambda axis=axis: self._remove_selected(axis),
-                    "secondary", parent=axis_actions,
-                )
-            self.axes[axis] = QtTable(self.content, (axis.upper() + " Data",), height=105, multiple=True)
-        self.reverse = self.labeled_widget(
-            "Combine operation",
-            lambda: self.combo(self.REVERSE_OPTIONS, default_value="As is"),
+        with dpg.table_row(parent=axes_layout):
+            for axis in ("x", "y"):
+                with dpg.group() as axis_panel:
+                    with dpg.group(horizontal=True, horizontal_spacing=DialogMetrics.BUTTON_GAP, parent=axis_panel) as axis_actions:
+                        self.action(
+                            "Add to {}".format(axis.upper()), lambda axis=axis: self._add_selected(axis),
+                            "secondary", parent=axis_actions, width=84,
+                        )
+                        self.action(
+                            "Remove {}".format(axis.upper()), lambda axis=axis: self._remove_selected(axis),
+                            "secondary", parent=axis_actions, width=84,
+                        )
+                    self.axes[axis] = QtTable(axis_panel, (axis.upper() + " Data",), height=125, multiple=True)
+
+        form = self.form_layout(label_width=118)
+        self.reverse = self.form_layout_row(
+            form, "Combine operation",
+            lambda parent: self.combo(self.REVERSE_OPTIONS, parent=parent, default_value="As is"),
         )
         self.summary = self.status_text()
         self.ok_button = self.button_box([("Extract", self._accept, "primary", True),

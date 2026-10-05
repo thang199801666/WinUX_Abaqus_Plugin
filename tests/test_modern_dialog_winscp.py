@@ -64,7 +64,8 @@ class ModernDialogRegressionTests(unittest.TestCase):
         self.assertIn("self.button_box", source)
         self.assertIn('action = self.action(', source)
         self.assertIn('"Cancel",', source)
-        self.assertIn('width=94', source)
+        self.assertIn('width=86', source)
+        self.assertIn('transfer_row_theme', source)
 
 
 class WinScpShortcutRegressionTests(unittest.TestCase):
@@ -90,12 +91,16 @@ class WinScpShortcutRegressionTests(unittest.TestCase):
 
     def test_context_menu_advertises_keyboard_accelerators(self):
         source = FILE_PANEL.read_text(encoding="utf-8")
-        self.assertIn("Upload selected   F5", source)
-        self.assertIn("Download selected   F5", source)
-        self.assertIn("Edit in WinUx Notepad   F4", source)
-        self.assertIn("Rename   F2", source)
-        self.assertIn("New Folder   F7", source)
-        self.assertIn("Refresh   Ctrl+R", source)
+        self.assertIn('"label": "Upload selected"', source)
+        self.assertIn('"label": "Download selected"', source)
+        self.assertIn('"label": "Edit in WinUx Notepad"', source)
+        self.assertIn('"label": "Rename"', source)
+        self.assertIn('"label": "New Folder"', source)
+        self.assertIn('"label": "Refresh"', source)
+        for accelerator in ("F5", "F4", "F2", "F7", "Ctrl+R"):
+            self.assertIn('"shortcut": "{}"'.format(accelerator), source)
+        self.assertIn('"id": "new_group"', source)
+        self.assertIn('"label": "New"', source)
 
 
 if __name__ == "__main__":

@@ -8,6 +8,7 @@ from .login import LoginPreferences
 from .navigation import NavigationPreferences
 from .performance import PerformancePreferences
 from .storage import JsonPreferenceStore, user_profile_path
+from .update import UpdatePreferences
 
 __all__ = [
     "AbaqusVersionPreferences",
@@ -18,6 +19,7 @@ __all__ = [
     "LoginPreferences",
     "NavigationPreferences",
     "PerformancePreferences",
+    "UpdatePreferences",
     "user_profile_path",
 ]
 

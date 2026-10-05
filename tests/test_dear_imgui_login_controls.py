@@ -24,19 +24,18 @@ def test_login_can_use_dpg_prewarm_like_other_floating_dialogs():
     assert '!= "login"' not in source
 
 
-def test_editable_combo_is_dpg_input_plus_internal_arrow_and_dpg_popup():
+def test_editable_combo_is_dpg_input_plus_native_no_preview_combo():
     source = COMBO.read_text(encoding="utf-8")
     assert "dpg.add_input_text(" in source
-    assert "self.button = dpg.add_drawlist(" in source
-    assert "dpg.draw_triangle(" in source
+    assert "self.button = dpg.add_combo(" in source
+    assert "no_preview=True" in source
+    assert "callback=self._native_selected" in source
     assert 'label="v"' not in source
-    assert "dpg.add_window(" in source
-    assert "popup=True" in source
-    assert "dpg.add_selectable(" in source
-    assert "dpg.add_combo(" not in source
+    assert "dpg.add_child_window(" in source  # outer one-frame shell only
+    assert "self._popup = dpg.add_child_window(" not in source
+    assert "dpg.add_selectable(" not in source
     assert "tkinter" not in source
     assert "PyQt" not in source
-
 
 def test_combo_mouse_click_is_left_to_imgui_inputtext_for_caret():
     source = COMBO.read_text(encoding="utf-8")

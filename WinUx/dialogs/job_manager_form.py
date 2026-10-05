@@ -7,13 +7,16 @@ from ..abaqus_version_preferences import AbaqusVersionPreferences
 from .qt_dialog import QtDialog
 from .logic.job_manager import JobManagerLogic
 from .theme import DialogMetrics
+from ..widgets.imgui_qt_style import METRICS, compact_stack_theme
 
 
 class JobManagerDialog(JobManagerLogic, QtDialog):
     """Per-input job configuration using the existing submission/schedule API."""
 
     MAX_VISIBLE_ROWS = 7
-    ROW_HEIGHT = 28
+    # Visual table row height.  Controls are 26 px high and are centered
+    # inside a 32 px row, matching Qt/QTableView editor geometry.
+    ROW_HEIGHT = 32
 
     @classmethod
     def initial_size(cls, count):
@@ -38,41 +41,97 @@ class JobManagerDialog(JobManagerLogic, QtDialog):
         QtDialog.__init__(self, view, "Abaqus Job Manager", *self.preferred_size)
         self.header("Selected input files ({})".format(len(self.paths)))
         with dpg.table(parent=self.content, header_row=True, scrollY=True,
-                       height=-24, width=-1, resizable=True, row_background=True,
+                       height=-1, width=-1, resizable=True, row_background=True,
                        freeze_rows=1, borders_innerH=True, borders_outerH=True,
                        borders_innerV=True, borders_outerV=True,
                        policy=dpg.mvTable_SizingStretchProp) as self.table:
-            for heading, width in (("Run", 32), ("Input file", None), ("Version", 100),
-                                   ("CPUs", 52), ("Precision", 88), ("Overwrite", 74),
-                                   ("Schedule", 108), ("Time", 180)):
+            for heading, width in (("Run", 38), ("Input file", None), ("Version", 108),
+                                   ("CPUs", 58), ("Precision", 92), ("Overwrite", 82),
+                                   ("Schedule", 112), ("Time", 160)):
                 if width is None:
                     dpg.add_table_column(label=heading, width_stretch=True, init_width_or_weight=1)
                 else:
                     dpg.add_table_column(label=heading, width_fixed=True, init_width_or_weight=width)
+            self.style_table(self.table)
             for path in self.paths:
                 with dpg.table_row():
-                    row = {"run": self.checkbox(checked=True)}
-                    name = dpg.add_text(path.name)
+                    # Dear ImGui top-aligns mixed-height table items.  Every cell
+                    # uses a zero-gap vertical lane plus an explicit top inset.
+                    # Editors are 26 px high in a 32 px visual row (2 px inset
+                    # after table padding); 14 px text/checks use 8 px.  Their
+                    # visual centres therefore land on the exact same Y coordinate.
+                    def cell(top=0):
+                        group = dpg.add_group()
+                        dpg.bind_item_theme(group, compact_stack_theme(dpg))
+                        if top:
+                            dpg.add_spacer(parent=group, height=top)
+                        return group
+
+                    def centered_checkbox_cell(column_width, *, checked=False):
+                        """Center a native 14 px checkbox in both axes of a fixed table cell.
+
+                        QTableView centres indicator-only checkbox delegates. Dear ImGui
+                        otherwise places an empty-label checkbox at the left edge of the
+                        cell. Account for the table's 4 px horizontal padding on each side,
+                        then insert the exact leading spacer needed to centre the native
+                        indicator without replacing its hit target with custom drawing.
+                        """
+                        holder = cell(8)
+                        usable = max(0, int(column_width) - 8)
+                        lead = max(0, (usable - METRICS.check_size) // 2)
+                        lane = dpg.add_group(parent=holder, horizontal=True)
+                        dpg.bind_item_theme(lane, compact_stack_theme(dpg))
+                        if lead:
+                            dpg.add_spacer(parent=lane, width=lead)
+                        return self.checkbox(checked=checked, parent=lane)
+
+                    # Indicator-only checkbox delegates are centred horizontally and
+                    # vertically, matching Qt/QTableView rather than ImGui's left edge.
+                    row = {"run": centered_checkbox_cell(38, checked=True)}
+
+                    # Plain text uses the same 14 px visual lane as a checkbox, so an
+                    # 8 px top inset puts its centre on the 26 px editors' centre line.
+                    name_cell = cell(8)
+                    name = dpg.add_text(path.name, parent=name_cell)
                     with dpg.tooltip(name):
                         dpg.add_text(str(path))
-                    row["version"] = self.combo(self._versions, default_value=self._prefs["version"])
-                    row["cpus"] = self.spin_int(int(self._prefs.get("cpus", 4)), minimum=1, width=-1)
-                    row["precision"] = self.combo(("single", "double"), default_value=self._prefs.get("precision", "single"))
-                    row["overwrite"] = self.checkbox(
-                        checked=bool(self._prefs.get("overwrite", False)))
-                    row["schedule"] = self.combo(self.SCHEDULE_OPTIONS, default_value="Now",
-                        user_data=path, callback=self._schedule_changed)
-                    row["time"] = self.line_edit("Runs immediately", enabled=False, width=-1,
+
+                    version_cell = cell(2)
+                    row["version"] = self.combo(self._versions, parent=version_cell,
+                        default_value=self._prefs["version"])
+
+                    cpu_cell = cell(2)
+                    row["cpus"] = self.spin_int(int(self._prefs.get("cpus", 4)),
+                        parent=cpu_cell, minimum=1, width=-1)
+
+                    precision_cell = cell(2)
+                    row["precision"] = self.combo(("single", "double"), parent=precision_cell,
+                        default_value=self._prefs.get("precision", "single"))
+
+                    row["overwrite"] = centered_checkbox_cell(
+                        82, checked=bool(self._prefs.get("overwrite", False)))
+
+                    schedule_cell = cell(2)
+                    row["schedule"] = self.combo(self.SCHEDULE_OPTIONS, parent=schedule_cell,
+                        default_value="Now", user_data=path, callback=self._schedule_changed)
+
+                    time_cell = cell(2)
+                    row["time"] = self.line_edit("Runs immediately", parent=time_cell, enabled=False, width=-1,
                         user_data=path, callback=self._time_changed)
                     row["live"] = True
                     row["mode"] = "Now"
                     row["saved"] = {"Run After": "00:30:00", "Run At": ""}
                     self.rows_by_path[path] = row
+        # Status belongs to the QDialogButtonBox middle slot rather than below
+        # the table.  This prevents the body child from becoming a few pixels
+        # taller than its viewport (and showing a stray vertical scrollbar).
         self.status = self.status_text(wrap=1000)
         self.run_button, _ = self.button_box([
             ("Run", self._run, "primary", True),
             ("Cancel", self.destroy, "secondary", False)],
-            left_actions=[("Estimate cores", self._estimate, "secondary", False)])
+            left_actions=[("Estimate cores", self._estimate, "secondary", False)],
+            status_item=self.status,
+            status_left_padding=14)
         self.estimate_button = self.left_buttons[0]
         self._tick()
 

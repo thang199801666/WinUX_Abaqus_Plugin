@@ -277,8 +277,9 @@ class ImGuiPushButton(QWidget):
         backend, options = self._construction(parent, backend)
         if width is not None:
             options["width"] = width
-        if height is not None:
-            options["height"] = height
+        # QPushButton has a stable style-driven height in Qt.  Do not let
+        # arbitrary surrounding ImGui item spacing determine button geometry.
+        options["height"] = METRICS.button_height if height is None else int(height)
         self.clicked = Signal()
         requested_role = str(role or "secondary")
         self._default = bool(default)
@@ -512,9 +513,12 @@ class _ImGuiAbstractSpinBox(QWidget):
 
         shell_width = -1 if width is None else int(width)
         native_parent = parent_options.get("parent")
+        # Keep the complete framed spin box at the same 26 px height as the
+        # other Qt-like editors.  The previous +2 px shell made QSpinBox look
+        # lower/taller than neighbouring combos and line edits in table rows.
         shell_options = {
             "width": shell_width,
-            "height": METRICS.control_height + 2,
+            "height": METRICS.control_height,
             "border": True,
             "no_scrollbar": True,
             "no_scroll_with_mouse": True,
@@ -523,11 +527,12 @@ class _ImGuiAbstractSpinBox(QWidget):
             shell_options["parent"] = native_parent
         self.container = backend.add_child_window(**shell_options)
 
+        inner_height = max(20, METRICS.control_height - 2 * METRICS.border_size)
         with backend.table(
             parent=self.container,
             header_row=False,
             width=-1,
-            height=METRICS.control_height,
+            height=inner_height,
             policy=backend.mvTable_SizingStretchProp,
             pad_outerX=False,
             borders_innerH=False,
@@ -536,7 +541,6 @@ class _ImGuiAbstractSpinBox(QWidget):
             borders_outerV=False,
         ):
             backend.add_table_column(width_stretch=True, init_width_or_weight=1.0)
-            backend.add_table_column(width_fixed=True, init_width_or_weight=1)
             backend.add_table_column(width_fixed=True, init_width_or_weight=self._button_width)
             with backend.table_row():
                 native_value = self._coerce(value)
@@ -557,12 +561,8 @@ class _ImGuiAbstractSpinBox(QWidget):
                 else:
                     input_tag = backend.add_input_int(**input_options)
 
-                separator = backend.add_child_window(
-                    width=1, height=METRICS.control_height, border=False,
-                    no_scrollbar=True, no_scroll_with_mouse=True,
-                )
                 with backend.group(horizontal=False, horizontal_spacing=0) as buttons:
-                    half_height = max(10, METRICS.control_height // 2)
+                    half_height = max(10, inner_height // 2)
                     self.up_button = self._create_spin_arrow(
                         backend, half_height, direction=1)
                     self.down_button = self._create_spin_arrow(
@@ -570,13 +570,12 @@ class _ImGuiAbstractSpinBox(QWidget):
 
         super().__init__(input_tag, parent=parent, after=after, backend=backend)
         self.valueChanged.owner = self
-        self.separator = separator
+        self.separator = None
         self.buttons = buttons
         bind_theme(backend, self.buttons, spin_button_stack_theme)
         self._properties.update(value=native_value, enabled=True)
         bind_theme(backend, self.tag, spin_editor_theme, kind=self._kind, disabled=False)
         bind_theme(backend, self.container, spin_shell_theme, focused=False, disabled=False)
-        bind_theme(backend, self.separator, separator_theme)
         if not self._drawn_arrows:
             for button in (self.up_button, self.down_button):
                 bind_theme(backend, button, spin_button_theme, disabled=False)
@@ -602,6 +601,16 @@ class _ImGuiAbstractSpinBox(QWidget):
                 points = ((cx - 3.5, cy - 1.7),
                           (cx + 3.5, cy - 1.7),
                           (cx, cy + 2.2))
+            # Draw the editor/button divider as a true single-pixel line in
+            # the arrow strip.  The old dedicated 1 px table column acquired
+            # extra table/child geometry on Windows and looked 2-3 px thick.
+            if hasattr(backend, "draw_line"):
+                try:
+                    backend.draw_line((0.5, 0), (0.5, height),
+                                      color=(188, 188, 188, 255),
+                                      thickness=1.0, parent=item)
+                except Exception:
+                    pass
             triangle = backend.draw_triangle(
                 *points, color=(40, 40, 40, 255), fill=(40, 40, 40, 255),
                 parent=item)
@@ -854,6 +863,14 @@ class ImGuiProgressBar(QWidget):
 
     def setFormat(self, text):
         self._on_ui("overlay", self._configure, "overlay", str(text))
+
+    def setState(self, state="normal"):
+        """Apply a semantic Qt-style progress state without changing value."""
+        self._on_ui("state", self._set_state, str(state or "normal"))
+
+    def _set_state(self, state):
+        self._properties["state"] = str(state or "normal")
+        bind_theme(self.backend, self.tag, progress_theme, state=self._properties["state"])
 
 
 class ImGuiCheckBox(QWidget):

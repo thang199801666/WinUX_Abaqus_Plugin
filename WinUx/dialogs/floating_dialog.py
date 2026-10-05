@@ -33,6 +33,7 @@ from ..runtime.child_processes import (
 from ..platform.dialog_focus import (
     foreground_hwnd as _foreground_hwnd, window_state as _window_state,
     owner_has_keyboard_focus as _owner_has_keyboard_focus, queue_owner_focus,
+    cancel_owner_focus_return,
 )
 from ..platform.floating_viewport import set_native_window_visible
 
@@ -299,6 +300,11 @@ class FloatingDialogController:
             self._child_pid = child_pid
         if not hwnd:
             return False
+        # Never accept the main WinUx viewport as the floating child HWND.
+        # A stale/ambiguous window lookup must not allow dialog teardown to
+        # execute SW_HIDE against the application owner itself.
+        if self._owner_hwnd and int(hwnd) == int(self._owner_hwnd):
+            return False
         if self._hwnd == hwnd:
             return True
         if self._hwnd:
@@ -362,11 +368,13 @@ class FloatingDialogController:
         # visible "blink" reported by users.  Native frameworks transfer the
         # foreground slot first and only then destroy/hide the owned dialog.
         preclose_handoff = False
-        if return_focus and self._hwnd and getattr(self, "_native_visible", False):
+        if (return_focus and self._hwnd and getattr(self, "_native_visible", False)
+                and int(self._hwnd) != int(self._owner_hwnd or 0)):
             preclose_handoff = handoff_owner_before_close(
                 self._owner_hwnd, self._hwnd)
 
-        if self._hwnd and getattr(self, "_native_visible", False):
+        if (self._hwnd and getattr(self, "_native_visible", False)
+                and int(self._hwnd) != int(self._owner_hwnd or 0)):
             set_native_window_visible(self._hwnd, False)
             self._native_visible = False
         self._closed = self._finalized = True
@@ -446,6 +454,9 @@ class FloatingDialogController:
         """
         self._visible = bool(visible)
         if self._visible:
+            # A newly shown sibling invalidates any deferred focus restoration
+            # left behind by a dialog that just closed on the same owner.
+            cancel_owner_focus_return(self._owner_hwnd)
             self._focus_return_generation = getattr(self, "_focus_return_generation", 0) + 1
             try:
                 owner_live, owner_visible, _owner_enabled = _window_state(self._owner_hwnd)

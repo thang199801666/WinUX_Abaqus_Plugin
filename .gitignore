@@ -6,3 +6,15 @@ __pycache__/
 .DS_Store
 .env
 .env.*
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+settings.json
+known_hosts
+OPTIMIZATION_GOAL.md
+REFACTOR_NOTES.md
+tools/*.json

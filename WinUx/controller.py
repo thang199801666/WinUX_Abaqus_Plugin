@@ -753,6 +753,9 @@ class WinUXController(ExplorerTransferInteractionMixin):
         if not self._ensure_server_online():
             return False
         try:
+            # A user command may change cwd, so the next Server Files
+            # navigation must be allowed to re-synchronise the shell.
+            self.server.invalidate_shell_directory()
             self.server.send_shell_command(command)
             return True
         except Exception as exc:

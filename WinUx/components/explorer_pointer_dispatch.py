@@ -326,6 +326,10 @@ class ExplorerPointerDispatchMixin:
             if abs(delta) >= float(self.DRAG_THRESHOLD):
                 self._separator_click_candidate_key = None
             self._column_widths[self._resize_key] = new_width
+            if self.auto_width_enabled:
+                # Keep the grabbed section authoritative while all remaining
+                # visible sections immediately absorb the complementary delta.
+                self._sync_auto_width_to_viewport(locked_key=self._resize_key)
 
             if abs(old_width - new_width) >= 0.01:
                 # Mouse-drag handlers already run at most once per rendered
@@ -561,6 +565,11 @@ class ExplorerPointerDispatchMixin:
                 return
             if not self.commit_inline_rename():
                 return
+        inside_header, _local_x = self._header_mouse_position()
+        if inside_header:
+            self._clear_hover()
+            self._show_header_context_menu()
+            return
         if not self._mouse_in_body():
             return
         if not self._has_focus:

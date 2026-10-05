@@ -22,18 +22,29 @@ class LoginForm(QtDialog):
         # Match the pre-migration login geometry: one compact form, no nested
         # group-box chrome.  The controls themselves remain retained Dear ImGui
         # widgets and keep the newer focus/validation behavior.
-        super().__init__(view, "SSH Login", 420, 242)
-        self.preferred_size = (420, 220)
-        self.host_combo = self._combo_field("Host:", initial.get("hosts", []), initial.get("host", ""), self._host_changed, self.content)
+        super().__init__(view, "SSH Login", 420, 204)
+        # A single QFormLayout-like table keeps all four editors on one shared
+        # baseline/label column.  The previous one-table-per-field layout added
+        # Dear ImGui ItemSpacing between every row and made this small dialog
+        # look much looser than its Qt counterpart.
+        self.preferred_size = (420, 184)
+        self._form = self.form_layout(parent=self.content, label_width=78)
+        self.host_combo = self._combo_field(
+            "Host:", initial.get("hosts", []), initial.get("host", ""),
+            self._host_changed, self._form)
         self.host = self.host_combo.input
-        self.port = self.field("Port:", initial.get("port", "22"), parent=self.content)
-        self.username_combo = self._combo_field("Username:", initial.get("usernames", []), initial.get("username", ""), self._username_changed, self.content)
+        self.port = self._line_field("Port:", initial.get("port", "22"), self._form)
+        self.username_combo = self._combo_field(
+            "Username:", initial.get("usernames", []), initial.get("username", ""),
+            self._username_changed, self._form)
         self.username = self.username_combo.input
-        self.password = self.field("Password:", initial.get("password", ""), parent=self.content, password=True)
-        self._remember_widget = self.own_widget(ImGuiCheckBox(
-            "Remember password for this Windows account",
-            checked=initial.get("remember", False), parent=self.content,
-            after=view.after, backend=dpg))
+        self.password = self._line_field(
+            "Password:", initial.get("password", ""), self._form, password=True)
+        self._remember_widget = self.form_layout_row(
+            self._form, "", lambda parent: self.own_widget(ImGuiCheckBox(
+                "Remember password for this Windows account",
+                checked=initial.get("remember", False), parent=parent,
+                after=view.after, backend=dpg)))
         self.remember = self._remember_widget.tag
         self.error = self.status_text(error=True, wrap=360)
         self.connect_button, self.cancel_button = self.button_box([
@@ -41,13 +52,22 @@ class LoginForm(QtDialog):
             ("Cancel", self.cancel_from_window, "secondary", False)])
 
     def _combo_field(self, label, items, value, callback, parent=None):
-        combo = self.labeled_widget(label,
-            lambda: ImGuiComboBox(items=items, default_value=value, width=-1, callback=callback), parent)
+        combo = self.form_layout_row(
+            parent or self._form, label,
+            lambda editor_parent: ImGuiComboBox(
+                items=items, default_value=value, width=-1, callback=callback,
+                parent=editor_parent))
         # Emit edits as well as history selection; there is only one field per
         # value, with the arrow beside the editable text like QComboBox.
         dpg.configure_item(combo.input, on_enter=False)
         self._combos.append(combo)
         return combo
+
+    def _line_field(self, label, value, parent=None, **kwargs):
+        return self.form_layout_row(
+            parent or self._form, label,
+            lambda editor_parent: self.line_edit(
+                value, parent=editor_parent, width=-1, **kwargs))
 
     def invoke_default(self):
         if not any(combo.popup_open() for combo in self._combos):
@@ -119,7 +139,7 @@ class LoginForm(QtDialog):
             self.set_error("Port must be a number from 1 to 65535.")
             return
         self.set_busy(True)
-        dpg.set_value(self.error, "")
+        self.set_status_text(self.error, "", error=True)
         self.submit_from_window(values)
 
     def submit_from_window(self, values):
@@ -146,7 +166,8 @@ class LoginForm(QtDialog):
 
     def _set_error(self, message):
         if self.winfo_exists():
-            dpg.set_value(self.error, str(message))
+            text = str(message or "")
+            self.set_status_text(self.error, text, error=True)
             self.set_busy(False)
 
     def handle_command(self, command, *args, **kwargs):

@@ -18,7 +18,13 @@ class ServerPathDialog(QtDialog):
         super().__init__(view, "Server Folder", 520, 340)
         self.preferred_size = (510, 315)
         self.header("Choose server folder", "Enter a remote path or choose a matching folder.")
-        self.entry = self.field("Remote path", initial or "/", callback=lambda: self._schedule_search())
+        form = self.form_layout(parent=self.content, label_width=88)
+        self.entry = self.form_layout_row(
+            form, "Remote path",
+            lambda parent: self.line_edit(
+                initial or "/", parent=parent,
+                callback=lambda: self._schedule_search()),
+        )
         self.listbox = self.own_widget(QtListView(
             self.content, [], width=-1, visible_rows=8,
             after=self.view.after, backend=dpg))

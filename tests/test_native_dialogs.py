@@ -307,7 +307,10 @@ class NativeDialogThreadingRegressionTests(unittest.TestCase):
 
     def test_settings_exposes_default_abaqus_command(self):
         source = text("settings_form.py")
-        self.assertIn('self.labeled_widget("Default",', source)
+        # Rev13 consolidates related fields into one QFormLayout instead of
+        # creating a separate mini-grid per labeled widget.
+        self.assertIn('command_form = self.form_layout(parent=commands, label_width=78)', source)
+        self.assertIn('command_form, "Default",', source)
         self.assertIn('self.default_command', source)
 
 
@@ -340,7 +343,7 @@ class QtNativeDialogChromeTests(unittest.TestCase):
 
     def test_login_sizes_to_layout_so_button_box_is_not_clipped(self):
         source = text("login_form.py")
-        self.assertIn('self.preferred_size = (420, 220)', source)
+        self.assertIn('self.preferred_size = (420, 184)', source)
         self.assertIn('self.button_box(', source)
         self.assertIn('resizable=False', LOGIN_DIALOG.read_text(encoding="utf-8"))
         self.assertIn('getattr(self.form, "preferred_size", None)', text("floating_runtime.py"))

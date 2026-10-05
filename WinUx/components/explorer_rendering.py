@@ -36,7 +36,7 @@ class ExplorerRenderingMixin:
                     fonts["body"] = dpg.add_font(body_path, self.BODY_FONT_PX)
                 for path in bold_candidates:
                     if os.path.exists(path):
-                        fonts["header"] = dpg.add_font(path, 16)
+                        fonts["header"] = dpg.add_font(path, 14)
                         break
         except Exception:
             pass
@@ -198,6 +198,8 @@ class ExplorerRenderingMixin:
                 getattr(self, "_context_menu_keyboard_button_theme", None),
                 getattr(self, "_context_menu_disabled_button_theme", None),
                 getattr(self, "_context_menu_disabled_icon_theme", None),
+                getattr(self, "_context_menu_shortcut_theme", None),
+                getattr(self, "_context_menu_disabled_shortcut_theme", None),
                 getattr(self, "_context_menu_arrow_theme", None),
                 getattr(self, "_context_menu_disabled_arrow_theme", None),
             ):
@@ -252,6 +254,32 @@ class ExplorerRenderingMixin:
                 dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
                 dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
                 dpg.add_theme_style(dpg.mvStyleVar_ButtonTextAlign, 0.0, 0.5)
+
+
+        with dpg.theme() as self._context_menu_shortcut_theme:
+            with dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 0, 0, 0))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, p.MENU_HOVER)
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, p.MENU_ACTIVE)
+                dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT)
+                dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 4, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_ButtonTextAlign, 1.0, 0.5)
+
+        with dpg.theme() as self._context_menu_disabled_shortcut_theme:
+            with dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 0, 0, 0))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, (0, 0, 0, 0))
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, (0, 0, 0, 0))
+                dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT_DISABLED)
+                dpg.add_theme_color(dpg.mvThemeCol_TextDisabled, p.TEXT_DISABLED)
+                dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 4, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_ButtonTextAlign, 1.0, 0.5)
 
         with dpg.theme() as self._context_menu_icon_theme:
             with dpg.theme_component(dpg.mvImageButton):
@@ -586,10 +614,23 @@ class ExplorerRenderingMixin:
         self._header_items = {}
         self._header_top_line = None
         self._header_bottom_line = None
+        self._header_background = None
         self._reset_row_registry()
-        dpg.draw_rectangle((0, 0), (max(1.0, self._available_width()), self.HEADER_HEIGHT),
-                           parent=self.header_canvas, fill=self.theme_config["header_bg"],
-                           color=self.theme_config["header_bg"], thickness=0)
+
+        # Keep one explicit background primitive for the *whole* header.
+        # The header drawlist itself can grow later when Auto Width reacts to
+        # startup/layout/splitter changes.  If this rectangle is left at the
+        # width measured during construction, the newly exposed part of the
+        # drawlist falls back to the canvas/window background and produces the
+        # visibly uneven grey strip seen after a resize.
+        self._header_background = dpg.draw_rectangle(
+            (0, 0),
+            (max(1.0, self._available_width()), self.HEADER_HEIGHT),
+            parent=self.header_canvas,
+            fill=self.theme_config["header_bg"],
+            color=self.theme_config["header_bg"],
+            thickness=0,
+        )
 
         for column in self._visible_columns():
             key = column["key"]

@@ -1,24 +1,23 @@
-"""Qt/Fusion-like editable combo box built only from Dear PyGui primitives.
+"""Qt/Fusion-like editable combo box implemented with Dear PyGui only.
 
-This module intentionally contains no Qt/Tk/native-widget dependency.  The
-editor is a real ``mvInputText`` so Dear ImGui owns text editing and the caret;
-the arrow is a small drawlist hit target inside the same framed shell, and the
-popup is a DPG popup window containing selectables.  The triangle is geometry,
-not a font glyph, so Windows font fallback cannot turn it into a replacement
-symbol.  The control therefore
-looks like one QComboBox while keeping the InputText completely unobstructed.
+The control deliberately uses one *full-width* native ``mvCombo`` as the visual
+frame and popup owner, then places a borderless ``mvInputText`` over the preview
+region.  This mirrors Qt's editable QComboBox composition: one outer frame, an
+editable line edit inside it, and one arrow sub-control at the right.  Because
+the native combo spans the entire control, Dear ImGui anchors the drop-down to
+the full control width instead of to a tiny arrow-only widget.
+
+The editor is an overlay only over the preview region; the native combo arrow
+remains exposed and owns the popup interaction.  No nested WinUx popup, child
+drop-down or font arrow glyph is used.
 """
 from __future__ import annotations
 
 import dearpygui.dearpygui as dpg
 
-from .qt_style import QtFusionPalette, QtFusionMetrics
+from .qt_style import QtFusionPalette
 from ..widgets.core import Signal
 from ..widgets.imgui_qt_style import METRICS
-from .interaction_gate import (
-    register_pointer_protected_item,
-    unregister_pointer_protected_item,
-)
 
 
 _SHELL_THEME = "winux.qt_combo.shell.normal"
@@ -28,7 +27,6 @@ _INPUT_THEME = "winux.qt_combo.editor.normal"
 _DISABLED_INPUT_THEME = "winux.qt_combo.editor.disabled"
 _ARROW_THEME = "winux.qt_combo.arrow.normal"
 _DISABLED_ARROW_THEME = "winux.qt_combo.arrow.disabled"
-_POPUP_THEME = "winux.qt_combo.popup"
 
 
 def _shell_theme(*, focused=False, disabled=False):
@@ -49,6 +47,11 @@ def _shell_theme(*, focused=False, disabled=False):
             dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 1)
         with dpg.theme_component(dpg.mvTable):
             dpg.add_theme_style(dpg.mvStyleVar_CellPadding, 0, 0)
+            # One real table border is the Qt-style separator between the
+            # editable field and the native combo arrow.  This remains exactly
+            # one physical line instead of consuming a layout column.
+            dpg.add_theme_color(dpg.mvThemeCol_TableBorderLight, (220, 220, 220, 255))
+            dpg.add_theme_color(dpg.mvThemeCol_TableBorderStrong, (220, 220, 220, 255))
     return tag
 
 
@@ -68,8 +71,6 @@ def _input_theme(*, disabled=False):
             dpg.add_theme_color(dpg.mvThemeCol_TextDisabled, p.TEXT_DISABLED)
             cursor_role = getattr(dpg, "mvThemeCol_InputTextCursor", None)
             if cursor_role is not None:
-                # Explicit cursor colour fixes the light-theme case where the
-                # bundled Dear ImGui can inherit a cursor too close to white.
                 dpg.add_theme_color(cursor_role, p.TEXT_DISABLED if disabled else p.TEXT)
             dpg.add_theme_color(dpg.mvThemeCol_TextSelectedBg, (0, 120, 215, 115))
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 4)
@@ -79,88 +80,51 @@ def _input_theme(*, disabled=False):
 
 
 def _arrow_theme(*, disabled=False):
+    """Theme the full-width native combo frame and its Qt arrow sub-control."""
     tag = _DISABLED_ARROW_THEME if disabled else _ARROW_THEME
     if dpg.does_item_exist(tag):
         return tag
     p = QtFusionPalette
-    face = p.BUTTON_DISABLED if disabled else p.BASE
+    base = p.BUTTON_DISABLED if disabled else p.BASE
+    # Qt/Fusion keeps the arrow area only subtly different from the editor.
+    # That visual edge replaces the old thick separator strip.
+    arrow = p.BUTTON_DISABLED if disabled else (248, 248, 248, 255)
+    face = arrow  # compatibility name: suppress a nested nav-focus rectangle
+    hover = arrow if disabled else (238, 238, 238, 255)
+    active = arrow if disabled else (226, 226, 226, 255)
+    text = p.TEXT_DISABLED if disabled else p.TEXT
     with dpg.theme(tag=tag):
-        with dpg.theme_component(dpg.mvButton):
-            dpg.add_theme_color(dpg.mvThemeCol_Button, face)
-            dpg.add_theme_color(
-                dpg.mvThemeCol_ButtonHovered,
-                face if disabled else p.HIGHLIGHT_HOVER,
-            )
-            dpg.add_theme_color(
-                dpg.mvThemeCol_ButtonActive,
-                face if disabled else p.HIGHLIGHT_SOFT,
-            )
-            dpg.add_theme_color(
-                dpg.mvThemeCol_Text,
-                p.TEXT_DISABLED if disabled else p.TEXT,
-            )
-            dpg.add_theme_color(dpg.mvThemeCol_Border, p.BASE)
-            # The outer combo shell owns the focus frame.  Keep the arrow
-            # sub-control from drawing a second navigation rectangle, and
-            # explicitly center the small down-triangle like QStyle does.
-            dpg.add_theme_color(dpg.mvThemeCol_NavHighlight, face)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
-            text_align = getattr(dpg, "mvStyleVar_ButtonTextAlign", None)
-            if text_align is not None:
-                dpg.add_theme_style(text_align, 0.5, 0.48)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
-            # One outer frame owns the whole control.  A second button border
-            # makes the combo look like two widgets glued together, so the
-            # arrow sub-control is intentionally borderless.
-            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
-    return tag
-
-
-
-def _separator_theme():
-    tag = "winux.qt_combo.separator"
-    if dpg.does_item_exist(tag):
-        return tag
-    p = QtFusionPalette
-    with dpg.theme(tag=tag):
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.BORDER_LIGHT)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, p.BORDER_LIGHT)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return tag
-
-def _popup_theme():
-    if dpg.does_item_exist(_POPUP_THEME):
-        return _POPUP_THEME
-    p = QtFusionPalette
-    with dpg.theme(tag=_POPUP_THEME):
-        with dpg.theme_component(dpg.mvWindowAppItem):
-            dpg.add_theme_color(dpg.mvThemeCol_WindowBg, p.MENU)
-            dpg.add_theme_color(dpg.mvThemeCol_PopupBg, p.MENU)
+        with dpg.theme_component(dpg.mvCombo):
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, base)
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, base)
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, base)
+            dpg.add_theme_color(dpg.mvThemeCol_Button, arrow)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, hover)
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, active)
+            dpg.add_theme_color(dpg.mvThemeCol_Text, text)
             dpg.add_theme_color(dpg.mvThemeCol_Border, p.BORDER)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 2, 2)
+            dpg.add_theme_color(dpg.mvThemeCol_NavHighlight, face)
+            dpg.add_theme_color(dpg.mvThemeCol_PopupBg, p.BASE)
+            dpg.add_theme_color(dpg.mvThemeCol_Header, p.SELECTION_INACTIVE)
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, p.HIGHLIGHT_HOVER)
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, p.HIGHLIGHT_SOFT)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 2, 4)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 1)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowBorderSize, 1)
-        with dpg.theme_component(dpg.mvSelectable):
-            dpg.add_theme_color(dpg.mvThemeCol_Header, p.HIGHLIGHT_SOFT)
-            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, p.MENU_HOVER)
-            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, p.MENU_ACTIVE)
-            dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 4)
-            dpg.add_theme_style(dpg.mvStyleVar_SelectableTextAlign, 0.0, 0.5)
-    return _POPUP_THEME
+            dpg.add_theme_style(dpg.mvStyleVar_PopupRounding, 1)
+            dpg.add_theme_style(dpg.mvStyleVar_PopupBorderSize, 1)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 2, 2)
+    return tag
 
 
 class ImGuiComboBox:
-    """Editable QComboBox-like control implemented entirely in Dear PyGui.
+    """Editable QComboBox-like retained control with one native outer frame.
 
-    The text editor itself is never covered by an invisible item and is never
-    re-focused from a click callback.  A normal mouse click therefore reaches
-    Dear ImGui's InputText directly, preserving its native insertion cursor and
-    caret placement.  Focus styling is painted on the outer shell only.
+    ``mvCombo`` spans the complete control and owns the drop-down.  A borderless
+    editable ``mvInputText`` is layered over only the preview region.  The result
+    is one visual control rather than an InputText and arrow widget glued
+    together, while popup geometry remains native Dear ImGui behavior.
     """
 
     ARROW_WIDTH = METRICS.arrow_width
@@ -184,12 +148,11 @@ class ImGuiComboBox:
         self._handlers = dpg.generate_uuid()
         self._input_handlers = dpg.generate_uuid()
         self._button_handlers = dpg.generate_uuid()
-        self._value = (str(default_value) if default_value is not None
-                       else (self.items[0] if self.items else ""))
-        self._popup = None
-        self._popup_items = []
-        self._popup_index = -1
+        self._geometry_handlers = dpg.generate_uuid()
         self._max_visible_items = self.MAX_VISIBLE_ROWS
+        self._native_popup_hint = False
+        self._value = str(default_value if default_value is not None else
+                          (self.items[0] if self.items else ""))
 
         shell_width = self.width if self.width >= 0 else -1
         self.container = dpg.add_child_window(
@@ -203,63 +166,62 @@ class ImGuiComboBox:
         self.shell = self.container
         dpg.bind_item_theme(self.shell, _shell_theme())
 
-        with dpg.table(
+        # The native combo is intentionally full-width.  Do NOT use
+        # ``no_preview=True`` here: Dear ImGui makes a no-preview combo only as
+        # wide as its arrow button, which is exactly why earlier WinUx builds
+        # produced a narrow popup anchored to the right edge.
+        self.button = dpg.add_combo(
+            self.items,
+            label="",
             parent=self.shell,
-            header_row=False,
             width=-1,
-            height=self.CONTROL_HEIGHT,
-            policy=dpg.mvTable_SizingStretchProp,
-            pad_outerX=False,
-            borders_innerH=False,
-            borders_outerH=False,
-            borders_innerV=False,
-            borders_outerV=False,
-        ):
-            dpg.add_table_column(width_stretch=True, init_width_or_weight=1.0)
-            dpg.add_table_column(width_fixed=True, init_width_or_weight=1)
-            dpg.add_table_column(
-                width_fixed=True, init_width_or_weight=self.ARROW_WIDTH)
-            with dpg.table_row():
-                self.input = dpg.add_input_text(
-                    tag=self.tag,
-                    default_value=self._value,
-                    width=-1,
-                    readonly=not self.editable,
-                    callback=self._input_changed,
-                    on_enter=False,
-                    auto_select_all=False,
-                )
-                self.separator = dpg.add_child_window(
-                    width=1, height=self.CONTROL_HEIGHT, border=False,
-                    no_scrollbar=True, no_scroll_with_mouse=True,
-                )
-                self.button = dpg.add_drawlist(
-                    width=self.ARROW_WIDTH,
-                    height=self.CONTROL_HEIGHT,
-                )
-                cx = self.ARROW_WIDTH * 0.5
-                cy = self.CONTROL_HEIGHT * 0.5 + 0.5
-                self._arrow_triangle = dpg.draw_triangle(
-                    (cx - 4.0, cy - 2.0),
-                    (cx + 4.0, cy - 2.0),
-                    (cx, cy + 2.5),
-                    color=QtFusionPalette.TEXT,
-                    fill=QtFusionPalette.TEXT,
-                    parent=self.button,
-                )
+            pos=(0, 0),
+            default_value=self._native_value_for(self._value),
+            no_preview=False,
+            popup_align_left=True,
+            fit_width=False,
+            callback=self._native_selected,
+        )
+        dpg.bind_item_theme(self.button, _arrow_theme())
 
-        # Compatibility names retained for existing callers/tests.
+        # Overlay the editable field on the combo preview only.  Negative width
+        # follows ImGui's fill-minus-N convention, so it tracks dialog resizing
+        # without a table or a second independently-sized widget.  One pixel is
+        # left before the arrow sub-control to read as a Qt separator.
+        editor_right_reserve = self.ARROW_WIDTH + 1
+        self.input = dpg.add_input_text(
+            tag=self.tag,
+            parent=self.shell,
+            default_value=self._value,
+            width=-editor_right_reserve,
+            pos=(1, 1),
+            readonly=not self.editable,
+            callback=self._input_changed,
+            on_enter=False,
+            auto_select_all=False,
+        )
+        dpg.bind_item_theme(self.input, _input_theme())
+
+        # Compatibility names retained for callers written against earlier
+        # wrappers. The native combo itself is the popup/list owner.
         self.search = None
         self.listbox = self.button
+        self.separator = None
+        self._popup = None
+        self._popup_items = []
+        self._popup_index = -1
 
-        dpg.bind_item_theme(self.input, _input_theme())
-        dpg.bind_item_theme(self.separator, _separator_theme())
-        self._render_arrow()
-        self._create_popup()
         self._install_input_state_handlers()
         self._install_button_state_handlers()
+        self._install_geometry_handlers()
         self._install_handlers()
         self._refresh_shell_theme()
+
+    def _native_value_for(self, text):
+        text = str(text or "")
+        if text in self.items:
+            return text
+        return self.items[0] if self.items else ""
 
     # ------------------------------------------------------------------ API
     def current_text(self):
@@ -288,12 +250,18 @@ class ImGuiComboBox:
 
     def set_current_text(self, value, emit=False):
         old_text = self.current_text() if dpg.does_item_exist(self.input) else self._value
-        old_index = self.current_index() if dpg.does_item_exist(self.input) else -1
+        try:
+            old_index = self.items.index(old_text)
+        except ValueError:
+            old_index = -1
         self._value = str(value or "")
         if dpg.does_item_exist(self.input):
             dpg.set_value(self.input, self._value)
+        if self.button and dpg.does_item_exist(self.button) and self._value in self.items:
+            # The preview is hidden, but keeping the native combo selection in
+            # sync makes its popup highlight the same item as the editor.
+            dpg.set_value(self.button, self._value)
         new_index = self.current_index() if dpg.does_item_exist(self.input) else -1
-        self._sync_popup_selection()
         if old_text != self._value:
             self.currentTextChanged.emit(self._value)
         if old_index != new_index:
@@ -305,7 +273,7 @@ class ImGuiComboBox:
 
     def add_items(self, items):
         self.items.extend(str(item) for item in items)
-        self._rebuild_popup_items()
+        self._sync_native_items()
 
     addItems = add_items
 
@@ -329,11 +297,12 @@ class ImGuiComboBox:
 
     def clear(self):
         self.items = []
-        self._popup_index = -1
-        self._rebuild_popup_items()
+        self._sync_native_items()
         self.set_current_text("")
 
     def setMaxVisibleItems(self, count):
+        # Dear ImGui owns native combo popup sizing. Keep the Qt-compatible API
+        # for callers even though DPG exposes only coarse combo height modes.
         self._max_visible_items = max(1, int(count))
 
     def maxVisibleItems(self):
@@ -344,11 +313,9 @@ class ImGuiComboBox:
         if dpg.does_item_exist(self.input):
             dpg.configure_item(self.input, enabled=self.enabled)
             dpg.bind_item_theme(self.input, _input_theme(disabled=not self.enabled))
-        # Drawlists do not expose an enabled flag.  The click callback checks
-        # ``self.enabled`` and the triangle is recoloured explicitly.
-        self._render_arrow()
-        if not self.enabled:
-            self.close_popup()
+        if self.button and dpg.does_item_exist(self.button):
+            dpg.configure_item(self.button, enabled=self.enabled)
+            dpg.bind_item_theme(self.button, _arrow_theme(disabled=not self.enabled))
         self._refresh_shell_theme()
         return self
 
@@ -358,165 +325,67 @@ class ImGuiComboBox:
         return bool(self.enabled)
 
     def popup_open(self):
-        if not self._popup or not dpg.does_item_exist(self._popup):
-            return False
-        try:
-            return bool(dpg.is_item_shown(self._popup))
-        except Exception:
-            return False
-
-    def _render_arrow(self):
-        """Keep the geometric arrow without reconfiguring draw commands.
-
-        Dear PyGui 2.3.1 on Windows can raise a C-extension SystemError when
-        ``configure_item`` is used to mutate draw-triangle colour/fill after
-        creation.  The combo remains functionally disabled through
-        ``self.enabled``/``open_popup``; the arrow itself is deliberately
-        static so startup never touches the unsafe draw-item configure path.
-        """
-        return
-
-    def _popup_geometry(self):
-        x, y = dpg.get_item_rect_min(self.shell)
-        width, height = dpg.get_item_rect_size(self.shell)
-        rows = max(1, min(len(self.items), self._max_visible_items))
-        popup_width = max(80, int(width))
-        popup_height = rows * self.POPUP_ROW_HEIGHT + 4
-        try:
-            viewport_width = int(dpg.get_viewport_client_width())
-            viewport_height = int(dpg.get_viewport_client_height())
-        except Exception:
-            viewport_width = max(popup_width, int(x + popup_width))
-            viewport_height = max(popup_height, int(y + height + popup_height))
-        popup_x = max(0, min(int(x), max(0, viewport_width - popup_width)))
-        below_y = int(y + height)
-        above_y = int(y - popup_height)
-        popup_y = below_y if below_y + popup_height <= viewport_height else max(0, above_y)
-        return popup_x, popup_y, popup_width, popup_height
-
-    def _scroll_popup_to_index(self, index):
-        if index < 0 or not self._popup or not dpg.does_item_exist(self._popup):
-            return
-        try:
-            visible = max(1, self._max_visible_items)
-            first = max(0, index - visible + 1)
-            dpg.set_y_scroll(self._popup, first * self.POPUP_ROW_HEIGHT)
-        except Exception:
-            pass
+        # DPG does not expose the internal BeginCombo popup id.  The hint is
+        # deliberately conservative and used only to suppress a dialog default
+        # action for the frame in which the arrow was activated/selection made.
+        return bool(self._native_popup_hint)
 
     def open_popup(self):
-        if not self.enabled or not self.items:
-            return
-        if not self._popup or not dpg.does_item_exist(self._popup):
-            self._create_popup()
-        try:
-            self._popup_index = self.current_index()
-            if self._popup_index < 0:
-                self._popup_index = 0
-            self._sync_popup_selection(self._popup_index)
-            x, y, width, height = self._popup_geometry()
-            # Configure while hidden, then reveal at the final position.  This
-            # mirrors QComboBox popup placement and avoids a one-frame jump.
-            dpg.configure_item(self._popup, width=width, height=height, show=False)
-            dpg.set_item_pos(self._popup, (x, y))
-            self._scroll_popup_to_index(self._popup_index)
-            dpg.configure_item(self._popup, show=True)
-            dpg.focus_item(self._popup)
-        except Exception:
-            pass
+        """Qt compatibility helper.
+
+        Dear PyGui has no public API to programmatically call BeginCombo/OpenPopup
+        for an existing mvCombo.  Focusing the native sub-control preserves the
+        keyboard contract without reintroducing a second custom popup.
+        """
+        if self.enabled and self.button and dpg.does_item_exist(self.button):
+            try:
+                dpg.focus_item(self.button)
+                self._native_popup_hint = True
+            except Exception:
+                pass
         self._refresh_shell_theme()
 
     showPopup = open_popup
 
     def close_popup(self):
-        if self._popup and dpg.does_item_exist(self._popup):
-            try:
-                dpg.configure_item(self._popup, show=False)
-            except Exception:
-                pass
-        self._popup_index = -1
-        self._sync_popup_selection()
+        # Native BeginCombo popups auto-dismiss on selection/click-away/Escape.
+        self._native_popup_hint = False
         self._refresh_shell_theme()
 
     hidePopup = close_popup
 
     def toggle_popup(self, sender=None, app_data=None, user_data=None):
-        if self.popup_open():
-            self.close_popup()
-        else:
-            self.open_popup()
+        # Kept for API compatibility.  Mouse opening is owned by mvCombo.
+        self.open_popup()
 
     def focus_editor(self):
-        """Compatibility helper for explicit keyboard navigation focus only.
-
-        Do not call this from a mouse-click handler. Mouse clicks must be left
-        entirely to ImGui InputText so the native insertion point/caret survives.
-        """
         if self.enabled and dpg.does_item_exist(self.input):
             try:
                 dpg.focus_item(self.input)
             except Exception:
                 pass
 
-    # -------------------------------------------------------------- popup
-    def _create_popup(self):
-        if self._popup and dpg.does_item_exist(self._popup):
+    def _sync_native_items(self):
+        if not self.button or not dpg.does_item_exist(self.button):
             return
-        self._popup = dpg.add_window(
-            popup=True,
-            show=False,
-            no_title_bar=True,
-            no_move=True,
-            no_resize=True,
-            no_collapse=True,
-            no_saved_settings=True,
-            width=160,
-            height=100,
-        )
-        dpg.bind_item_theme(self._popup, _popup_theme())
-        # Dear PyGui global mouse handlers continue firing behind popup
-        # windows. Register this popup as a protected foreground surface so
-        # Explorer/ListView drag, selection and splitters never receive the
-        # same click used to choose a combo item.
-        register_pointer_protected_item(self._popup)
-        self._rebuild_popup_items()
+        dpg.configure_item(self.button, items=list(self.items))
+        if self.current_text() in self.items:
+            dpg.set_value(self.button, self.current_text())
+        elif self.items:
+            dpg.set_value(self.button, self.items[0])
 
-    def _rebuild_popup_items(self):
-        if not self._popup or not dpg.does_item_exist(self._popup):
+    def _native_selected(self, sender=None, app_data=None, user_data=None):
+        value = str(app_data or "")
+        if not value and sender and dpg.does_item_exist(sender):
+            try:
+                value = str(dpg.get_value(sender) or "")
+            except Exception:
+                value = ""
+        if not value:
             return
-        for item in list(self._popup_items):
-            if dpg.does_item_exist(item):
-                dpg.delete_item(item)
-        self._popup_items = []
-        current = self.current_text() if dpg.does_item_exist(self.input) else self._value
-        for value in self.items:
-            tag = dpg.add_selectable(
-                parent=self._popup,
-                label=value,
-                width=-1,
-                default_value=(value == current),
-                callback=self._popup_selected,
-                user_data=value,
-            )
-            self._popup_items.append(tag)
-
-    def _sync_popup_selection(self, index=None):
-        """Mirror QComboBox current-index/highlight state in the popup list."""
-        if index is None:
-            current = self.current_text() if dpg.does_item_exist(self.input) else self._value
-            index = self.items.index(current) if current in self.items else -1
-        for row, item in enumerate(self._popup_items):
-            if dpg.does_item_exist(item):
-                try:
-                    dpg.set_value(item, row == index)
-                except Exception:
-                    pass
-
-    def _popup_selected(self, sender=None, app_data=None, user_data=None):
-        value = str(user_data if user_data is not None else "")
+        self._native_popup_hint = False
         self.set_current_text(value, emit=True)
         self.activated.emit(self.current_index())
-        self.close_popup()
 
     # -------------------------------------------------------------- behavior
     @staticmethod
@@ -530,11 +399,7 @@ class ImGuiComboBox:
             return False
 
     def _owns_keyboard(self):
-        return bool(
-            self._item_focused(self.input)
-            or self._item_focused(self.button)
-            or self.popup_open()
-        )
+        return bool(self._item_focused(self.input) or self._item_focused(self.button))
 
     def _refresh_shell_theme(self, *_args):
         if not self.shell or not dpg.does_item_exist(self.shell):
@@ -544,15 +409,10 @@ class ImGuiComboBox:
             self.shell,
             _shell_theme(focused=focused, disabled=not self.enabled),
         )
-        self._render_arrow()
 
     def _install_input_state_handlers(self):
         try:
             with dpg.item_handler_registry(tag=self._input_handlers):
-                # Do NOT install a clicked handler here.  Programmatic
-                # focus_item() from a click callback converts InputText to nav
-                # focus on some DPG builds and is the reason WinUx showed a blue
-                # focus frame without a blinking insertion caret.
                 if hasattr(dpg, "add_item_focus_handler"):
                     dpg.add_item_focus_handler(callback=self._refresh_shell_theme)
                 if hasattr(dpg, "add_item_activated_handler"):
@@ -563,20 +423,55 @@ class ImGuiComboBox:
         except Exception:
             self._input_handlers = None
 
+    def _button_activated(self, *_args):
+        self._native_popup_hint = True
+        self._refresh_shell_theme()
+
+    def _button_deactivated(self, *_args):
+        # Do not immediately assume the popup is closed; selection callback or
+        # the next outside click will clear the hint.  The hint does not drive
+        # popup rendering, only LoginForm's default-button suppression.
+        self._refresh_shell_theme()
+
     def _install_button_state_handlers(self):
         try:
             with dpg.item_handler_registry(tag=self._button_handlers):
-                dpg.add_item_clicked_handler(
-                    button=dpg.mvMouseButton_Left,
-                    callback=self.toggle_popup,
-                )
                 if hasattr(dpg, "add_item_activated_handler"):
-                    dpg.add_item_activated_handler(callback=self._refresh_shell_theme)
+                    dpg.add_item_activated_handler(callback=self._button_activated)
                 if hasattr(dpg, "add_item_deactivated_handler"):
-                    dpg.add_item_deactivated_handler(callback=self._refresh_shell_theme)
+                    dpg.add_item_deactivated_handler(callback=self._button_deactivated)
             dpg.bind_item_handler_registry(self.button, self._button_handlers)
         except Exception:
             self._button_handlers = None
+
+    def _install_geometry_handlers(self):
+        """Keep the editor overlay aligned with the native combo frame."""
+        try:
+            with dpg.item_handler_registry(tag=self._geometry_handlers):
+                if hasattr(dpg, "add_item_resize_handler"):
+                    dpg.add_item_resize_handler(callback=self._sync_geometry)
+            dpg.bind_item_handler_registry(self.shell, self._geometry_handlers)
+        except Exception:
+            self._geometry_handlers = None
+
+    def _sync_geometry(self, *_args):
+        # The negative width already tracks the right edge. Reasserting pos is
+        # cheap and protects against Dear ImGui cursor/layout state changes when
+        # dialogs are reparented or DPI changes at runtime.
+        if self.input and dpg.does_item_exist(self.input):
+            try:
+                dpg.configure_item(
+                    self.input,
+                    pos=(1, 1),
+                    width=-(self.ARROW_WIDTH + 1),
+                )
+            except Exception:
+                pass
+        if self.button and dpg.does_item_exist(self.button):
+            try:
+                dpg.configure_item(self.button, pos=(0, 0), width=-1)
+            except Exception:
+                pass
 
     def _install_handlers(self):
         try:
@@ -586,70 +481,73 @@ class ImGuiComboBox:
                     ("mvKey_Escape", self._escape_pressed),
                     ("mvKey_Up", self._up_pressed),
                     ("mvKey_Down", self._down_pressed),
-                    ("mvKey_Return", self._return_pressed),
                 ):
                     key = getattr(dpg, key_name, None)
                     if key is not None:
                         dpg.add_key_press_handler(key=key, callback=callback)
+                dpg.add_mouse_click_handler(
+                    button=dpg.mvMouseButton_Left, callback=self._mouse_clicked)
         except Exception:
             self._handlers = None
 
+    @staticmethod
+    def _point_inside(item, x, y):
+        if not item or not dpg.does_item_exist(item):
+            return False
+        try:
+            rx, ry = dpg.get_item_rect_min(item)
+            rw, rh = dpg.get_item_rect_size(item)
+            return rx <= x < rx + rw and ry <= y < ry + rh
+        except Exception:
+            return False
+
+    def _mouse_clicked(self, sender=None, app_data=None, user_data=None):
+        if not self._native_popup_hint:
+            return
+        try:
+            x, y = dpg.get_mouse_pos(local=False)
+            if self._point_inside(self.shell, x, y):
+                return
+        except Exception:
+            return
+        # The native combo itself already handled popup dismissal.
+        self._native_popup_hint = False
+
     def _f4_pressed(self, sender=None, app_data=None, user_data=None):
-        if self._owns_keyboard() and self.enabled:
-            self.toggle_popup()
+        if not self.enabled or not self._owns_keyboard():
+            return
+        # Dear PyGui does not expose OpenPopup for an existing mvCombo.
+        # Transfer keyboard focus to the native combo; Space/Enter/Down then
+        # follow Dear ImGui's own combo navigation without a custom overlay.
+        self.open_popup()
 
     def _escape_pressed(self, sender=None, app_data=None, user_data=None):
-        if self.popup_open():
-            self.close_popup()
-
-    def _move_popup_highlight(self, delta):
-        if not self.items:
-            return
-        index = self._popup_index if self._popup_index >= 0 else self.current_index()
-        if index < 0:
-            index = 0
-        self._popup_index = max(0, min(len(self.items) - 1, index + int(delta)))
-        self._sync_popup_selection(self._popup_index)
-        self._scroll_popup_to_index(self._popup_index)
+        self._native_popup_hint = False
+        self._refresh_shell_theme()
 
     def _up_pressed(self, sender=None, app_data=None, user_data=None):
-        if not self.enabled:
-            return
-        if self.popup_open():
-            self._move_popup_highlight(-1)
-            return
-        if not self._item_focused(self.input):
+        if not self.enabled or not self._item_focused(self.input) or not self.items:
             return
         index = self.current_index()
         self.set_current_index((index if index >= 0 else 0) - 1, emit=True)
 
     def _down_pressed(self, sender=None, app_data=None, user_data=None):
-        if not self.enabled:
-            return
-        if self.popup_open():
-            self._move_popup_highlight(1)
-            return
-        if not self._item_focused(self.input):
+        if not self.enabled or not self._item_focused(self.input) or not self.items:
             return
         index = self.current_index()
         self.set_current_index((index if index >= 0 else -1) + 1, emit=True)
 
-    def _return_pressed(self, sender=None, app_data=None, user_data=None):
-        if not self.popup_open() or not self.enabled:
-            return
-        index = self._popup_index
-        if 0 <= index < len(self.items):
-            self.set_current_text(self.items[index], emit=True)
-            self.activated.emit(index)
-        self.close_popup()
-
     def _input_changed(self, sender=None, app_data=None, user_data=None):
         value = self.current_text()
         old = self._value
-        old_index = self.items.index(old) if old in self.items else -1
+        try:
+            old_index = self.items.index(old)
+        except ValueError:
+            old_index = -1
         self._value = value
         new_index = self.current_index()
-        self._sync_popup_selection()
+        if self.button and dpg.does_item_exist(self.button) and value in self.items:
+            dpg.set_value(self.button, value)
         if value != old:
             self.editTextChanged.emit(value)
             self.currentTextChanged.emit(value)
@@ -659,18 +557,18 @@ class ImGuiComboBox:
             self.callback(self.input, value, self)
 
     def destroy(self):
-        if self._popup:
-            unregister_pointer_protected_item(self._popup)
         for item in (
             self._handlers,
             self._input_handlers,
             self._button_handlers,
-            self._popup,
-            self.separator,
-            self.container,
+            self._geometry_handlers,
+            self.shell,
         ):
             if item and dpg.does_item_exist(item):
-                dpg.delete_item(item)
+                try:
+                    dpg.delete_item(item)
+                except Exception:
+                    pass
 
 
 QtComboBox = ImGuiComboBox

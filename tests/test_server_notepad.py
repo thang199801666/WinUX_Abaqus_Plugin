@@ -271,7 +271,8 @@ class ServerNotepadModelTests(unittest.TestCase):
 class ServerNotepadIntegrationTests(unittest.TestCase):
     def test_server_context_menu_exposes_internal_editor(self):
         source = FILE_PANEL.read_text(encoding="utf-8")
-        self.assertIn('"label": "Edit in WinUx Notepad   F4"', source)
+        self.assertIn('"label": "Edit in WinUx Notepad"', source)
+        self.assertIn('"shortcut": "F4"', source)
         self.assertIn('"action": "edit_server_file"', source)
         self.assertIn('"id": "server_notepad_edit"', source)
         self.assertIn('<= 8 * 1024 * 1024', source)

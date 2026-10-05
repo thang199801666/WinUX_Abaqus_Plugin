@@ -8,6 +8,7 @@ import subprocess
 import tempfile
 
 from winux_updater import DEFAULT_NETWORK_PROJECT_DIR
+from winux_installation_state import resolve_active_installation
 
 
 ABAQUS_COMMAND = "abaqus"
@@ -30,21 +31,35 @@ def _bundled_project_dir():
 
 
 def resolve_project_dir(value=None, environ=None):
-    """Resolve the complete *local* deployment that directly contains WinUx.
+    """Resolve the local runtime deployment used for this launch.
 
-    A normal Abaqus/CAE menu launch always uses the self-contained copy beside
-    this launcher.  The S: deployment is an update source only; it is never
-    used as the runtime working directory.  ``value`` remains an explicit
-    development/test override.
+    Explicit development/test paths still win. Normal Windows launches prefer
+    the crash-safe versioned installation pointer when one exists, then fall
+    back to the historical self-contained plug-in directory. The shared S:\n    source remains update-only and is never executed directly.
     """
     environ = os.environ if environ is None else environ
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     source_checkout = os.path.abspath(
         os.path.join(plugin_dir, os.pardir, os.pardir)
     )
+
+    if value is not None:
+        if _is_project_dir(value):
+            return os.path.abspath(value)
+        raise RuntimeError("The requested WinUx project directory is invalid: {}".format(value))
+
+    bundled = _bundled_project_dir()
+    install_mode = str(environ.get("WINUX_INSTALL_MODE", "")).strip().lower()
+    if install_mode not in ("legacy", "flat", "in-place", "inplace"):
+        try:
+            active = resolve_active_installation(bundled, environ=environ)
+        except Exception:
+            active = None
+        if _is_project_dir(active):
+            return os.path.abspath(active)
+
     candidates = (
-        value,
-        _bundled_project_dir(),
+        bundled,
         environ.get("WINUX_APP_DIR") or environ.get("WIXUX_APP_DIR"),
         source_checkout,
         os.getcwd(),
@@ -53,8 +68,8 @@ def resolve_project_dir(value=None, environ=None):
         if _is_project_dir(candidate):
             return os.path.abspath(candidate)
     raise RuntimeError(
-        "The local WinUx deployment was not found beside the launcher or in "
-        "WINUX_APP_DIR."
+        "The local WinUx deployment was not found beside the launcher, in the "
+        "versioned runtime store, or in WINUX_APP_DIR."
     )
 
 
@@ -195,7 +210,8 @@ def _running_processes():
     return list(candidates)
 
 
-def launch_winux(project_dir=None, abaqus_command=None, popen_factory=None, update_checker=None):
+def launch_winux(project_dir=None, abaqus_command=None, popen_factory=None, update_checker=None,
+                 existing_pid=None, install_update=False):
     """Launch WinUx without blocking Abaqus/CAE.
 
     Returns ``(process, started)``. A new bootstrap child is started for every
@@ -231,15 +247,22 @@ def launch_winux(project_dir=None, abaqus_command=None, popen_factory=None, upda
         abaqus_command,
         runner_path=_runner_path(project_dir),
     )
+    if install_update:
+        command.append("--install-update")
     log_path = _log_path()
     environment = _launch_environment(project_dir)
     environment["WINUX_LAUNCH_LOG"] = log_path
-    if existing_process is not None:
+    if install_update:
+        environment.pop("WINUX_SKIP_UPDATE", None)
+        environment["WINUX_UPDATE_FROM_APP"] = "1"
+    if existing_pid is not None:
+        environment["WINUX_EXISTING_PID"] = str(int(existing_pid))
+    elif existing_process is not None:
         try:
             environment["WINUX_EXISTING_PID"] = str(int(existing_process.pid))
         except Exception:
             pass
-    if explicit_project_dir:
+    if explicit_project_dir and not install_update:
         # Explicit development/test checkouts preserve the historical behavior:
         # they are launched as-is and never auto-updated from the shared S: source.
         environment["WINUX_SKIP_UPDATE"] = "1"
@@ -262,7 +285,7 @@ def launch_winux(project_dir=None, abaqus_command=None, popen_factory=None, upda
         ).format(
             datetime.datetime.now().isoformat(),
             project_dir,
-            command[-1],
+            _runner_path(project_dir),
             " ".join(command),
         )
         log_handle.write(header.encode("utf-8"))

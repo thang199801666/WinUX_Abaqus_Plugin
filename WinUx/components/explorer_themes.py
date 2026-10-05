@@ -33,6 +33,8 @@ class ListViewThemeManager:
             "header_pressed": QtFusionPalette.HEADER_PRESSED,
             "text": QtFusionPalette.TEXT, "header_text": QtFusionPalette.TEXT,
             "border": QtFusionPalette.BORDER, "separator": QtFusionPalette.BORDER_LIGHT,
+            "header_top_line": QtFusionPalette.BASE,
+            "header_bottom_line": QtFusionPalette.BORDER_LIGHT,
             "row_line": QtFusionPalette.BORDER_LIGHT,
             "show_row_lines": False, "row_rounding": 0.0,
             "hover_fill": QtFusionPalette.HIGHLIGHT_HOVER,
@@ -45,7 +47,8 @@ class ListViewThemeManager:
             "inactive_selected_border": (0, 0, 0, 0),
             "inactive_selected_text": QtFusionPalette.TEXT,
             "focus_border": QtFusionPalette.FOCUS,
-            "header_alignment": "column",
+            # Header labels are centered uniformly across WinUx list views.
+            "header_alignment": "center",
             "drop_fill": (214, 239, 255, 255), "drop_border": QtFusionPalette.HIGHLIGHT,
             "status_bg": QtFusionPalette.BASE, "status_text": QtFusionPalette.TEXT_MUTED,
             "rubber_fill": (0, 120, 215, 38), "rubber_border": QtFusionPalette.HIGHLIGHT,
@@ -89,12 +92,11 @@ class ListViewThemeManager:
             "drag_text": (25, 25, 25, 255),
             "drag_border": (170, 170, 170, 230),
             "drag_accent": (0, 120, 215, 255),
-            # The old Job Viewer centered its header labels instead of treating
-            # them as left-aligned file-detail columns.
+            # Keep all Job Viewer header labels visually centered regardless
+            # of the data-cell alignment used by each column.
             "header_alignment": "center",
-            # Keep the sort marker beside the centered label instead of jammed
-            # against the next column divider.
-            "sort_indicator_mode": "inline",
+            # Keep the sort marker in the standard right-side header sub-area.
+            "sort_indicator_mode": "edge",
         },
         "WinSCP": {
             # Commander-style file panel palette modelled after WinSCP's
@@ -134,7 +136,9 @@ class ListViewThemeManager:
             "drag_text": (25, 25, 25, 255),
             "drag_border": (170, 170, 170, 255),
             "drag_accent": (0, 120, 215, 255),
-            "header_alignment": "column",
+            # File panel headers use the same centered-label contract as the
+            # rest of WinUx while cell contents keep their own alignments.
+            "header_alignment": "center",
         },
         "White": {
             "background": (255, 255, 255, 255), "header_bg": (245, 245, 245, 255),

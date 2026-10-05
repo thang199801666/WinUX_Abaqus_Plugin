@@ -8,13 +8,13 @@ def _read(relative):
     return (WINUX / relative).read_text(encoding="utf-8")
 
 
-def test_combo_does_not_configure_draw_triangle_after_creation():
+def test_combo_uses_native_combo_arrow_and_no_draw_triangle_reconfiguration():
     source = _read("components/qt_combo_box.py")
-    block = source[source.index("    def _render_arrow"):source.index("    def _popup_geometry", source.index("    def _render_arrow"))]
-    assert "configure_item" not in block.replace("`configure_item`", "")
-    assert "draw_triangle(" in source
+    assert "self.button = dpg.add_combo(" in source
+    assert "no_preview=True" in source
+    assert "draw_triangle(" not in source
     assert 'label="v"' not in source
-
+    assert "configure_item(self.button, color=" not in source
 
 def test_spinbox_does_not_configure_draw_triangle_after_creation():
     source = _read("widgets/controls.py")

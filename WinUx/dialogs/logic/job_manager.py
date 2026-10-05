@@ -85,6 +85,11 @@ class JobManagerLogic:
         self.post("core_suggestions_failed", str(error))
 
     def submission_started(self, path):
+        # Keep Run disabled for the entire active submission window.  The
+        # form already disables it before dispatch; posting this state again
+        # makes the worker/UI boundary authoritative as well and prevents a
+        # delayed UI update from re-enabling Run while a submit is in flight.
+        self.post("run_enabled", False)
         self.post("status", "Submitting {}...".format(path.name))
 
     def submission_job_complete(self, path, output):

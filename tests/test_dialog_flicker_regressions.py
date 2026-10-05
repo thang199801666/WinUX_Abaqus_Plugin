@@ -152,25 +152,19 @@ class DialogFocusRaceTests(unittest.TestCase):
         ensure_visible.assert_not_called()
         restore.assert_not_called()
 
-    def test_external_focus_is_preserved_while_hidden_owner_visibility_is_repaired(self):
+    def test_external_focus_is_preserved_without_revealing_hidden_owner(self):
         view = _QueueView()
         closing = _Dialog(view, 200, owner_was_visible=True)
         restore = Mock()
-        visibility = {"owner": False}
-        foreground_values = iter((200, 999, 999))
+        foreground_values = iter((200, 999))
 
         def state(hwnd):
             if hwnd == 100:
-                return (True, visibility["owner"], True)
+                return (True, False, True)
             return (True, False, True)
 
-        def reveal(hwnd):
-            visibility["owner"] = True
-            return True
-
         with unittest.mock.patch(
-                "WinUx.platform.dialog_focus.ensure_owner_visible",
-                side_effect=reveal) as ensure_visible:
+                "WinUx.platform.dialog_focus.ensure_owner_visible") as ensure_visible:
             queue_owner_focus(
                 closing,
                 foreground=lambda: next(foreground_values),
@@ -180,7 +174,9 @@ class DialogFocusRaceTests(unittest.TestCase):
             )
             view.tick()
 
-        ensure_visible.assert_called_once_with(100)
+        # An unrelated foreground application is authoritative. Do not pop the
+        # WinUx owner back onto the desktop merely to repair visibility.
+        ensure_visible.assert_not_called()
         restore.assert_not_called()
 
     def test_explicit_modal_completion_can_recover_hidden_owner(self):
@@ -215,6 +211,25 @@ class DialogFocusRaceTests(unittest.TestCase):
 
         ensure_visible.assert_called_once_with(100)
         restore.assert_called_once_with(100)
+
+
+    def test_new_dialog_invalidates_pending_owner_focus_return(self):
+        from WinUx.platform.dialog_focus import cancel_owner_focus_return
+
+        view = _QueueView()
+        closing = _Dialog(view, 200, owner_was_visible=True)
+        restore = Mock()
+        queue_owner_focus(
+            closing,
+            force=True,
+            foreground=lambda: 200,
+            state=lambda hwnd: (True, False, True) if hwnd == 200 else (True, True, True),
+            restore=restore,
+            keyboard=lambda hwnd: False,
+        )
+        cancel_owner_focus_return(100)
+        view.tick()
+        restore.assert_not_called()
 
 
 class DialogForegroundHandoffTests(unittest.TestCase):
@@ -478,6 +493,18 @@ class DialogFlickerSourceTests(unittest.TestCase):
         destroy_body = destroy_body.split("def _finalize_window", 1)[0]
         self.assertLess(destroy_body.index("self._set_modal_owner_active(False)"),
                         destroy_body.index("window.destroy()"))
+
+    def test_floating_dialog_rejects_owner_hwnd_as_child(self):
+        source = FLOATING_DIALOG.read_text(encoding="utf-8")
+        self.assertIn("int(hwnd) == int(self._owner_hwnd)", source)
+        self.assertIn("cancel_owner_focus_return(self._owner_hwnd)", source)
+
+    def test_focus_retries_are_bounded_and_coalesced_per_owner(self):
+        source = (ROOT / "WinUx" / "platform" / "dialog_focus.py").read_text(encoding="utf-8")
+        self.assertIn("_OWNER_FOCUS_GENERATIONS", source)
+        self.assertIn("owner_generation != _OWNER_FOCUS_GENERATIONS", source)
+        self.assertIn("if attempt < 32", source)
+
 
 
 if __name__ == "__main__":

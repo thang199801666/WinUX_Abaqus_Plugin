@@ -27,12 +27,12 @@ def test_editable_combo_sets_cursor_colour_without_covering_inputtext():
     assert "focus_item(self.input)" not in handlers
 
 
-def test_combo_popup_tracks_qcombobox_current_item_selection():
+def test_combo_native_popup_selection_tracks_editor_text():
     source = _read("components/qt_combo_box.py")
-    assert 'default_value=(value == current)' in source
-    assert 'def _sync_popup_selection' in source
-    assert source.count('self._sync_popup_selection()') >= 2
-
+    assert "def _native_selected" in source
+    assert "dpg.set_value(self.button, self._value)" in source
+    assert "dpg.set_value(self.button, value)" in source
+    assert "self.set_current_text(value, emit=True)" in source
 
 def test_dialog_form_rows_use_compact_shared_form_layout_theme():
     style = _read("widgets/imgui_qt_style.py")

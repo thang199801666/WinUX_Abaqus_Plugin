@@ -5,7 +5,6 @@ from datetime import datetime
 import dearpygui.dearpygui as dpg
 from .qt_dialog import QtDialog
 from .logic.job_schedule import JobEditScheduleLogic
-from .theme import DialogPalette
 
 
 class JobEditDialog(JobEditScheduleLogic, QtDialog):
@@ -19,14 +18,13 @@ class JobEditDialog(JobEditScheduleLogic, QtDialog):
         self.preferred_size = (590, 390)
         self.header("Edit job", "Update the automatic deletion schedule.")
         with self.section("Job summary") as summary:
-            with dpg.table(parent=summary, header_row=False, width=-1):
-                for _ in range(4):
-                    dpg.add_table_column()
-                for left, right in ((0, 4), (2, 3), (5, 1)):
-                    with dpg.table_row():
-                        for index in (left, right):
-                            dpg.add_text(self.JOB_FIELDS[index][0], color=DialogPalette.MUTED)
-                            dpg.add_text(str(values[index]) if index < len(values) else "-")
+            order = (0, 4, 2, 3, 5, 1)
+            self.summary_grid(
+                [(self.JOB_FIELDS[index][0],
+                  str(values[index]) if index < len(values) else "-")
+                 for index in order],
+                parent=summary, columns=2, label_width=58,
+            )
         with self.section("Automatic deletion") as schedule:
             self.mode = self.radio_group(
                 self.DELETE_MODES,
@@ -35,9 +33,22 @@ class JobEditDialog(JobEditScheduleLogic, QtDialog):
                 parent=schedule,
                 callback=lambda: self._tick(schedule=False),
             )
-            self.after = self.field("Delete After", after, parent=schedule, callback=lambda: self._tick(schedule=False))
-            self.at = self.field("Delete At", at, parent=schedule, callback=lambda: self._tick(schedule=False))
-            self.note("HH:MM[:SS] | YYYY-MM-DD HH:MM:SS", parent=schedule)
+            form = self.form_layout(parent=schedule)
+            self.after = self.form_layout_row(
+                form, "Delete After",
+                lambda parent: self.line_edit(
+                    after, parent=parent, callback=lambda: self._tick(schedule=False)),
+            )
+            self.at = self.form_layout_row(
+                form, "Delete At",
+                lambda parent: self.line_edit(
+                    at, parent=parent, callback=lambda: self._tick(schedule=False)),
+            )
+            self.form_layout_row(
+                form, "",
+                lambda parent: self.note(
+                    "HH:MM[:SS] | YYYY-MM-DD HH:MM:SS", parent=parent),
+            )
         self.error = self.status_text(error=True)
         self.save_button = self.button_box([("Save", self._save, "primary", True),
             ("Cancel", lambda: self.finish(None), "secondary", False)])[0]
@@ -57,7 +68,7 @@ class JobEditDialog(JobEditScheduleLogic, QtDialog):
             error = ""
         except ValueError as exc:
             error = str(exc)
-        dpg.set_value(self.error, error)
+        self.set_status_text(self.error, error, error=True)
         dpg.configure_item(self.save_button, enabled=not error)
         if schedule:
             self.view.after(1000, self._tick)

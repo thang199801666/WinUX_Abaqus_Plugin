@@ -17,7 +17,20 @@ import os
 import tempfile
 import time
 
-from winux_update_installer import synchronize_project as _synchronize_project
+from winux_update_installer import (
+    synchronize_project as _synchronize_project,
+    synchronize_versioned_project as _synchronize_versioned_project,
+)
+from winux_installation_state import (
+    INSTALL_MODE_KEY,
+    install_mode as resolve_install_mode,
+    install_root as versioned_install_root,
+    versioned_install_enabled,
+    resolve_active_installation,
+    is_quarantined,
+    quarantine_version,
+    clear_quarantine,
+)
 from winux_update_lock import UpdateInProgress, UpdateLock
 from winux_update_manifest import (
     MANIFEST_FILENAME,
@@ -27,10 +40,23 @@ from winux_update_manifest import (
     source_descriptor,
     source_is_valid,
 )
+from winux_health_check import subprocess_health_check as _subprocess_health_check
+from winux_update_providers import (
+    GITHUB_API_BASE_KEY,
+    GITHUB_REPOSITORY_KEY,
+    PROVIDER_AUTO,
+    PROVIDER_FOLDER,
+    PROVIDER_GITHUB,
+    UPDATE_CHANNEL_KEY,
+    UPDATE_PROVIDER_KEY,
+    GitHubReleaseProvider,
+    should_use_github,
+    update_preferences,
+)
 
 
 DEFAULT_NETWORK_PROJECT_DIR = (
-    r"S:\Division1\CAE\1. FEA\6. Tools\17.WinUx\WinUX_Abaqus_Plugin"
+    r"S:\WinUx"
 )
 UPDATE_SOURCE_KEY = "update_source"
 SETTINGS_FILENAME = "settings.json"
@@ -115,6 +141,128 @@ def save_update_source(source_dir, environ=None, settings_path=None):
     data[UPDATE_SOURCE_KEY] = os.path.abspath(source_dir)
     _write_settings(path, data)
     return path
+
+
+
+
+def load_update_preferences(environ=None, settings_path=None):
+    """Return provider preferences from the shared WinUX settings file.
+
+    ``update_source`` remains untouched for legacy S:/folder deployments.
+    New installations default to the public WinUx repository. Existing folder
+    settings keep their source until the user selects GitHub in Settings.
+    """
+    path = settings_path or _profile_settings_path(environ)
+    return update_preferences(_read_settings(path), environ=environ)
+
+
+def save_update_preferences(provider=None, github_repository=None, channel=None,
+                            github_api_base=None, credential_target=None, environ=None,
+                            settings_path=None):
+    """Persist non-secret updater preferences without erasing existing keys."""
+    path = settings_path or _profile_settings_path(environ)
+    data = _read_settings(path)
+    if provider is not None:
+        # Run through the canonical resolver for validation/normalization.
+        resolved = update_preferences({UPDATE_PROVIDER_KEY: provider}, environ={})
+        data[UPDATE_PROVIDER_KEY] = resolved["provider"]
+    if github_repository is not None:
+        probe = update_preferences(
+            {GITHUB_REPOSITORY_KEY: github_repository}, environ={}
+        )
+        if probe["github_repository"]:
+            data[GITHUB_REPOSITORY_KEY] = probe["github_repository"]
+        else:
+            data[GITHUB_REPOSITORY_KEY] = ""
+    if channel is not None:
+        probe = update_preferences({UPDATE_CHANNEL_KEY: channel}, environ={})
+        data[UPDATE_CHANNEL_KEY] = probe["channel"]
+    if github_api_base is not None:
+        value = _text(github_api_base).strip().rstrip("/")
+        if value:
+            data[GITHUB_API_BASE_KEY] = value
+        else:
+            data.pop(GITHUB_API_BASE_KEY, None)
+    _write_settings(path, data)
+    return path
+
+
+def load_install_mode(environ=None, settings_path=None):
+    """Return legacy or versioned install strategy for this launch."""
+    path = settings_path or _profile_settings_path(environ)
+    return resolve_install_mode(
+        _read_settings(path), environ=environ, platform_name=os.name
+    )
+
+
+def save_install_mode(mode, environ=None, settings_path=None):
+    """Persist the updater install strategy without touching provider settings."""
+    path = settings_path or _profile_settings_path(environ)
+    data = _read_settings(path)
+    normalized = resolve_install_mode(
+        {INSTALL_MODE_KEY: mode}, environ={}, platform_name="nt"
+    )
+    data[INSTALL_MODE_KEY] = normalized
+    _write_settings(path, data)
+    return path
+
+
+def _use_versioned_install(environ=None, settings_path=None):
+    path = settings_path or _profile_settings_path(environ)
+    return versioned_install_enabled(
+        _read_settings(path), environ=environ, platform_name=os.name
+    )
+
+
+def _refresh_active_local(local_dir, environ=None, settings_path=None):
+    """Re-resolve the active immutable build after the shared update lock."""
+    if not _use_versioned_install(environ=environ, settings_path=settings_path):
+        return os.path.abspath(local_dir)
+    resolved = resolve_active_installation(local_dir, environ=environ)
+    return os.path.abspath(resolved or local_dir)
+
+
+def _default_sync(source_dir, local_dir, progress_callback=None, health_check=None,
+                  environ=None, settings_path=None, source_label=None,
+                  before_activate=None):
+    """Dispatch to versioned production install or legacy in-place fallback.
+
+    Production Windows versioned installs run the candidate in a separate
+    Python process before activation. Tests/non-Windows ports remain injectable
+    and do not try to load bundled Windows native modules.
+    """
+    environ = os.environ if environ is None else environ
+    if (health_check is None and os.name == "nt" and
+            str(environ.get("WINUX_SKIP_SUBPROCESS_HEALTH_CHECK", "")).strip() != "1"):
+        health_check = lambda deployment_dir, manifest: _subprocess_health_check(
+            deployment_dir, manifest, environ=environ
+        )
+    if _use_versioned_install(environ=environ, settings_path=settings_path):
+        return _synchronize_versioned_project(
+            source_dir, local_dir, progress_callback=progress_callback,
+            health_check=health_check, environ=environ, source_label=source_label,
+            before_activate=before_activate,
+        )
+    return _synchronize_project(
+        source_dir, local_dir, progress_callback=progress_callback,
+        health_check=health_check,
+    )
+
+
+def _sync_result(status, result):
+    """Normalize legacy string and versioned dict installer return values."""
+    if isinstance(result, dict):
+        status["local_version"] = result.get("version") or status.get("local_version")
+        status["active_dir"] = result.get("active_dir")
+        status["install_mode"] = result.get("mode") or "versioned"
+        status["previous_version"] = result.get("previous_version")
+        status["bootstrap"] = result.get("bootstrap")
+        status["bootstrap_error"] = result.get("bootstrap_error")
+        return status["local_version"]
+    status["local_version"] = result
+    status["active_dir"] = status.get("local_dir")
+    status["install_mode"] = "legacy"
+    return result
 
 
 def _read_version_once(path, cache=None):
@@ -303,10 +451,38 @@ def _update_log_path(environ=None):
     return os.path.join(directory, "winux_update.log")
 
 
+UPDATE_LOG_MAX_BYTES = 2 * 1024 * 1024
+UPDATE_LOG_KEEP_BYTES = 512 * 1024
+
+
+def _prune_update_log(path):
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return
+    if size <= UPDATE_LOG_MAX_BYTES:
+        return
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(max(0, size - UPDATE_LOG_KEEP_BYTES))
+            tail = handle.read()
+        newline = tail.find(b"\n")
+        if newline != -1:
+            tail = tail[newline + 1:]
+        with open(path, "wb") as handle:
+            handle.write(b"[WinUx update history truncated; keeping recent entries]\n")
+            handle.write(tail)
+    except (OSError, IOError):
+        pass
+
+
 def _log(message, environ=None):
     try:
         path = _update_log_path(environ)
-        line = "[{}] {}\n".format(datetime.datetime.now().isoformat(), _text(message))
+        _prune_update_log(path)
+        line = "[{}] [pid={}] {}\n".format(
+            datetime.datetime.now().isoformat(), os.getpid(), _text(message)
+        )
         with open(path, "ab") as handle:
             handle.write(line.encode("utf-8"))
     except Exception:
@@ -462,13 +638,344 @@ def _resolve_interactive_source(server_dir, environ, settings_path,
     return current, False
 
 
+
+def _github_status(local_dir, candidate, error=None):
+    """Normalize GitHub provider state to the historical updater status shape."""
+    source_label = (candidate or {}).get("source_label") or "GitHub Releases"
+    status = {
+        "local_dir": os.path.abspath(local_dir),
+        # ``server_dir`` is retained for update-dialog/API compatibility.  For
+        # non-folder providers it is a human-readable source descriptor.
+        "server_dir": source_label,
+        "source_label": source_label,
+        "provider": PROVIDER_GITHUB,
+        "github_repository": (candidate or {}).get("repository"),
+        "channel": (candidate or {}).get("channel"),
+        "prerelease": bool((candidate or {}).get("prerelease")),
+        "release_url": (candidate or {}).get("release_url"),
+        "published_at": (candidate or {}).get("published_at"),
+        "package_sha256": (candidate or {}).get("package_sha256"),
+        "local_version": (candidate or {}).get("local_version") or read_version(local_dir),
+        "server_version": (candidate or {}).get("server_version"),
+        "manifest": None,
+        "manifest_valid": False,
+        "manifest_checked": False,
+        "manifest_error": None,
+        "release_dir": None,
+        "available": bool((candidate or {}).get("available")),
+        "reason": (candidate or {}).get("reason") or "",
+        "updated": False,
+        "cancelled": False,
+        "error": _text(error) if error is not None else None,
+        "locked": False,
+        "active_dir": os.path.abspath(local_dir),
+        "install_mode": None,
+    }
+    return status
+
+
+def _scaled_progress(callback, start, end):
+    if callback is None:
+        return None
+    span = max(0, int(end) - int(start))
+
+    def emit(percent, message):
+        value = max(0, min(100, int(percent)))
+        mapped = int(start) + int((float(value) / 100.0) * span)
+        _notify_progress(callback, mapped, message)
+    return emit
+
+
+def _github_provider_from_preferences(preferences, environ=None, provider_factory=None):
+    repository = preferences.get("github_repository")
+    if not repository:
+        raise RuntimeError(
+            "GitHub update provider is enabled but github_repository is not configured."
+        )
+    factory = provider_factory or GitHubReleaseProvider
+    return factory(
+        repository=repository,
+        channel=preferences.get("channel", "stable"),
+        api_base=preferences.get("github_api_base"),
+        environ=environ,
+    )
+
+
+def _update_local_from_github(local_dir, provider, candidate, environ,
+                              dialog_available, dialog_failed, sync_callable,
+                              progress_factory, before_sync, lock_factory,
+                              health_check, in_progress_dialog, settings_path=None,
+                              custom_sync=False):
+    """Install one GitHub release using the existing transactional installer."""
+    status = _github_status(local_dir, candidate)
+    _log(
+        "update check provider=github repo={} local_version={} server_version={} available={} reason={}".format(
+            candidate.get("repository"), status["local_version"],
+            status["server_version"], status["available"], status["reason"]
+        ),
+        environ,
+    )
+    if not status["available"]:
+        return status
+
+    package_sha256 = _text((candidate or {}).get("package_sha256") or "").strip().lower()
+    if is_quarantined(status.get("server_version"), package_sha256, environ=environ):
+        status["available"] = False
+        status["reason"] = "GitHub release is quarantined after a failed verification/health check"
+        status["quarantined"] = True
+        _log("skipping quarantined GitHub release {}".format(status.get("server_version")), environ)
+        return status
+
+    try:
+        accepted = bool(
+            dialog_available(
+                status["local_version"],
+                status["server_version"],
+                status["source_label"],
+            )
+        )
+    except Exception as exc:
+        _log("GitHub update confirmation failed: {}".format(exc), environ)
+        accepted = False
+    if not accepted:
+        status["cancelled"] = True
+        status["reason"] = "update cancelled by user; using local version"
+        return status
+
+    progress = None
+    lock = None
+    materialized = None
+    try:
+        progress = progress_factory(status["local_version"], status["server_version"])
+        progress_callback = getattr(progress, "update", None) if progress is not None else None
+        _notify_progress(progress_callback, 0, "Preparing GitHub update...")
+
+        lock_target = (
+            versioned_install_root(environ)
+            if (not custom_sync and _use_versioned_install(environ, settings_path))
+            else status["local_dir"]
+        )
+        lock = lock_factory(lock_target)
+        try:
+            lock.acquire()
+        except AttributeError:
+            lock.__enter__()
+        status["locked"] = True
+
+        # Another bootstrap may have activated a newer immutable version while
+        # this process waited for the shared installation lock. Re-resolve the
+        # active pointer before comparing versions so we never reinstall over a
+        # stale process-local path.
+        if not custom_sync:
+            status["local_dir"] = _refresh_active_local(
+                status["local_dir"], environ=environ, settings_path=settings_path
+            )
+            status["local_version"] = read_version(status["local_dir"])
+            status["active_dir"] = status["local_dir"]
+
+        # Release metadata is re-read after acquiring the deployment lock. This
+        # prevents an older candidate from being installed after another WinUx
+        # bootstrap has already completed an update.
+        refreshed_candidate = provider.check(read_version(status["local_dir"]))
+        if not refreshed_candidate.get("available"):
+            refreshed = _github_status(status["local_dir"], refreshed_candidate)
+            status.update(refreshed)
+            status["reason"] = "local version became current before installation"
+            _notify_progress(progress_callback, 100, "WinUx is already up to date.")
+            return status
+        refreshed_sha256 = _text(refreshed_candidate.get("package_sha256") or "").strip().lower()
+        if is_quarantined(refreshed_candidate.get("server_version"), refreshed_sha256, environ=environ):
+            status["available"] = False
+            status["quarantined"] = True
+            status["reason"] = "GitHub release is quarantined after a failed verification/health check"
+            _notify_progress(progress_callback, 100, "Published WinUx build is quarantined; using current version.")
+            return status
+
+        # Download/verify while the existing WinUx process can still remain
+        # open. It is only terminated immediately before the atomic local swap.
+        materialized = provider.materialize(
+            refreshed_candidate,
+            progress_callback=_scaled_progress(progress_callback, 2, 35),
+        )
+        status["server_version"] = refreshed_candidate.get("server_version")
+        status["release_dir"] = materialized.get("source_dir")
+        status["manifest_checked"] = True
+        status["manifest_valid"] = True
+
+        versioned_mode = (
+            not custom_sync and _use_versioned_install(environ, settings_path)
+        )
+        if before_sync is not None and not versioned_mode:
+            _notify_progress(progress_callback, 36, "Closing the current WinUx instance...")
+            before_sync()
+        _notify_progress(progress_callback, 38, "Installing verified GitHub release...")
+        sync_kwargs = {
+            "progress_callback": _scaled_progress(progress_callback, 38, 99),
+        }
+        if health_check is not None:
+            sync_kwargs["health_check"] = health_check
+        if custom_sync:
+            result = sync_callable(
+                materialized["source_dir"], status["local_dir"], **sync_kwargs
+            )
+        else:
+            result = _default_sync(
+                materialized["source_dir"], status["local_dir"],
+                progress_callback=sync_kwargs.get("progress_callback"),
+                health_check=health_check, environ=environ, settings_path=settings_path,
+                source_label=status.get("source_label"),
+                before_activate=before_sync if versioned_mode else None,
+            )
+        _sync_result(status, result)
+        _notify_progress(progress_callback, 100, "Update complete. Starting WinUx...")
+        status["updated"] = True
+        status["available"] = False
+        status["reason"] = "GitHub release installed and verified successfully"
+        try:
+            clear_quarantine(status.get("server_version"), environ=environ)
+        except Exception:
+            pass
+        return status
+    except UpdateInProgress as exc:
+        status["error"] = _text(exc)
+        status["reason"] = "another update is in progress; using local version"
+        _log(status["reason"], environ)
+        if progress is not None:
+            try:
+                progress.close()
+            except Exception:
+                pass
+            progress = None
+        try:
+            in_progress_dialog(status["local_version"])
+        except Exception:
+            pass
+        return status
+    except Exception as exc:
+        status["error"] = _text(exc)
+        status["reason"] = "GitHub update failed; local version restored"
+        if materialized is not None:
+            try:
+                quarantine_version(
+                    status.get("server_version"),
+                    _text((refreshed_candidate or candidate or {}).get("package_sha256") or "").strip().lower(),
+                    reason=_text(exc), environ=environ,
+                )
+                status["quarantined"] = True
+            except Exception:
+                pass
+        _log("GitHub update failed: {}".format(exc), environ)
+        if progress is not None:
+            try:
+                progress.close()
+            except Exception:
+                pass
+            progress = None
+        try:
+            dialog_failed(exc, status["local_version"])
+        except Exception:
+            pass
+        return status
+    finally:
+        if materialized is not None:
+            try:
+                provider.cleanup_materialized(materialized)
+            except Exception:
+                pass
+        if lock is not None and status.get("locked"):
+            try:
+                lock.release()
+            except AttributeError:
+                try:
+                    lock.__exit__(None, None, None)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        if progress is not None:
+            try:
+                progress.close()
+            except Exception:
+                pass
+
+
+
+def check_for_updates(local_dir, server_dir=None, environ=None, settings_path=None,
+                      github_provider_factory=None):
+    """Perform an explicit, discovery-only update check.
+
+    This is the Settings > Updates action. It never shows the startup updater,
+    never downloads/installs a package, and never changes the active runtime.
+    In automatic mode public GitHub is tried first when configured, then the
+    legacy S:/shared-folder source remains the compatibility fallback.
+    """
+    environ = os.environ if environ is None else environ
+    local_dir = os.path.abspath(local_dir)
+    if environ.get("WINUX_SKIP_UPDATE", "").strip() == "1":
+        return {
+            "provider": None,
+            "local_dir": local_dir,
+            "local_version": read_version(local_dir),
+            "server_version": None,
+            "available": False,
+            "reason": "update check disabled by WINUX_SKIP_UPDATE",
+            "error": None,
+        }
+
+    explicit_folder_source = bool(server_dir or environ.get("WINUX_UPDATE_SOURCE"))
+    preferences = load_update_preferences(environ=environ, settings_path=settings_path)
+
+    if should_use_github(preferences, explicit_folder_source=explicit_folder_source):
+        try:
+            provider = _github_provider_from_preferences(
+                preferences, environ=environ, provider_factory=github_provider_factory
+            )
+            candidate = provider.check(read_version(local_dir))
+            return _github_status(local_dir, candidate)
+        except Exception as exc:
+            _log("manual GitHub update check failed: {}".format(exc), environ)
+            if preferences.get("provider") == PROVIDER_GITHUB:
+                return _github_status(local_dir, {
+                    "provider": PROVIDER_GITHUB,
+                    "source_label": "GitHub Releases: {}".format(
+                        preferences.get("github_repository") or "not configured"
+                    ),
+                    "repository": preferences.get("github_repository"),
+                    "channel": preferences.get("channel"),
+                    "local_version": read_version(local_dir),
+                    "server_version": None,
+                    "available": False,
+                    "reason": "GitHub update check unavailable",
+                }, error=exc)
+            # Automatic mode deliberately falls through to S:/folder compatibility.
+
+    source = (server_dir or environ.get("WINUX_UPDATE_SOURCE")
+              or load_update_source(environ=environ, settings_path=settings_path)
+              or DEFAULT_NETWORK_PROJECT_DIR)
+    status = get_update_status(
+        local_dir,
+        server_dir=source,
+        environ=environ,
+        settings_path=settings_path,
+        _version_cache={},
+    )
+    status["provider"] = PROVIDER_FOLDER
+    status["source_label"] = "Legacy shared folder: {}".format(
+        status.get("server_dir") or source
+    )
+    status["legacy_provider"] = True
+    status["error"] = (
+        status.get("manifest_error") if not status.get("server_version") else None
+    )
+    return status
+
 def update_local_if_newer(local_dir, server_dir=None, environ=None,
                           dialog_available=None, dialog_failed=None,
                           sync_callable=None, source_prompt=None,
                           invalid_source_dialog=None, progress_factory=None,
                           settings_path=None, before_sync=None,
                           lock_factory=None, health_check=None,
-                          in_progress_dialog=None):
+                          in_progress_dialog=None, github_provider_factory=None):
     """Check and transactionally install a published WinUx update.
 
     Cancel is session-only: it never records a skipped version. A valid update
@@ -481,12 +988,55 @@ def update_local_if_newer(local_dir, server_dir=None, environ=None,
     version_cache = {}
     dialog_available = dialog_available or show_update_available
     dialog_failed = dialog_failed or show_update_failed
+    custom_sync = sync_callable is not None
     sync_callable = sync_callable or synchronize_project
     source_prompt = source_prompt or prompt_update_source
     invalid_source_dialog = invalid_source_dialog or show_invalid_update_source
     progress_factory = progress_factory or create_progress_dialog
     in_progress_dialog = in_progress_dialog or show_update_in_progress
     lock_factory = lock_factory or (lambda path: UpdateLock(path, environ=environ))
+
+    # Hybrid provider rollout. New installs default to public GitHub; existing
+    # saved folder sources retain their compatibility workflow. An
+    # explicit folder argument/WINUX_UPDATE_SOURCE always remains an admin
+    # override and bypasses GitHub for that launch.
+    explicit_folder_source = bool(server_dir or environ.get("WINUX_UPDATE_SOURCE"))
+    preferences = load_update_preferences(environ=environ, settings_path=settings_path)
+    if (environ.get("WINUX_SKIP_UPDATE", "").strip() != "1" and
+            should_use_github(preferences, explicit_folder_source=explicit_folder_source)):
+        provider = None
+        try:
+            provider = _github_provider_from_preferences(
+                preferences, environ=environ, provider_factory=github_provider_factory
+            )
+            candidate = provider.check(read_version(local_dir))
+        except Exception as exc:
+            _log("GitHub update discovery failed: {}".format(exc), environ)
+            if preferences.get("provider") == PROVIDER_GITHUB:
+                failed_candidate = {
+                    "provider": PROVIDER_GITHUB,
+                    "source_label": "GitHub Releases: {}".format(
+                        preferences.get("github_repository") or "not configured"
+                    ),
+                    "repository": preferences.get("github_repository"),
+                    "local_version": read_version(local_dir),
+                    "server_version": None,
+                    "available": False,
+                    "reason": "GitHub update check unavailable; using local version",
+                }
+                return _github_status(local_dir, failed_candidate, error=exc)
+            # AUTO is intentionally resilient. If GitHub, internet, proxy or
+            # credentials are unavailable, fall through to the historical S:
+            # provider so existing corporate deployments remain operational.
+            _log("falling back to legacy folder update provider", environ)
+        else:
+            return _update_local_from_github(
+                local_dir, provider, candidate, environ,
+                dialog_available, dialog_failed, sync_callable,
+                progress_factory, before_sync, lock_factory, health_check,
+                in_progress_dialog, settings_path=settings_path,
+                custom_sync=custom_sync,
+            )
 
     source, source_cancelled = _resolve_interactive_source(
         server_dir,
@@ -520,6 +1070,8 @@ def update_local_if_newer(local_dir, server_dir=None, environ=None,
     status["cancelled"] = bool(source_cancelled)
     status["error"] = None
     status["locked"] = False
+    status["active_dir"] = status["local_dir"]
+    status["install_mode"] = None
     if source_cancelled:
         status["reason"] = "update source selection cancelled; using local version"
         return status
@@ -550,13 +1102,25 @@ def update_local_if_newer(local_dir, server_dir=None, environ=None,
         progress_callback = getattr(progress, "update", None) if progress is not None else None
         _notify_progress(progress_callback, 0, "Preparing update...")
 
-        lock = lock_factory(status["local_dir"])
+        lock_target = (
+            versioned_install_root(environ)
+            if (not custom_sync and _use_versioned_install(environ, settings_path))
+            else status["local_dir"]
+        )
+        lock = lock_factory(lock_target)
         try:
             lock.acquire()
         except AttributeError:
             # Test/custom lock factories may return context-manager-only locks.
             lock.__enter__()
         status["locked"] = True
+
+        if not custom_sync:
+            status["local_dir"] = _refresh_active_local(
+                status["local_dir"], environ=environ, settings_path=settings_path
+            )
+            status["local_version"] = read_version(status["local_dir"])
+            status["active_dir"] = status["local_dir"]
 
         # Re-check after acquiring the lock. Another updater may have completed
         # between the first status check and this process acquiring the lock.
@@ -573,18 +1137,32 @@ def update_local_if_newer(local_dir, server_dir=None, environ=None,
             _notify_progress(progress_callback, 100, "WinUx is already up to date.")
             return status
 
-        if before_sync is not None:
+        versioned_mode = (
+            not custom_sync and _use_versioned_install(environ, settings_path)
+        )
+        if before_sync is not None and not versioned_mode:
             _notify_progress(progress_callback, 1, "Closing the current WinUx instance...")
             before_sync()
-        _notify_progress(progress_callback, 2, "Starting file synchronization...")
+        _notify_progress(
+            progress_callback, 2,
+            "Preparing immutable version..." if versioned_mode else "Starting file synchronization..."
+        )
         sync_kwargs = {"progress_callback": progress_callback}
         if health_check is not None:
             sync_kwargs["health_check"] = health_check
-        status["local_version"] = sync_callable(
-            status["server_dir"],
-            status["local_dir"],
-            **sync_kwargs
-        )
+        if custom_sync:
+            result = sync_callable(
+                status["server_dir"], status["local_dir"], **sync_kwargs
+            )
+        else:
+            result = _default_sync(
+                status["server_dir"], status["local_dir"],
+                progress_callback=progress_callback, health_check=health_check,
+                environ=environ, settings_path=settings_path,
+                source_label=status.get("server_dir"),
+                before_activate=before_sync if versioned_mode else None,
+            )
+        _sync_result(status, result)
         _notify_progress(progress_callback, 100, "Update complete. Starting WinUx...")
         status["updated"] = True
         status["reason"] = "local version updated and verified successfully"
@@ -644,12 +1222,15 @@ __all__ = [
     "UPDATE_SOURCE_KEY",
     "VERSION_FILENAME",
     "compare_versions",
+    "check_for_updates",
     "configured_update_source",
     "create_progress_dialog",
     "get_update_status",
+    "load_install_mode",
     "load_update_source",
     "prompt_update_source",
     "read_version",
+    "save_install_mode",
     "save_update_source",
     "show_invalid_update_source",
     "show_update_available",

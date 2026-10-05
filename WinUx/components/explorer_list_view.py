@@ -355,7 +355,7 @@ class ExplorerListView(
     SEPARATOR_HIT = 8.0
     SCROLLBAR_HIT_SIZE = float(SharedScrollerMetrics.HIT_THICKNESS)
     MIN_COLUMN_WIDTH = 56
-    ELLIPSIS = "…"
+    ELLIPSIS = "..."
     DRAG_THRESHOLD = 4.0
     ITEM_MOVE_HOLD_DELAY = 0.28
     QUICK_RUBBER_MAX_DELAY = 0.28
@@ -424,6 +424,11 @@ class ExplorerListView(
         self.preserve_column_widths_on_startup = bool(
             preserve_column_widths_on_startup
         )
+        # QHeaderView-style optional stretch policy exposed by the header
+        # context menu. When enabled every visible section participates in
+        # owner-width changes and the visible section widths always sum to the
+        # ListView viewport width.
+        self.auto_width_enabled = True
 
         # File operation state. Clipboard entries are absolute paths so copy/cut
         # remains valid after sorting or reloading the current directory.
@@ -470,6 +475,8 @@ class ExplorerListView(
         self._context_menu_keyboard_button_theme = None
         self._context_menu_disabled_button_theme = None
         self._context_menu_disabled_icon_theme = None
+        self._context_menu_shortcut_theme = None
+        self._context_menu_disabled_shortcut_theme = None
         self._context_menu_action_controls = {}
         # Consume the release paired with a click handled by a popup. DPG may
         # auto-hide the popup before the global release handler runs.
@@ -593,7 +600,12 @@ class ExplorerListView(
             content_size_provider=self._scroller_content_size,
         )
         self._build_item_context_menu()
+        self._build_header_context_menu()
         self._install_global_handlers()
+        # Auto Width must be driven by each ListView's own resolved geometry.
+        # This avoids startup races between multiple panes sharing DPG's global
+        # frame-callback slot.
+        self._install_auto_width_geometry_handlers()
 
         if self.current_path is not None:
             self.set_path(self.current_path)
@@ -1123,6 +1135,8 @@ class ExplorerListView(
         if (self._rename_active or self._context_menu_is_visible()
                 or _overlay_window_owns_input()):
             key = None
+        elif not self._header_sections_clickable:
+            key = None
         else:
             inside, local_x = self._header_mouse_position()
             if not inside or self._separator_at(local_x) is not None:
@@ -1143,7 +1157,7 @@ class ExplorerListView(
             dpg.configure_item(
                 separator,
                 color=self.theme_config["drop_border"] if hovered else self.theme_config["separator"],
-                thickness=2.0 if hovered else 1.0,
+                thickness=1.0,
             )
 
     def _update_resize_cursor(self):

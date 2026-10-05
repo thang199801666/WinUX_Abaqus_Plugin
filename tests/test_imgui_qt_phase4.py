@@ -17,23 +17,27 @@ def test_imgui_menu_renders_icon_check_and_hover_submenu_slots():
     source = (WIDGETS / "menu.py").read_text(encoding="utf-8")
     for token in (
         "b.add_image(icon",
-        'mark = "✓"',
-        '"›" if spec.get("children")',
+        "def _redraw_check",
+        "def _redraw_submenu_arrow",
+        "b.add_drawlist(width=self.CHECK_SLOT",
+        "b.add_drawlist(width=self.ARROW_SLOT",
         "def _row_hovered",
         "def _show_submenu",
     ):
         assert token in source
+    assert "✓" not in source
+    assert "›" not in source
 
 
-def test_job_viewer_is_migrated_from_explorer_to_imgui_data_grid():
+def test_job_viewer_uses_restored_explorer_details_view_contract():
     source = JOBS.read_text(encoding="utf-8")
-    assert "ImGuiDataGridView" in source
-    assert "QtGridRow" in source
-    assert "ExplorerListView" not in source
-    assert "ListViewItem" not in source
+    assert "ExplorerListView" in source
+    assert "ListViewItem" in source
+    assert "ImGuiDataGridView" not in source
+    assert "theme=ListViewTheme.JOB_VIEWER" in source
 
 
-def test_job_grid_preserves_odb_plots_menu_runtime_state():
+def test_job_viewer_preserves_odb_plots_menu_runtime_state():
     source = JOBS.read_text(encoding="utf-8")
     for token in (
         '"action": "job_check_odb"',
@@ -41,6 +45,6 @@ def test_job_grid_preserves_odb_plots_menu_runtime_state():
         '"action": "job_plots"',
         "set_context_menu_item_checked",
         "set_context_menu_item_enabled",
-        "selectedRows()",
+        "self.listview.get_selected()",
     ):
         assert token in source

@@ -1,10 +1,50 @@
 """The updater UI must run outside the Abaqus/CAE process."""
 
 import os
+import sys
 from unittest import mock
 
 import run_winux
 import winux_launcher
+
+
+def test_settings_update_launch_keeps_explicit_source_and_checks_updates(tmp_path):
+    project = tmp_path / "WinUx"
+    project.mkdir()
+    (project / "run_winux.py").write_text("# runner\n")
+    (project / "WinUx").mkdir()
+    (project / "WinUx" / "__main__.py").write_text("# app\n")
+    process = mock.Mock(pid=999)
+    popen = mock.Mock(return_value=process)
+    with mock.patch.object(winux_launcher, "_log_path", return_value=str(tmp_path / "launch.log")), \
+            mock.patch.object(winux_launcher, "_running_processes", return_value=[]), \
+            mock.patch.dict(os.environ, {"WINUX_SKIP_UPDATE": "1"}):
+        winux_launcher.launch_winux(
+            project_dir=str(project), existing_pid=1234, install_update=True,
+            popen_factory=popen,
+        )
+    env = popen.call_args.kwargs["env"]
+    assert "WINUX_SKIP_UPDATE" not in env
+    assert env["WINUX_EXISTING_PID"] == "1234"
+    assert env["WINUX_UPDATE_FROM_APP"] == "1"
+    assert "--install-update" in " ".join(popen.call_args.args[0])
+
+
+def test_settings_update_passes_user_consent_to_bootstrap(tmp_path):
+    update = mock.Mock(return_value={"updated": False})
+    with mock.patch.object(sys, "argv", ["run_winux.py", "--install-update"]), \
+            mock.patch.dict(os.environ, {"WINUX_SKIP_UPDATE": "0"}):
+        run_winux._check_for_update(str(tmp_path), update_callable=update)
+    assert update.call_args.kwargs["dialog_available"]("1.0.0", "1.1.0", "GitHub") is True
+
+
+def test_settings_update_does_not_kill_its_own_descendant_tree():
+    with mock.patch.object(run_winux.os, "name", "nt"), \
+            mock.patch.object(run_winux, "_pid_is_alive", return_value=True), \
+            mock.patch.dict(os.environ, {"WINUX_UPDATE_FROM_APP": "1"}), \
+            mock.patch.object(run_winux.subprocess, "call", return_value=0) as terminate:
+        run_winux._terminate_existing_winux(1234)
+    assert terminate.call_args.args[0] == ["taskkill", "/PID", "1234", "/F"]
 
 
 def test_child_update_changes_out_of_deployment_before_sync(tmp_path):

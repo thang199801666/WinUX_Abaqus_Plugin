@@ -38,14 +38,60 @@ class ExplorerColumnsMixin:
 
     def set_column_visible(self, key, visible):
         column = self.get_column(key)
-        if column is None: raise KeyError(key)
-        column["visible"] = bool(visible)
-        self._ensure_column_widths(force=True); self._rebuild_draw_items(); return self
+        if column is None:
+            raise KeyError(key)
+        visible = bool(visible)
+        if not visible and column.get("visible", True):
+            # A details view without any section has no useful header/body
+            # geometry. Match Explorer/QHeaderView customizers and keep at
+            # least one section visible.
+            if len(self._visible_columns()) <= 1:
+                return self
+        column["visible"] = visible
+        self._ensure_column_widths(force=False)
+        if self.auto_width_enabled:
+            self._fit_columns_auto_width(self._available_width())
+        self._text_fit_cache.clear()
+        self._rebuild_draw_items()
+        self._last_available_width = self._available_width()
+        return self
+
+    def set_auto_width(self, enabled):
+        self.auto_width_enabled = bool(enabled)
+        if self.auto_width_enabled:
+            self._sync_auto_width_to_viewport(layout=True)
+        self._sync_header_context_menu_state()
+        return self
+
+    def auto_width(self):
+        return bool(self.auto_width_enabled)
+
+    def _sync_auto_width_to_viewport(self, locked_key=None, layout=False):
+        """Synchronize visible section widths with the live ListView viewport.
+
+        This is the single entry point used by startup, owner resizing and
+        header-section resizing.  When Auto Width is checked, the visible
+        columns must always consume exactly the current ListView width.
+        """
+        if not self.auto_width_enabled:
+            return False
+        available = float(self._available_width())
+        self._ensure_column_widths(force=False)
+        self._fit_columns_auto_width(available, locked_key=locked_key)
+        self._last_available_width = available
+        self._text_fit_cache.clear()
+        if layout:
+            self._layout_all()
+        return True
 
     def set_column_width(self, key, width):
-        if self.get_column(key) is None: raise KeyError(key)
+        if self.get_column(key) is None:
+            raise KeyError(key)
         self._column_widths[key] = max(self.MIN_COLUMN_WIDTH, float(width))
-        self._layout_all(); return self
+        if self.auto_width_enabled:
+            self._sync_auto_width_to_viewport(locked_key=key)
+        self._layout_all()
+        return self
 
     def set_column_alignment(self, key, horizontal=None, vertical=None):
         return self.set_column_style(key, align=horizontal, valign=vertical)
@@ -101,14 +147,22 @@ class ExplorerColumnsMixin:
         return float(self.MIN_COLUMN_WIDTH)
 
     def _available_width(self):
+        """Return the actual visible ListView content width.
+
+        Do not use ``header_canvas`` as the source of truth here.  Its width is
+        derived from the current column sum in ``_layout_all``; reading it back
+        makes Auto Width self-referential, so the columns can never discover a
+        wider parent after a container resize.  The body child window tracks the
+        real pane width and therefore matches the row/header viewport.
+        """
         try:
-            width = float(dpg.get_item_rect_size(self.header_canvas)[0])
+            width = float(dpg.get_item_rect_size(self.body_window)[0])
             if width > 20:
                 return width
         except Exception:
             pass
         try:
-            width = float(dpg.get_item_rect_size(self.window_tag)[0]) - 14.0
+            width = float(dpg.get_item_rect_size(self.window_tag)[0]) - 2.0
             if width > 20:
                 return width
         except Exception:
@@ -133,11 +187,19 @@ class ExplorerColumnsMixin:
         self._last_available_width = available
 
     def _fit_columns_to_width(self, available):
+        """Fit visible sections to *available* pixels using current policy.
+
+        The public/internal signature is intentionally unchanged for backward
+        compatibility. Auto Width delegates to the proportional fitter; when
+        disabled the historical single stretch-section behavior is retained.
+        """
+        if self.auto_width_enabled:
+            return self._fit_columns_auto_width(available)
         visible = self._visible_columns()
         if not visible:
             return
         total = sum(self._column_widths.get(c["key"], self.MIN_COLUMN_WIDTH) for c in visible)
-        delta = available - total
+        delta = float(available) - total
         fit_column = self._auto_fit_column(visible)
         fit_key = fit_column["key"]
         fit_minimum = self._auto_fit_minimum(fit_key)
@@ -145,6 +207,67 @@ class ExplorerColumnsMixin:
             fit_minimum,
             self._column_widths.get(fit_key, fit_minimum) + delta,
         )
+
+    def _fit_columns_auto_width(self, available, locked_key=None):
+        """Proportionally stretch visible sections to exactly *available*.
+
+        ``locked_key`` is used during interactive resize: the grabbed section
+        keeps the requested width and all other visible sections absorb the
+        complementary delta.
+        """
+        visible = self._visible_columns()
+        if not visible:
+            return
+        available = max(1.0, float(available))
+        keys = [c["key"] for c in visible]
+        minimums = {key: float(self._auto_fit_minimum(key)) for key in keys}
+        min_total = sum(minimums.values())
+        if available <= min_total + 1e-6:
+            each = available / float(len(keys))
+            for key in keys:
+                self._column_widths[key] = max(1.0, each)
+            used = sum(self._column_widths[key] for key in keys[:-1])
+            self._column_widths[keys[-1]] = max(1.0, available - used)
+            return
+
+        locked_key = locked_key if locked_key in keys else None
+        free_keys = list(keys)
+        remaining = available
+        if locked_key is not None and len(keys) > 1:
+            other_min = sum(minimums[k] for k in keys if k != locked_key)
+            locked = min(
+                max(minimums[locked_key], float(self._column_widths.get(locked_key, minimums[locked_key]))),
+                max(minimums[locked_key], available - other_min),
+            )
+            self._column_widths[locked_key] = locked
+            remaining -= locked
+            free_keys.remove(locked_key)
+
+        pending = list(free_keys)
+        fixed = {}
+        while pending:
+            base_total = sum(max(1.0, float(self._column_widths.get(k, minimums[k]))) for k in pending)
+            pool = max(0.0, remaining - sum(fixed.values()))
+            newly_fixed = []
+            for key in pending:
+                basis = max(1.0, float(self._column_widths.get(key, minimums[key])))
+                proposed = pool * basis / base_total if base_total > 0.0 else pool / len(pending)
+                if proposed < minimums[key]:
+                    fixed[key] = minimums[key]
+                    newly_fixed.append(key)
+            if not newly_fixed:
+                for key in pending:
+                    basis = max(1.0, float(self._column_widths.get(key, minimums[key])))
+                    self._column_widths[key] = pool * basis / base_total if base_total > 0.0 else pool / len(pending)
+                break
+            pending = [k for k in pending if k not in newly_fixed]
+
+        for key, value in fixed.items():
+            self._column_widths[key] = value
+
+        sink = next((k for k in reversed(keys) if k != locked_key), keys[-1])
+        used = sum(float(self._column_widths.get(k, 0.0)) for k in keys)
+        self._column_widths[sink] = max(1.0, self._column_widths[sink] + (available - used))
 
     def _column_geometry(self):
         x = 0.0
@@ -190,6 +313,8 @@ class ExplorerColumnsMixin:
         maximum = max(260.0, min(720.0, available * 0.72))
         width = max(float(self.MIN_COLUMN_WIDTH), min(float(required), maximum))
         self._column_widths[key] = width
+        if self.auto_width_enabled:
+            self._fit_columns_auto_width(available, locked_key=key)
         self._text_fit_cache.clear()
         self._layout_all()
         self._update_native_cursor_geometry()

@@ -14,6 +14,82 @@ from ..platform.windows_icons import ICON_SIZE
 
 class ExplorerLayoutMixin:
 
+
+    def _install_auto_width_geometry_handlers(self):
+        """Keep Auto Width synchronized from DPG item geometry events.
+
+        ``set_frame_callback`` is application-global in Dear PyGui.  Multiple
+        ListViews scheduling the same frame can therefore replace each other's
+        callback during startup.  Item resize/visible handlers are local to the
+        ListView and fire after Dear ImGui has resolved the real child-window
+        geometry, which makes them the authoritative trigger for Auto Width.
+        """
+        self._auto_width_geometry_registries = []
+
+        def bind_geometry_handler(item, suffix):
+            if not item or not dpg.does_item_exist(item):
+                return
+            try:
+                tag = f"{self.uid}_auto_width_geometry_{suffix}"
+                with dpg.item_handler_registry(tag=tag) as registry:
+                    if hasattr(dpg, "add_item_resize_handler"):
+                        dpg.add_item_resize_handler(
+                            callback=self._on_auto_width_geometry_event)
+                    # Visible fires after the first resolved layout and gives us
+                    # a deterministic startup pass even when the initial resize
+                    # happened before the handler registry was bound.
+                    if hasattr(dpg, "add_item_visible_handler"):
+                        dpg.add_item_visible_handler(
+                            callback=self._on_auto_width_geometry_event)
+                dpg.bind_item_handler_registry(item, registry)
+                self._auto_width_geometry_registries.append(registry)
+            except Exception:
+                pass
+
+        # The body child is the source used by _available_width().  Bind the
+        # outer pane as well because splitter changes may resize it one frame
+        # before the body child receives its final dimensions.
+        bind_geometry_handler(self.window_tag, "pane")
+        bind_geometry_handler(self.body_window, "body")
+
+    def _on_auto_width_geometry_event(self, sender=None, app_data=None, user_data=None):
+        """Refit visible sections when the live ListView width changes."""
+        if not self.auto_width_enabled:
+            return
+        if not dpg.does_item_exist(self.body_window):
+            return
+        try:
+            available = float(self._available_width())
+        except Exception:
+            return
+        if available <= 20.0:
+            return
+
+        visible = self._visible_columns()
+        if not visible:
+            return
+        total = sum(
+            float(self._column_widths.get(c["key"], self.MIN_COLUMN_WIDTH))
+            for c in visible
+        )
+        # visible-handler callbacks can occur every frame.  Only redraw when
+        # the viewport or the column sum is actually out of sync.
+        if (
+            abs(available - float(self._last_available_width)) < 0.5
+            and abs(available - total) < 0.5
+        ):
+            return
+
+        self._ensure_column_widths(force=not bool(self._column_widths))
+        self._fit_columns_auto_width(available)
+        self._last_available_width = available
+        self._text_fit_cache.clear()
+        self._layout_all()
+        try:
+            self._update_native_cursor_geometry()
+        except Exception:
+            pass
+
     def resize(self, width=-1, height=-1):
         """Fit the ListView pane to its owner without creating outer scrolling."""
         if not dpg.does_item_exist(self.window_tag):
@@ -27,9 +103,29 @@ class ExplorerLayoutMixin:
         self._text_fit_cache.clear()
         self._resize_layout_pending = True
         try:
+            if self.auto_width_enabled:
+                self._sync_auto_width_to_viewport()
             self._layout_all()
         except Exception:
             pass
+
+        # DearPyGui applies fill-width (-1) and splitter/container geometry on
+        # the next rendered frame. Re-sync once the live child viewport has its
+        # new size so Auto Width follows every ListView/container resize.
+        if self.auto_width_enabled:
+            def _sync_after_resize(sender=None, app_data=None):
+                if not dpg.does_item_exist(self.window_tag):
+                    return
+                try:
+                    self._sync_auto_width_to_viewport(layout=True)
+                    self._update_native_cursor_geometry()
+                except Exception:
+                    pass
+            try:
+                dpg.set_frame_callback(
+                    dpg.get_frame_count() + 1, callback=_sync_after_resize)
+            except Exception:
+                pass
         overlay = getattr(self, "_scroller_arrow_overlay", None)
         if overlay is not None:
             overlay.update()
@@ -90,11 +186,42 @@ class ExplorerLayoutMixin:
             max(1.0, viewport_width - 1.0),
         )
 
+        # The body child reports the scrollable *content* viewport, which on
+        # Dear ImGui/DPG excludes the vertical scrollbar strip whenever that
+        # scrollbar is visible.  The QHeaderView-like header, however, belongs
+        # to the outer ListView frame and must visually span the full frame.
+        # Using only body_window here left a white strip at the right edge
+        # (roughly the scrollbar width) even when Auto Width was enabled.
+        try:
+            pane_width = float(dpg.get_item_rect_size(self.window_tag)[0])
+        except Exception:
+            pane_width = 0.0
+        header_viewport_width = max(
+            1.0,
+            (pane_width - 2.0) if pane_width > 2.0 else (viewport_width - 1.0),
+        )
+        header_width = max(total_width, header_viewport_width)
         dpg.configure_item(
             self.header_canvas,
-            width=max(1, int(round(total_width))),
+            width=max(1, int(round(header_width))),
             height=self.HEADER_HEIGHT,
         )
+
+        # Resize the painted header background together with the drawlist.
+        # Auto Width may change ``header_width`` after the primitive was first
+        # created, and a drawlist does not automatically resize its children.
+        # Painting to the full viewport keeps one uniform QHeaderView-style
+        # grey across columns and any transient remainder at the right edge.
+        header_background = getattr(self, "_header_background", None)
+        if header_background and dpg.does_item_exist(header_background):
+            dpg.configure_item(
+                header_background,
+                pmin=(0, 0),
+                pmax=(header_width, self.HEADER_HEIGHT),
+                fill=self.theme_config["header_bg"],
+                color=self.theme_config["header_bg"],
+                thickness=0.0,
+            )
 
         dpg.configure_item(
             self.body_canvas,
@@ -113,7 +240,9 @@ class ExplorerLayoutMixin:
         header_font = self._fonts.get("header")
 
         # ------------------------------ header ------------------------------
-        for column in self._visible_columns():
+        visible_columns = self._visible_columns()
+        last_visible_key = visible_columns[-1]["key"] if visible_columns else None
+        for column in visible_columns:
             key = column["key"]
             column_x, column_width = geometry[key]
 
@@ -123,17 +252,29 @@ class ExplorerLayoutMixin:
 
             background = parts.get("background")
             if background and dpg.does_item_exist(background):
+                # QHeaderView paints the final section through the header's
+                # scrollbar-reserved strip.  Keep the logical/data width tied
+                # to the body viewport so values are never hidden beneath the
+                # vertical scrollbar; only the final header surface consumes
+                # this visual remainder.
+                section_right = column_x + column_width
+                if key == last_visible_key:
+                    section_right = max(section_right, header_width)
                 dpg.configure_item(
                     background,
                     pmin=(column_x, 0),
-                    pmax=(column_x + column_width, self.HEADER_HEIGHT),
+                    pmax=(section_right, self.HEADER_HEIGHT),
                 )
 
             raw_label = column["label"]
-
+            sorted_column = self.sort_key == key
+            # QHeaderView reserves only the sub-control space it actually
+            # needs.  The old fixed 48 px deduction made short Job Viewer
+            # sections truncate far too early, especially Status/Tokens.
+            right_reserve = 24.0 if sorted_column else 14.0
             label = self._fit_text(
                 raw_label,
-                max(0.0, column_width - 48.0),
+                max(0.0, column_width - right_reserve),
                 header_font,
                 16,
             )
@@ -144,7 +285,6 @@ class ExplorerLayoutMixin:
                 16,
             )
 
-            sorted_column = self.sort_key == key
             arrow_width = 7.0
             arrow_height = 5.0
 
@@ -215,11 +355,11 @@ class ExplorerLayoutMixin:
         if self._header_top_line and dpg.does_item_exist(self._header_top_line):
             dpg.configure_item(
                 self._header_top_line, p1=(0, 0.5),
-                p2=(total_width, 0.5))
+                p2=(header_width, 0.5))
         if self._header_bottom_line and dpg.does_item_exist(self._header_bottom_line):
             dpg.configure_item(
                 self._header_bottom_line, p1=(0, self.HEADER_HEIGHT - 0.5),
-                p2=(total_width, self.HEADER_HEIGHT - 0.5))
+                p2=(header_width, self.HEADER_HEIGHT - 0.5))
 
         self._update_header_cell_visuals()
 
@@ -403,17 +543,17 @@ class ExplorerLayoutMixin:
                     visible_columns = self._visible_columns()
 
                     if visible_columns:
-                        fit_column = self._auto_fit_column(visible_columns)
-                        fit_key = fit_column["key"]
-                        fit_minimum = self._auto_fit_minimum(fit_key)
-
-                        self._column_widths[fit_key] = max(
-                            fit_minimum,
-                            self._column_widths.get(
-                                fit_key,
+                        if self.auto_width_enabled:
+                            self._fit_columns_auto_width(available)
+                        else:
+                            fit_column = self._auto_fit_column(visible_columns)
+                            fit_key = fit_column["key"]
+                            fit_minimum = self._auto_fit_minimum(fit_key)
+                            self._column_widths[fit_key] = max(
                                 fit_minimum,
-                            ) + delta,
-                        )
+                                self._column_widths.get(
+                                    fit_key, fit_minimum) + delta,
+                            )
 
                     self._last_available_width = available
                     self._text_fit_cache.clear()
@@ -436,14 +576,16 @@ class ExplorerLayoutMixin:
                         self._last_available_width = self._available_width()
 
                         if self.preserve_column_widths_on_startup:
-                            # Column widths do not depend on font metrics.
-                            # Preserve widths assigned by a specialized view
-                            # instead of dividing the pane equally again.
+                            # Preserve the specialized view's proportions as
+                            # the basis, then Auto Width stretches those widths
+                            # to the real viewport measured after startup.
                             self._ensure_column_widths(
                                 force=not bool(self._column_widths)
                             )
                         else:
                             self._ensure_column_widths(force=True)
+                        if self.auto_width_enabled:
+                            self._sync_auto_width_to_viewport()
                         self._layout_all()
                         self._update_native_cursor_geometry()
 

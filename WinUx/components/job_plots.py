@@ -12,8 +12,9 @@ from .dock_widget import DockWidget
 from .interaction_gate import acquire_pointer_input, release_pointer_input
 from .qt_style import QtFusionPalette
 from ..widgets.imgui_qt_style import (
-    checkbox_theme, command_button_theme, line_edit_theme, panel_surface_theme,
-    tool_bar_theme,
+    METRICS,
+    button_theme, checkbox_theme, line_edit_theme, panel_surface_theme,
+    panel_header_theme, status_text_theme,
 )
 from .tooltip import tooltip_theme
 
@@ -31,15 +32,18 @@ class JobPlotsWindow:
     LIST_WIDTH = 280
     MIN_LIST_WIDTH = 220
     MIN_PLOT_WIDTH = 340
-    TOOLBAR_HEIGHT = 31
-    OUTER_MARGIN = 8
-    TOOLBAR_BODY_GAP = 5
+    TOOLBAR_HEIGHT = 34
+    OUTER_MARGIN = 6
+    TOOLBAR_BODY_GAP = 6
     PANEL_GAP = 8
     HISTORY_ROW_GAP = 3
-    INNER_PAD = 8
+    INNER_PAD = 7
     BUTTON_ROW_GAP = 4
     CONTROL_SECTION_GAP = 10
     COUNT_RIGHT_PAD = 4
+    BUTTON_HEIGHT = METRICS.button_height
+    EDIT_HEIGHT = METRICS.control_height
+    TOP_SECTION_PAD = 8
     SERIES_COLORS = (
         (0, 191, 255, 255),
         (255, 179, 0, 255),
@@ -113,7 +117,7 @@ class JobPlotsWindow:
             border=False, no_scrollbar=True, no_scroll_with_mouse=True)
         self.status_text = dpg.add_text("Waiting for ODB...", parent=self.toolbar)
         self.fit_button = dpg.add_button(
-            label="Fit", width=48, height=22, parent=self.toolbar,
+            label="Fit", width=52, height=self.BUTTON_HEIGHT, parent=self.toolbar,
             callback=self._fit_axes)
 
         with dpg.handler_registry() as self._drag_registry:
@@ -136,19 +140,19 @@ class JobPlotsWindow:
                 self.filter_input = dpg.add_input_text(
                     hint="Filter history outputs...",
                     width=-1,
-                    height=24,
+                    height=self.EDIT_HEIGHT,
                     callback=self._filter_changed,
                 )
                 self.all_button = dpg.add_button(
-                    label="All", width=52, height=22,
+                    label="All", width=52, height=self.BUTTON_HEIGHT,
                     callback=lambda: self._set_all(True))
                 self.none_button = dpg.add_button(
-                    label="None", width=52, height=22,
+                    label="None", width=52, height=self.BUTTON_HEIGHT,
                     callback=lambda: self._set_all(False))
                 self.count_text = dpg.add_text("0 outputs")
                 self.header_separator = dpg.add_drawlist(width=1, height=1)
                 self._header_separator_line = dpg.draw_line(
-                    (0, 0), (1, 0), color=QtFusionPalette.BORDER,
+                    (0, 0), (1, 0), color=QtFusionPalette.BORDER_LIGHT,
                     thickness=1.0, parent=self.header_separator)
                 self.history_container = dpg.add_child_window(
                     width=-1, height=-1, border=False,
@@ -178,15 +182,18 @@ class JobPlotsWindow:
                     self.y_axis = dpg.add_plot_axis(
                         dpg.mvYAxis, label="Value")
 
-        dpg.bind_item_theme(self.toolbar, tool_bar_theme(dpg))
+        dpg.bind_item_theme(self.toolbar, panel_header_theme(dpg))
+        dpg.bind_item_theme(self.status_text, status_text_theme(dpg, muted=True))
+        dpg.bind_item_theme(self.fit_button, button_theme(dpg, role="secondary"))
+        dpg.bind_item_theme(self.filter_input, line_edit_theme(dpg))
+        dpg.bind_item_theme(self.all_button, button_theme(dpg, role="secondary"))
+        dpg.bind_item_theme(self.none_button, button_theme(dpg, role="secondary"))
+        dpg.bind_item_theme(self.count_text, status_text_theme(dpg, muted=True))
         dpg.bind_item_theme(self.body_panel, self._body_theme)
         dpg.bind_item_theme(self.body_group, self._body_theme)
         dpg.bind_item_theme(self.plot_panel, self._panel_theme)
         dpg.bind_item_theme(self.plot, self._plot_theme)
         dpg.bind_item_theme(self.list_panel, self._panel_theme)
-        dpg.bind_item_theme(self.filter_input, line_edit_theme(dpg))
-        for button in (self.fit_button, self.all_button, self.none_button):
-            dpg.bind_item_theme(button, command_button_theme(dpg))
         self._history_rows: Dict[str, Any] = {}
         self._history_labels: Dict[str, Any] = {}
         self.sync_layout()
@@ -239,7 +246,11 @@ class JobPlotsWindow:
 
         self._panel_theme = panel_surface_theme(
             dpg, bordered=True, compact=True)
-        self._checkbox_theme = checkbox_theme(dpg)
+        # Keep separate native checkbox themes for the two visual states.
+        # Binding one unchecked theme permanently leaves Dear ImGui's white
+        # check mark on a white indicator when the value becomes True.
+        self._checkbox_theme_off = checkbox_theme(dpg, checked=False)
+        self._checkbox_theme_on = checkbox_theme(dpg, checked=True)
 
         with dpg.theme() as self._history_label_theme:
             with dpg.theme_component(dpg.mvText):
@@ -333,21 +344,22 @@ class JobPlotsWindow:
             status_size = (7 * len(str(dpg.get_value(self.status_text) or "")), 14)
             count_size = (7 * len(str(dpg.get_value(self.count_text) or "")), 14)
 
-        fit_w = 48
-        fit_h = 22
+        fit_w = 52
+        fit_h = self.BUTTON_HEIGHT
         toolbar_w = max(1, content_w)
         fit_x = max(inner_pad, toolbar_w - inner_pad - fit_w)
-        fit_y = max(3, (toolbar_h - fit_h) // 2)
+        fit_y = max(0, (toolbar_h - fit_h) // 2)
         status_y = max(0, (toolbar_h - int(status_size[1])) // 2)
 
-        header_y = inner_pad
-        button_row_y = header_y + 24 + 8
-        history_y = button_row_y + 22 + 8
+        header_y = self.TOP_SECTION_PAD
+        button_row_y = header_y + self.EDIT_HEIGHT + 8
+        history_y = button_row_y + self.BUTTON_HEIGHT + 8
         history_h = max(1, body_h - history_y - inner_pad)
         count_x = max(
             inner_pad + 52 + self.BUTTON_ROW_GAP + 52 + self.CONTROL_SECTION_GAP,
             max(inner_pad, list_width - inner_pad - int(count_size[0]) - self.COUNT_RIGHT_PAD),
         )
+        count_y = button_row_y + max(0, (self.BUTTON_HEIGHT - int(count_size[1])) // 2)
 
         self._safe_configure(
             self.toolbar, pos=(0, 0), width=toolbar_w,
@@ -368,17 +380,17 @@ class JobPlotsWindow:
         filter_w = max(80, list_width - 2 * inner_pad)
         self._safe_configure(
             self.filter_input, pos=(inner_pad, header_y),
-            width=filter_w, height=24)
+            width=filter_w, height=self.EDIT_HEIGHT)
         self._safe_configure(
             self.all_button, pos=(inner_pad, button_row_y),
-            width=52, height=22)
+            width=52, height=self.BUTTON_HEIGHT)
         self._safe_configure(
             self.none_button,
             pos=(inner_pad + 52 + self.BUTTON_ROW_GAP, button_row_y),
-            width=52, height=22)
-        self._safe_configure(self.count_text, pos=(count_x, button_row_y + 3))
+            width=52, height=self.BUTTON_HEIGHT)
+        self._safe_configure(self.count_text, pos=(count_x, count_y))
         self._safe_configure(
-            self.header_separator, pos=(inner_pad, history_y - 6),
+            self.header_separator, pos=(inner_pad, history_y - 7),
             width=filter_w, height=1)
         self._safe_configure(
             self._header_separator_line,
@@ -536,7 +548,7 @@ class JobPlotsWindow:
                 "{} outputs".format(len(self.catalog)))
             self._sync_client_layout()
         odb_name = str((payload or {}).get("odb") or "ODB")
-        self.set_status("{} • live history catalog ready".format(odb_name))
+        self.set_status("{} | live history catalog ready".format(odb_name))
         self._notify_selection_changed()
 
     def _rebuild_history_list(self):
@@ -565,7 +577,11 @@ class JobPlotsWindow:
                 user_data=item_id,
                 callback=self._checkbox_changed,
             )
-            dpg.bind_item_theme(checkbox, self._checkbox_theme)
+            dpg.bind_item_theme(
+                checkbox,
+                self._checkbox_theme_on if item_id in self.selected_ids
+                else self._checkbox_theme_off,
+            )
             dpg.add_spacer(parent=inline_group, width=7)
             label_text = dpg.add_text(label, parent=inline_group)
             dpg.bind_item_theme(label_text, self._history_label_theme)
@@ -585,7 +601,11 @@ class JobPlotsWindow:
 
     def _checkbox_changed(self, sender, app_data, user_data):
         item_id = str(user_data or "")
-        if bool(app_data):
+        checked = bool(app_data)
+        if dpg.does_item_exist(sender):
+            dpg.bind_item_theme(
+                sender, self._checkbox_theme_on if checked else self._checkbox_theme_off)
+        if checked:
             self.selected_ids.add(item_id)
         else:
             self.selected_ids.discard(item_id)
@@ -598,6 +618,10 @@ class JobPlotsWindow:
         for item_id, checkbox in self._checkboxes.items():
             if dpg.does_item_exist(checkbox):
                 dpg.set_value(checkbox, bool(checked))
+                dpg.bind_item_theme(
+                    checkbox,
+                    self._checkbox_theme_on if checked else self._checkbox_theme_off,
+                )
         if not checked:
             for item_id in list(self._series_tags):
                 self._delete_series(item_id)
@@ -710,7 +734,7 @@ class JobPlotsWindow:
                 for item_id in self.selected_ids)
             stamp = time.strftime("%H:%M:%S")
             self.set_status(
-                "Live • {} selected • {} points • updated {}".format(
+                "Live | {} selected | {} points | updated {}".format(
                     len(self.selected_ids), total_points, stamp))
 
     def _fit_axes(self, sender=None, app_data=None, user_data=None):

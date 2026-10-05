@@ -100,6 +100,24 @@ class MigrationTests(unittest.TestCase):
         self.view.drain()
         self.assertEqual(received, [False, "hello"])
 
+    def test_settings_update_requires_available_release_and_recovers_launch_error(self):
+        requests = []
+        dialog = self.keep(SettingsDialog(self.view, on_install_update=lambda: requests.append("install")))
+        self.assertFalse(dpg.get_item_configuration(dialog.install_update_button)["enabled"])
+        dialog._install_update_now()
+        self.assertEqual(requests, [])
+        dialog._finish_update_check({
+            "available": True, "local_version": "1.1.0", "server_version": "1.2.0",
+            "source_label": "GitHub Releases",
+        })
+        self.assertTrue(dpg.get_item_configuration(dialog.install_update_button)["enabled"])
+        with patch.object(dialog, "_save_update_preferences_only"):
+            dialog._install_update_now()
+        self.assertEqual(requests, ["install"])
+        self.assertFalse(dpg.get_item_configuration(dialog.install_update_button)["enabled"])
+        dialog.handle_command("update_launch_failed", "Abaqus command unavailable")
+        self.assertTrue(dpg.get_item_configuration(dialog.install_update_button)["enabled"])
+
     def test_late_worker_result_is_dropped_after_destroy(self):
         dialog = self.keep(QtDialog(self.view, "Worker"))
         received = []
@@ -130,9 +148,12 @@ class MigrationTests(unittest.TestCase):
                                             task_submitter=lambda *a, **k: None))
         generation = dialog._generation
         dialog.handle_command("results", generation-1, "/", ["/stale"], None)
-        self.assertEqual(dpg.get_item_configuration(dialog.listbox)["items"], [])
+        self.assertEqual(list(dialog.listbox.items), [])
         dialog.handle_command("results", generation, "/", ["/current"], None)
-        self.assertEqual(dpg.get_item_configuration(dialog.listbox)["items"], ["/current"])
+        self.assertEqual([
+            dpg.get_item_configuration(tag)["label"]
+            for tag in dialog.listbox.items.values()
+        ], ["/current"])
         dialog.finish("/current")
         dialog.finish("/duplicate")
         self.view.drain()

@@ -24,6 +24,7 @@ def normalize_menu_item(spec):
     item.setdefault("label", "")
     item.setdefault("action", None)
     item.setdefault("icon", None)
+    item.setdefault("shortcut", None)
     item.setdefault("enabled", True)
     item.setdefault("visible", True)
     item.setdefault("checkable", False)
@@ -107,6 +108,14 @@ class ExplorerContextMenuMixin:
                 icon,
                 self._context_menu_icon_theme if enabled else self._context_menu_disabled_icon_theme,
             )
+        shortcut = controls.get("shortcut")
+        if shortcut and dpg.does_item_exist(shortcut):
+            dpg.configure_item(shortcut, enabled=True)
+            dpg.bind_item_theme(
+                shortcut,
+                self._context_menu_shortcut_theme
+                if enabled else self._context_menu_disabled_shortcut_theme,
+            )
         check_slot = controls.get("check_slot")
         if check_slot and dpg.does_item_exist(check_slot) and spec is not None:
             self._render_context_menu_check_slot(check_slot, spec, enabled)
@@ -125,6 +134,79 @@ class ExplorerContextMenuMixin:
         item = next((x for x in self.item_menu_spec if x.get("id") == item_id), None)
         if item is None: raise KeyError(item_id)
         item.update(changes); self._build_item_context_menu(rebuild=True); return self
+
+    def _build_header_context_menu(self):
+        self.header_menu_tag = f"{self.uid}_headermenu"
+        self._header_menu_column_checks = {}
+        self._header_menu_auto_width_check = None
+        if dpg.does_item_exist(self.header_menu_tag):
+            return
+        width = 220
+        with dpg.window(
+            tag=self.header_menu_tag, popup=False, show=False,
+            no_title_bar=True, no_saved_settings=True, no_resize=True,
+            no_scrollbar=True, no_collapse=True, no_move=True,
+            no_bring_to_front_on_focus=False, width=width,
+            min_size=(width, 10), max_size=(width, 520),
+        ):
+            for column in self.columns:
+                key = str(column.get("key"))
+                check = dpg.add_checkbox(
+                    label=str(column.get("label") or key),
+                    default_value=bool(column.get("visible", True)),
+                    callback=self._on_header_column_check, user_data=key,
+                )
+                self._header_menu_column_checks[key] = check
+            dpg.add_separator()
+            self._header_menu_auto_width_check = dpg.add_checkbox(
+                label="Auto Width",
+                default_value=bool(self.auto_width_enabled),
+                callback=self._on_header_auto_width_check,
+            )
+        dpg.bind_item_theme(self.header_menu_tag, self.theme_popup)
+        _EXPLORER_MENU_TAGS.add(self.header_menu_tag)
+        register_pointer_protected_item(self.header_menu_tag)
+
+    def _sync_header_context_menu_state(self):
+        checks = getattr(self, "_header_menu_column_checks", {})
+        visible_count = len(self._visible_columns())
+        for column in self.columns:
+            key = str(column.get("key"))
+            tag = checks.get(key)
+            if tag and dpg.does_item_exist(tag):
+                shown = bool(column.get("visible", True))
+                dpg.set_value(tag, shown)
+                # Keep at least one section visible. The final visible section
+                # is disabled until another section is re-enabled.
+                dpg.configure_item(tag, enabled=(not shown or visible_count > 1))
+        tag = getattr(self, "_header_menu_auto_width_check", None)
+        if tag and dpg.does_item_exist(tag):
+            dpg.set_value(tag, bool(self.auto_width_enabled))
+
+    def _on_header_column_check(self, sender=None, app_data=None, user_data=None):
+        key = str(user_data or "")
+        try:
+            self.set_column_visible(key, bool(app_data))
+        finally:
+            self._sync_header_context_menu_state()
+
+    def _on_header_auto_width_check(self, sender=None, app_data=None, user_data=None):
+        self.set_auto_width(bool(app_data))
+        self._sync_header_context_menu_state()
+
+    def _show_header_context_menu(self):
+        if not getattr(self, "header_menu_tag", None):
+            self._build_header_context_menu()
+        self._hide_context_menus()
+        self._sync_header_context_menu_state()
+        try:
+            mx, my = map(float, dpg.get_mouse_pos(local=False))
+        except Exception:
+            return
+        menu_x, menu_y = self._clamp_context_position(
+            self.header_menu_tag, mx, my, 220.0)
+        dpg.set_item_pos(self.header_menu_tag, [menu_x, menu_y])
+        dpg.configure_item(self.header_menu_tag, show=True)
 
     def _build_item_context_menu(self, rebuild=False):
         self.itemmenu_tag = f"{self.uid}_itemmenu"
@@ -172,7 +254,10 @@ class ExplorerContextMenuMixin:
             register_pointer_protected_item(submenu_tag)
 
     def _delete_context_menu_windows(self):
-        tags = [getattr(self, "itemmenu_tag", None)]
+        tags = [
+            getattr(self, "itemmenu_tag", None),
+            getattr(self, "header_menu_tag", None),
+        ]
         tags.extend(getattr(self, "_context_submenu_tags", {}).values())
         for tag in tags:
             if tag:
@@ -224,12 +309,14 @@ class ExplorerContextMenuMixin:
         group_id = str(spec.get("id") or label)
         row_index = len(self._context_menu_group_tags) + len(self._context_submenu_tags)
         row_tag = f"{self.uid}_menu_row_{row_index}_{abs(hash((label, submenu))) % 100000}"
-        # Submenu arrows are independent controls, not spaces appended to the
-        # label.  This keeps every solid arrow in one right-aligned column no
-        # matter how long the action text or which font/DPI is active.
+        # Keep accelerator text in its own fixed right-aligned slot, matching
+        # Qt/Windows menu geometry.  Do not pad the action label with spaces:
+        # font/DPI changes would otherwise move F-keys/Ctrl shortcuts around.
         base_text_width = 210 if submenu else 232
         arrow_width = 16 if children else 0
-        text_width = base_text_width - arrow_width
+        shortcut = str(spec.get("shortcut") or "")
+        shortcut_width = 58 if shortcut else 0
+        text_width = base_text_width - arrow_width - shortcut_width
         callback = self._show_context_submenu if children else self._on_item_menu_action
         callback_data = group_id if children else spec.get("action")
 
@@ -265,6 +352,18 @@ class ExplorerContextMenuMixin:
                 width=text_width, height=28, enabled=True,
                 callback=callback, user_data=callback_data,
             )
+            shortcut_button = None
+            if shortcut:
+                shortcut_button = dpg.add_button(
+                    tag=f"{row_tag}_shortcut", label=shortcut,
+                    width=shortcut_width, height=28, enabled=True,
+                    callback=callback, user_data=callback_data,
+                )
+                dpg.bind_item_theme(
+                    shortcut_button,
+                    self._context_menu_shortcut_theme
+                    if enabled else self._context_menu_disabled_shortcut_theme,
+                )
             if children:
                 # Draw the submenu indicator as geometry instead of a Unicode
                 # glyph.  Some Dear PyGui font atlases do not include the
@@ -290,6 +389,7 @@ class ExplorerContextMenuMixin:
         )
         self._context_menu_row_controls[group_id] = {
             "button": button,
+            "shortcut": shortcut_button,
             "spec": spec,
             "parent": parent,
             "submenu": bool(submenu),
@@ -298,6 +398,7 @@ class ExplorerContextMenuMixin:
         if action_key is not None:
             self._context_menu_action_controls[str(action_key)] = {
                 "button": button,
+                "shortcut": shortcut_button,
                 "icon": icon_button,
                 "check_slot": check_slot,
             }
@@ -501,11 +602,16 @@ class ExplorerContextMenuMixin:
                 self._on_item_menu_action(None, None, action)
 
     def _context_menu_is_visible(self):
-        if self.itemmenu_tag and dpg.does_item_exist(self.itemmenu_tag):
-            try:
-                return bool(dpg.is_item_shown(self.itemmenu_tag))
-            except Exception:
-                pass
+        tags = [getattr(self, "itemmenu_tag", None),
+                getattr(self, "header_menu_tag", None)]
+        tags.extend(getattr(self, "_context_submenu_tags", {}).values())
+        for tag in tags:
+            if tag and dpg.does_item_exist(tag):
+                try:
+                    if dpg.is_item_shown(tag):
+                        return True
+                except Exception:
+                    pass
         return False
 
     def _mouse_inside_context_menus(self):
@@ -514,6 +620,9 @@ class ExplorerContextMenuMixin:
         except Exception:
             point = None
         if self._point_in_visible_window(self.itemmenu_tag, point):
+            return True
+        if self._point_in_visible_window(
+                getattr(self, "header_menu_tag", None), point):
             return True
         return any(self._point_in_visible_window(tag, point)
                    for tag in self._context_submenu_tags.values())
@@ -532,6 +641,9 @@ class ExplorerContextMenuMixin:
         self._hide_context_submenus()
         if dpg.does_item_exist(self.itemmenu_tag):
             dpg.configure_item(self.itemmenu_tag, show=False)
+        header_menu = getattr(self, "header_menu_tag", None)
+        if header_menu and dpg.does_item_exist(header_menu):
+            dpg.configure_item(header_menu, show=False)
 
     def _show_context_submenu(self, sender=None, app_data=None, user_data=None):
         group_id = str(user_data or "")

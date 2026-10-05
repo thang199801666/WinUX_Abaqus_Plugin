@@ -155,7 +155,14 @@ class ConnectionController:
         self.app._server_current_path = folder
         self.app._flush_schedule_manifest_async()
         self.app._restore_shared_schedules()
-        self.server.set_shell_directory(folder)
+        # The folder shown immediately after login is loaded directly here
+        # rather than through NavigationController.server_loaded().  Keep the
+        # interactive console in sync at startup as well, otherwise the path
+        # bar can show Batch-3 while the shell remains at ~ or its parent.
+        try:
+            self.server.set_shell_directory(folder)
+        except Exception:
+            pass
         self.app.navigation_preferences.save_server(
             self.server.host, self.server.username, folder)
         self.app._start_job_polling()

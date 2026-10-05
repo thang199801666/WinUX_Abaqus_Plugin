@@ -13,9 +13,9 @@ from typing import Callable, Optional
 import dearpygui.dearpygui as dpg
 
 from .qt_style import QtFusionPalette
+from ..widgets import QMenu
 from ..widgets.imgui_qt_style import (
     dock_content_theme, dock_control_theme, dock_frame_theme, dock_title_theme,
-    menu_bar_theme,
 )
 from .tooltip import add_styled_tooltip
 
@@ -62,12 +62,12 @@ class DockWidget:
     }
 
     FRAME = 1
-    TITLE_HEIGHT = 24
-    CONTROL_SIZE = 20
-    CONTROL_GAP = 1
-    TITLE_LEFT_PADDING = 6
-    TITLE_TOP_PADDING = 4
-    TITLE_TEXT_RIGHT_PADDING = 4
+    TITLE_HEIGHT = 20
+    CONTROL_SIZE = 18
+    CONTROL_GAP = 0
+    TITLE_LEFT_PADDING = 7
+    TITLE_TOP_PADDING = 2
+    TITLE_TEXT_RIGHT_PADDING = 6
 
     # Text/glyph colors remain local geometry details; surface/state colors are
     # supplied by the shared Dear ImGui Qt/Fusion style foundation.
@@ -200,33 +200,15 @@ class DockWidget:
         add_styled_tooltip(self.float_button, "Float")
         add_styled_tooltip(self.close_button, "Close")
 
-        # Qt exposes dock actions from the title area.  Dear PyGui has no
-        # QDockWidget system menu, so provide a compact popup with the same
-        # practical actions.  The popup is an overlay and therefore registers
-        # with the global pointer gate to prevent click-through.
-        self._title_menu = dpg.add_window(
-            popup=True, show=False, width=166, height=146,
-            no_saved_settings=True, no_title_bar=True, no_resize=True,
-            no_collapse=True, no_scrollbar=True, no_scroll_with_mouse=True)
-        dpg.bind_item_theme(self._title_menu, self._menu_theme)
+        # Qt exposes dock actions from the title area.  Reuse the retained
+        # QMenu renderer instead of maintaining a second hand-written popup.
+        # This keeps row metrics, checked dock-area state, keyboard navigation
+        # and pointer shielding identical to every other context menu in WinUx.
+        self._title_menu_obj = QMenu((), backend=dpg, min_width=166)
+        self._title_menu_obj.triggered.connect(self._title_menu_triggered)
+        self._title_menu = self._title_menu_obj.tag
         register_pointer_protected_item(self._title_menu)
-        self._menu_float = dpg.add_selectable(
-            parent=self._title_menu, label="Float",
-            callback=self._menu_float_clicked)
-        self._menu_dock_separator = dpg.add_separator(parent=self._title_menu)
-        self._menu_dock_items = {}
-        for area_name, label in (("left", "Dock Left"),
-                                 ("right", "Dock Right"),
-                                 ("top", "Dock Top"),
-                                 ("bottom", "Dock Bottom")):
-            self._menu_dock_items[area_name] = dpg.add_selectable(
-                parent=self._title_menu, label=label,
-                callback=self._menu_dock_area_clicked,
-                user_data=area_name)
-        self._menu_separator = dpg.add_separator(parent=self._title_menu)
-        self._menu_close = dpg.add_selectable(
-            parent=self._title_menu, label="Close",
-            callback=self._menu_close_clicked)
+        self._rebuild_title_menu_actions()
 
         self.title_overlay = dpg.add_drawlist(
             parent=self.title_bar,
@@ -275,7 +257,6 @@ class DockWidget:
         self._content_theme = dock_content_theme(dpg)
         self._float_control_theme = dock_control_theme(dpg, close=False)
         self._close_control_theme = dock_control_theme(dpg, close=True)
-        self._menu_theme = menu_bar_theme(dpg)
 
         with dpg.theme() as self._drag_theme:
             with dpg.theme_component(dpg.mvButton):
@@ -362,22 +343,7 @@ class DockWidget:
                 if dpg.does_item_exist(glyph):
                     dpg.configure_item(glyph, show=self.closable)
             if self._title_menu and dpg.does_item_exist(self._title_menu):
-                dpg.configure_item(
-                    self._menu_float, show=self.floatable,
-                    label="Dock" if self.floating else "Float")
-                area_actions_visible = bool(self.movable)
-                for area_name, item in self._menu_dock_items.items():
-                    allowed = area_actions_visible and self.is_area_allowed(area_name)
-                    dpg.configure_item(
-                        item, show=allowed,
-                        label=("✓ " if area_name == self.dock_area and not self.floating else "")
-                              + "Dock " + area_name.title())
-                dpg.configure_item(
-                    self._menu_dock_separator, show=area_actions_visible)
-                dpg.configure_item(self._menu_close, show=self.closable)
-                dpg.configure_item(
-                    self._menu_separator,
-                    show=self.closable and (self.floatable or area_actions_visible))
+                self._rebuild_title_menu_actions()
         except Exception:
             pass
 
@@ -385,49 +351,76 @@ class DockWidget:
         if self.floatable and not self.floating:
             self._float_clicked()
 
+    def _dock_title_menu_actions(self):
+        actions = []
+        if self.floatable:
+            actions.append({
+                "id": "toggle_float",
+                "label": "Dock" if self.floating else "Float",
+                "action": "toggle_float",
+            })
+        dock_actions = []
+        if self.movable:
+            for area_name in ("left", "right", "top", "bottom"):
+                if not self.is_area_allowed(area_name):
+                    continue
+                dock_actions.append({
+                    "id": "dock_{}".format(area_name),
+                    "label": "Dock {}".format(area_name.title()),
+                    "action": "dock_{}".format(area_name),
+                    "checkable": True,
+                    "checked": bool(not self.floating and self.dock_area == area_name),
+                })
+        if dock_actions:
+            if actions:
+                actions.append({"separator": True, "label": "---", "action": "sep_dock"})
+            actions.extend(dock_actions)
+        if self.closable:
+            if actions:
+                actions.append({"separator": True, "label": "---", "action": "sep_close"})
+            actions.append({"id": "close", "label": "Close", "action": "close"})
+        return actions
+
+    def _rebuild_title_menu_actions(self):
+        menu = getattr(self, "_title_menu_obj", None)
+        if menu is not None:
+            menu.setActions(self._dock_title_menu_actions())
+
     def _show_title_menu(self, sender=None, app_data=None, user_data=None):
-        if not self._title_menu or not dpg.does_item_exist(self._title_menu):
+        menu = getattr(self, "_title_menu_obj", None)
+        if menu is None:
             return
         self._sync_action_visibility()
         if not self.floatable and not self.closable and not self.movable:
             return
         try:
             mx, my = map(int, dpg.get_mouse_pos(local=False))
-            dpg.configure_item(
-                self._title_menu, pos=(mx, my), show=True)
-            dpg.focus_item(self._title_menu)
+            menu.popup((mx, my), context=self)
         except Exception:
-            try:
-                dpg.configure_item(self._title_menu, show=True)
-            except Exception:
-                pass
+            menu.popup(context=self)
 
     def _hide_title_menu(self):
-        if self._title_menu and dpg.does_item_exist(self._title_menu):
-            try:
-                dpg.configure_item(self._title_menu, show=False)
-            except Exception:
-                pass
+        menu = getattr(self, "_title_menu_obj", None)
+        if menu is not None:
+            menu.hide()
 
-    def _menu_float_clicked(self, sender=None, app_data=None, user_data=None):
-        self._hide_title_menu()
-        self._float_clicked()
-
-    def _menu_dock_area_clicked(
-            self, sender=None, app_data=None, user_data=None):
-        area = self._normalize_dock_area(user_data)
-        self._hide_title_menu()
-        if not self.movable or not self.is_area_allowed(area):
+    def _title_menu_triggered(self, action, _context=None):
+        action = str(action or "")
+        if action == "toggle_float":
+            self._float_clicked()
             return
-        callback = self.on_dock_area_change
-        if callable(callback):
-            callback(area)
-        else:
-            self.set_dock_area(area)
-
-    def _menu_close_clicked(self, sender=None, app_data=None, user_data=None):
-        self._hide_title_menu()
-        self._close_clicked()
+        if action == "close":
+            self._close_clicked()
+            return
+        if action.startswith("dock_"):
+            area = self._normalize_dock_area(action[5:])
+            if not self.movable or not self.is_area_allowed(area):
+                return
+            callback = self.on_dock_area_change
+            if callable(callback):
+                callback(area)
+            else:
+                self.set_dock_area(area)
 
     def _float_clicked(self, sender=None, app_data=None, user_data=None):
         if not self.floatable:
@@ -489,21 +482,27 @@ class DockWidget:
 
     def _update_title_glyphs(self, float_x: int, close_x: int, control_y: int):
         """Position vector glyphs over the right-aligned title buttons."""
-        # Coordinates are relative to title_overlay/title_bar.
+        # Coordinates are relative to title_overlay/title_bar.  Derive every
+        # glyph from the control centre so changing title-button metrics cannot
+        # leave the symbols visually off-centre (a common ImGui-vs-Qt tell).
         fy = control_y
+        half = self.CONTROL_SIZE / 2.0
+        float_cx = float_x + half
+        close_cx = close_x + half
+        cy = fy + half
         try:
             dpg.configure_item(
                 self._float_back,
-                pmin=(float_x + 5, fy + 7), pmax=(float_x + 11, fy + 13))
+                pmin=(float_cx - 5, cy - 2), pmax=(float_cx + 1, cy + 4))
             dpg.configure_item(
                 self._float_front,
-                pmin=(float_x + 8, fy + 4), pmax=(float_x + 14, fy + 10))
+                pmin=(float_cx - 2, cy - 5), pmax=(float_cx + 4, cy + 1))
             dpg.configure_item(
                 self._close_line_a,
-                p1=(close_x + 5, fy + 5), p2=(close_x + 13, fy + 13))
+                p1=(close_cx - 4, cy - 4), p2=(close_cx + 4, cy + 4))
             dpg.configure_item(
                 self._close_line_b,
-                p1=(close_x + 13, fy + 5), p2=(close_x + 5, fy + 13))
+                p1=(close_cx + 4, cy - 4), p2=(close_cx - 4, cy + 4))
         except Exception:
             # Older DPG builds can be stricter about draw-item reconfiguration;
             # losing a glyph is preferable to breaking the dock layout.
@@ -640,11 +639,13 @@ class DockWidget:
                     dpg.delete_item(handlers)
                 except Exception:
                     pass
-        if self._title_menu and dpg.does_item_exist(self._title_menu):
+        menu = getattr(self, "_title_menu_obj", None)
+        if menu is not None:
             try:
-                dpg.delete_item(self._title_menu)
+                menu.delete()
             except Exception:
                 pass
+            self._title_menu_obj = None
         if dpg.does_item_exist(self.root):
             dpg.delete_item(self.root)
 

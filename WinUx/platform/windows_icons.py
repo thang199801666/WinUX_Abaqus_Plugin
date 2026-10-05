@@ -7,6 +7,7 @@ transparent fallback textures and does not call Win32 APIs there.
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import os
 from ctypes import wintypes
 from typing import Optional
@@ -398,6 +399,70 @@ class WindowsIconRegistry:
         finally:
             if hicon:
                 ctypes.windll.user32.DestroyIcon(hicon)
+
+    @classmethod
+    def get_stock_icon(cls, stock_id: int):
+        """Upload a cached Shell stock icon on the Dear PyGui UI thread."""
+        cls._ensure_fallbacks()
+        key = "stock:{}".format(int(stock_id))
+        cached = cls._textures.get(key)
+        if cached is not None and dpg.does_item_exist(cached):
+            return cached
+        if os.name != "nt":
+            return cls._textures["folder:fallback"]
+        hicon = None
+        try:
+            hicon = cls._stock_hicon(int(stock_id))
+            image = cls._hicon_to_image(hicon)
+            if image is not None:
+                texture = cls._add_texture(image, "native_icon_stock_{}".format(int(stock_id)))
+                cls._textures[key] = texture
+                return texture
+        except (OSError, ValueError, TypeError, ctypes.ArgumentError):
+            pass
+        finally:
+            if hicon:
+                ctypes.windll.user32.DestroyIcon(hicon)
+        return cls.get_icon(is_dir=True)
+
+    @classmethod
+    def read_path_info(cls, path):
+        """Read a real Shell icon/name off-thread, without touching DPG."""
+        if os.name != "nt":
+            return None, ""
+        cls._configure_win32_api()
+        info = SHFILEINFOW()
+        try:
+            result = ctypes.windll.shell32.SHGetFileInfoW(
+                str(path), 0, ctypes.byref(info), ctypes.sizeof(info),
+                SHGFI_ICON | SHGFI_SMALLICON | 0x000000200,  # SHGFI_DISPLAYNAME
+            )
+            image = cls._hicon_to_image(info.hIcon) if result and info.hIcon else None
+            return image, str(info.szDisplayName) if result else ""
+        except (OSError, ValueError, TypeError, ctypes.ArgumentError):
+            return None, ""
+        finally:
+            if info.hIcon:
+                ctypes.windll.user32.DestroyIcon(info.hIcon)
+
+    @classmethod
+    def read_path_image(cls, path):
+        return cls.read_path_info(path)[0]
+
+    @classmethod
+    def get_path_icon(cls, path, image=None):
+        """Use a worker-prepared image, or a cached/native folder fallback."""
+        cls._ensure_fallbacks()
+        key = "path:" + os.path.normcase(os.path.abspath(str(path)))
+        cached = cls._textures.get(key)
+        if cached is not None and dpg.does_item_exist(cached):
+            return cached
+        if image is not None:
+            suffix = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+            texture = cls._add_texture(image, "native_icon_path_" + suffix)
+            cls._textures[key] = texture
+            return texture
+        return cls.get_icon(is_dir=True)
 
 
 def reset_windows_icon_registry() -> None:

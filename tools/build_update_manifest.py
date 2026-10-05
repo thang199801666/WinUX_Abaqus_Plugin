@@ -4,8 +4,8 @@ Flat deployment example:
     abaqus python tools/build_update_manifest.py .
 
 Versioned release example:
-    python tools/build_update_manifest.py releases/1.4.0 \
-        --manifest-root . --release-path releases/1.4.0 --revision 12
+    python tools/build_update_manifest.py releases/1.1.0 \
+        --manifest-root . --release-path releases/1.1.0 --revision 12
 """
 from __future__ import print_function
 

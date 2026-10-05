@@ -5,6 +5,7 @@ import re
 import socket
 import threading
 from contextlib import contextmanager
+from collections import deque
 from pathlib import PurePosixPath
 
 from .runtime import BoundedTextBuffer
@@ -138,6 +139,21 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
         self.shell = None
         self._shell_output = BoundedTextBuffer(
             self.MAX_SHELL_TRANSCRIPT_CHARS)
+        # Keep a second, display-only transcript. Internal shell housekeeping
+        # (for example synchronising the interactive cwd with Server Files) is
+        # filtered before it reaches the UI, while the raw PTY transcript stays
+        # untouched. This avoids rewriting a transcript that the console may be
+        # selecting/rendering at the same time.
+        self._shell_visible_output = BoundedTextBuffer(
+            self.MAX_SHELL_TRANSCRIPT_CHARS)
+        # Each hidden echo entry is ``(command, replace_prompt)``.  Keeping
+        # prompt replacement on the individual command is important because
+        # Server Files can queue several cwd changes before the PTY has echoed
+        # the first one.  A single global boolean loses that association and
+        # eventually leaves stale/missing prompts.
+        self._shell_hidden_echoes = deque()
+        self._shell_hidden_partial = ""
+        self._shell_directory = None
         self._shell_condition = threading.Condition()
         self._shell_send_lock = threading.Lock()
         self._shell_stop = threading.Event()
@@ -645,6 +661,10 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
         self.shell = channel
         with self._shell_condition:
             self._shell_output.clear()
+            self._shell_visible_output.clear()
+            self._shell_hidden_echoes.clear()
+            self._shell_hidden_partial = ""
+            self._shell_directory = None
         self._shell_stop = stop_event
 
         def reader():
@@ -654,6 +674,7 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
                         chunk = channel.recv(4096).decode("utf-8", "replace")
                         with self._shell_condition:
                             self._shell_output.append(chunk)
+                            self._append_visible_shell_chunk_locked(chunk)
                             self._shell_condition.notify_all()
                     elif channel.closed:
                         break
@@ -665,16 +686,204 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
         threading.Thread(target=reader, name="winux-ssh-shell-reader",
                          daemon=True).start()
 
+    _SHELL_ANSI_RE = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+
+    @classmethod
+    def _shell_echo_compact(cls, value):
+        """Return PTY text suitable for matching an echoed input command.
+
+        Interactive shells may visually wrap a long command at the terminal
+        width. Paramiko can then deliver the echo as several physical lines
+        (CR/LF plus ANSI cursor sequences), even though the user entered one
+        logical command. Matching one line at a time therefore leaks command
+        tails such as ``14 studs/Batch-3'`` into the console.
+        """
+        text = cls._SHELL_ANSI_RE.sub("", str(value))
+        return text.replace("\r", "").replace("\n", "")
+
+    @classmethod
+    def _shell_echo_matches(cls, value, command):
+        logical = cls._shell_echo_compact(value)
+        wanted = cls._shell_echo_compact(command)
+        return bool(wanted) and wanted in logical
+
+    @classmethod
+    def _shell_echo_span(cls, value, command):
+        """Return ``(raw_start, raw_end)`` for an echoed logical command.
+
+        CR/LF introduced by terminal wrapping and ANSI control sequences are
+        ignored for matching, while raw source offsets are retained.
+        """
+        text = str(value)
+        wanted = cls._shell_echo_compact(command)
+        if not wanted:
+            return None
+
+        logical = []
+        starts = []
+        ends = []
+        i = 0
+        n = len(text)
+        while i < n:
+            match = cls._SHELL_ANSI_RE.match(text, i)
+            if match is not None:
+                i = match.end()
+                continue
+            raw_start = i
+            ch = text[i]
+            i += 1
+            if ch in "\r\n":
+                continue
+            logical.append(ch)
+            starts.append(raw_start)
+            ends.append(i)
+
+        compact = "".join(logical)
+        pos = compact.find(wanted)
+        if pos < 0:
+            return None
+        last = pos + len(wanted) - 1
+        if last >= len(ends):
+            return None
+        return starts[pos], ends[last]
+
+    @classmethod
+    def _shell_echo_end_index(cls, value, command):
+        span = cls._shell_echo_span(value, command)
+        return None if span is None else span[1]
+
+    @classmethod
+    def _shell_echo_partial_start_index(cls, value, commands):
+        """Return raw index of a trailing possible hidden-echo fragment.
+
+        Older revisions buffered *all* PTY output while a hidden ``cd`` echo
+        was pending.  If another command/job was running, that could hold the
+        terminal indefinitely and make folder sync appear to stop after a few
+        navigations.  We now retain only the shortest tail that can still grow
+        into one of the pending hidden commands; unrelated output is released
+        immediately.
+        """
+        text = str(value)
+        logical = []
+        starts = []
+        i = 0
+        n = len(text)
+        while i < n:
+            match = cls._SHELL_ANSI_RE.match(text, i)
+            if match is not None:
+                i = match.end()
+                continue
+            raw_start = i
+            ch = text[i]
+            i += 1
+            if ch in "\r\n":
+                continue
+            logical.append(ch)
+            starts.append(raw_start)
+
+        compact = "".join(logical)
+        if not compact:
+            return 0 if text else None
+
+        best = 0
+        for command in commands:
+            wanted = cls._shell_echo_compact(command)
+            if not wanted:
+                continue
+            max_len = min(len(compact), max(0, len(wanted) - 1))
+            for length in range(max_len, 0, -1):
+                if compact.endswith(wanted[:length]):
+                    best = max(best, length)
+                    break
+        if best <= 0:
+            return None
+        return starts[len(compact) - best]
+
+    @staticmethod
+    def _hidden_echo_parts(entry):
+        if isinstance(entry, tuple):
+            command = entry[0]
+            replace_prompt = bool(entry[1]) if len(entry) > 1 else False
+            return command, replace_prompt
+        return entry, False
+
+    def _append_visible_shell_chunk_locked(self, chunk):
+        if not self._shell_hidden_echoes:
+            if self._shell_hidden_partial:
+                self._shell_visible_output.append(self._shell_hidden_partial)
+                self._shell_hidden_partial = ""
+            self._shell_visible_output.append(chunk)
+            return
+
+        data = self._shell_hidden_partial + chunk
+        self._shell_hidden_partial = ""
+
+        while self._shell_hidden_echoes and data:
+            # Search every queued hidden command, not only queue[0].  This lets
+            # the stream recover if one PTY echo was lost while a later cwd
+            # sync did echo normally.  Commands are still sent in order; any
+            # skipped earlier entries are stale by definition once a later one
+            # is observed.
+            found = None
+            for idx, entry in enumerate(self._shell_hidden_echoes):
+                command, replace_prompt = self._hidden_echo_parts(entry)
+                span = self._shell_echo_span(data, command)
+                if span is None:
+                    continue
+                candidate = (span[0], idx, span[1], replace_prompt)
+                if found is None or candidate[:2] < found[:2]:
+                    found = candidate
+
+            if found is not None:
+                raw_start, idx, raw_end, replace_prompt = found
+                prefix = data[:raw_start]
+                if prefix:
+                    self._shell_visible_output.append(prefix)
+
+                # Discard the matched entry and any older stale entries.
+                for _ in range(idx + 1):
+                    self._shell_hidden_echoes.popleft()
+
+                if replace_prompt:
+                    self._drop_trailing_visible_prompt_locked()
+
+                data = data[raw_end:]
+                while data.startswith(("\r", "\n")):
+                    data = data[1:]
+                continue
+
+            # No complete hidden echo is present.  Release unrelated output
+            # immediately and retain only a trailing fragment that could be
+            # the beginning of any pending command.  This is what prevents a
+            # long-running job or user command from starving cwd updates.
+            commands = [self._hidden_echo_parts(e)[0]
+                        for e in self._shell_hidden_echoes]
+            partial_start = self._shell_echo_partial_start_index(data, commands)
+            if partial_start is None:
+                self._shell_visible_output.append(data)
+                data = ""
+            else:
+                if partial_start > 0:
+                    self._shell_visible_output.append(data[:partial_start])
+                self._shell_hidden_partial = data[partial_start:]
+                data = ""
+
+        if data:
+            self._shell_visible_output.append(data)
+
     def shell_output(self):
         with self._shell_condition:
-            return self._shell_output.snapshot()
+            return self._shell_visible_output.snapshot()
 
-    def send_shell_command(self, command):
+    def send_shell_command(self, command, *, show_echo=True, replace_prompt=False):
         if not self.shell or self.shell.closed:
             raise RuntimeError("Not connected to an SSH server")
         command = str(command).rstrip("\r\n")
         if not command:
             return
+        if not show_echo:
+            with self._shell_condition:
+                self._shell_hidden_echoes.append((command, bool(replace_prompt)))
         with self._shell_send_lock:
             self.shell.send(command + "\n")
 
@@ -685,9 +894,50 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
         with self._shell_send_lock:
             self.shell.send("\x03")
 
+    def invalidate_shell_directory(self):
+        """Forget the cached cwd after a user-entered shell command."""
+        self._shell_directory = None
+
+    _SHELL_PROMPT_LINE_RE = re.compile(
+        r"^\[[^]\r\n]+@[^]\r\n]+(?:\s+[^]\r\n]*)?\][#$]\s*$"
+    )
+
+    def _drop_trailing_visible_prompt_locked(self):
+        """Remove only the currently displayed shell prompt.
+
+        Automatic Server Files cwd synchronisation sends an internal ``cd``.
+        The old prompt has already been appended to the display transcript,
+        while the new prompt arrives after the hidden command echo. Keeping
+        both makes the terminal render two bracketed prompts side-by-side.
+        This display-only rewrite is done under ``_shell_condition`` and never
+        touches the raw PTY transcript used by shell/job logic.
+        """
+        text = self._shell_visible_output.snapshot()
+        if not text:
+            return False
+        start = max(text.rfind("\n"), text.rfind("\r")) + 1
+        tail = text[start:]
+        plain = self._SHELL_ANSI_RE.sub("", tail)
+        if not self._SHELL_PROMPT_LINE_RE.match(plain):
+            return False
+        prefix = text[:start]
+        self._shell_visible_output.clear()
+        if prefix:
+            self._shell_visible_output.append(prefix)
+        return True
+
     def set_shell_directory(self, folder):
-        """Keep the shared shell aligned with the visible SFTP directory."""
-        self.send_shell_command("cd {}".format(self._shell_quote(self.normalize(folder))))
+        """Keep the shared shell aligned with Server Files without console noise."""
+        target = self.normalize(folder)
+        if self._shell_directory == target:
+            return False
+        command = "cd {}".format(self._shell_quote(target))
+        # Prompt replacement belongs to this exact hidden command rather than
+        # a global flag. Multiple rapid navigations can be in flight at once.
+        self.send_shell_command(
+            command, show_echo=False, replace_prompt=True)
+        self._shell_directory = target
+        return True
 
 
 

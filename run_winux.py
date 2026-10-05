@@ -86,6 +86,11 @@ def _terminate_existing_winux(pid):
     if os.name == "nt":
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
         command = ["taskkill", "/PID", str(int(pid)), "/T", "/F"]
+        # A Settings-initiated bootstrap is a descendant of the old app.
+        # Killing the whole tree would kill this updater before activation.
+        # Floating dialog workers close when their parent IPC disconnects.
+        if os.environ.get("WINUX_UPDATE_FROM_APP") == "1":
+            command.remove("/T")
         null_handle = open(os.devnull, "wb")
         try:
             result = subprocess.call(
@@ -110,17 +115,25 @@ def _terminate_existing_winux(pid):
 
 def _vendor_candidates(project_dir):
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = (
-        os.path.join(plugin_dir, "vendor"),
-        os.path.join(plugin_dir, "winux_vendor"),
-        os.path.join(plugin_dir, "site-packages"),
-        os.path.join(plugin_dir, "winux_vendor.zip"),
+    project_dir = os.path.abspath(project_dir)
+    # During the first transition from a flat deployment to an immutable
+    # version, this already-loaded bootstrap script still lives in the old
+    # folder. Prefer dependencies that belong to the newly activated project so
+    # WinUx never mixes old Python packages/DLLs with a new application tree.
+    project_candidates = (
         os.path.join(project_dir, "vendor"),
         os.path.join(project_dir, "winux_vendor"),
         os.path.join(project_dir, "site-packages"),
         os.path.join(project_dir, "winux_vendor.zip"),
         os.path.join(project_dir, "WinUx", "vendor"),
     )
+    plugin_candidates = (
+        os.path.join(plugin_dir, "vendor"),
+        os.path.join(plugin_dir, "winux_vendor"),
+        os.path.join(plugin_dir, "site-packages"),
+        os.path.join(plugin_dir, "winux_vendor.zip"),
+    )
+    candidates = project_candidates + plugin_candidates
     result = []
     seen = set()
     for path in candidates:
@@ -218,9 +231,13 @@ def _check_for_update(project_dir, update_callable=None, before_sync=None):
             # Falling back to the deployment parent is still enough to avoid
             # holding the directory being replaced as the process CWD.
             os.chdir(os.path.dirname(project_dir))
-        if before_sync is None:
-            return update_callable(project_dir)
-        return update_callable(project_dir, before_sync=before_sync)
+        kwargs = {}
+        if before_sync is not None:
+            kwargs["before_sync"] = before_sync
+        if "--install-update" in sys.argv:
+            # The user already pressed Update Now in Settings.
+            kwargs["dialog_available"] = lambda *_args: True
+        return update_callable(project_dir, **kwargs)
     finally:
         # Always return to the (possibly newly installed) local deployment
         # before WinUx imports its resources/vendor packages.  If the update
@@ -257,6 +274,61 @@ def _note_launch_timings(marks):
         pass
 
 
+def _switch_to_active_project(project_dir, update_status):
+    """Switch imports/resources to a newly activated immutable version."""
+    if not isinstance(update_status, dict):
+        return project_dir
+    active_dir = update_status.get("active_dir")
+    if not active_dir:
+        return project_dir
+    active_dir = os.path.abspath(active_dir)
+    if not os.path.isfile(os.path.join(active_dir, "WinUx", "__main__.py")):
+        return project_dir
+    old_dir = os.path.abspath(project_dir)
+    if active_dir == old_dir:
+        return project_dir
+    while old_dir in sys.path:
+        try:
+            sys.path.remove(old_dir)
+        except ValueError:
+            break
+    if active_dir not in sys.path:
+        sys.path.insert(0, active_dir)
+    os.environ["WINUX_APP_DIR"] = active_dir
+    return active_dir
+
+
+def _run_update_health_check(project_dir):
+    """Validate that a staged WinUx build can import its runtime surface.
+
+    No viewport, SSH connection or update UI is created.  Running this in a
+    fresh process catches native-DLL/import-graph problems that a same-process
+    file/hash check cannot detect.
+    """
+    os.environ["WINUX_SKIP_UPDATE"] = "1"
+    os.environ["WINUX_HEALTH_CHECK"] = "1"
+    if project_dir not in sys.path:
+        sys.path.insert(0, project_dir)
+    _configure_bundled_dependencies(project_dir)
+    os.chdir(project_dir)
+
+    from winux_update_manifest import read_version, required_files_present
+    version = read_version(project_dir)
+    if not version or not required_files_present(project_dir):
+        raise RuntimeError("Candidate deployment is incomplete.")
+
+    # Import the critical application graph without constructing a viewport.
+    import WinUx  # noqa: F401
+    import WinUx.application  # noqa: F401
+    import WinUx.controller  # noqa: F401
+    import WinUx.server_model  # noqa: F401
+    import WinUx.view  # noqa: F401
+    import winux_updater  # noqa: F401
+    import winux_launcher  # noqa: F401
+    print("WINUX_HEALTH_CHECK_OK {}".format(version))
+    return True
+
+
 def main(run_callable=None):
     import time as _time
     # This script is the entry point of a dedicated WinUX child process.
@@ -265,6 +337,9 @@ def main(run_callable=None):
     project_dir = _project_dir()
     if project_dir not in sys.path:
         sys.path.insert(0, project_dir)
+
+    if "--update-health-check" in sys.argv or os.environ.get("WINUX_HEALTH_CHECK", "").strip() == "1":
+        return _run_update_health_check(project_dir)
 
     # The update check/dialog/progress window live entirely in this child
     # process. Abaqus/CAE is never made an owner and never runs a nested native
@@ -286,6 +361,7 @@ def main(run_callable=None):
         project_dir,
         before_sync=_before_sync if existing_pid is not None else None,
     )
+    project_dir = _switch_to_active_project(project_dir, update_status)
     marks.append(("update check complete", _time.time()))
 
     # If WinUx was already running and the user kept the current version (same
@@ -314,5 +390,8 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        _show_error("WinUx could not start.\n\n{}".format(error))
+        if "--update-health-check" not in sys.argv and os.environ.get("WINUX_HEALTH_CHECK", "").strip() != "1":
+            _show_error("WinUx could not start.\n\n{}".format(error))
+        else:
+            print("WINUX_HEALTH_CHECK_FAILED {}".format(error), file=sys.stderr)
         raise

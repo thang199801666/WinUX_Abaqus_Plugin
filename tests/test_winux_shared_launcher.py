@@ -7,7 +7,7 @@ import winux_launcher
 
 
 EXPECTED_SHARED_DIR = (
-    r"S:\Division1\CAE\1. FEA\6. Tools\17.WinUx\WinUX_Abaqus_Plugin"
+    r"S:\WinUx"
 )
 
 

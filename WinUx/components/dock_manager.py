@@ -33,11 +33,11 @@ class DockManager:
     tools beyond Job Plots.
     """
 
-    TAB_HEIGHT = 25
+    TAB_HEIGHT = 24
     TAB_MIN_WIDTH = 88
     TAB_MAX_WIDTH = 220
-    TAB_GAP = 1
-    TAB_PADDING_X = 10
+    TAB_GAP = 0
+    TAB_PADDING_X = 9
     TAB_DRAG_START_DISTANCE = 4
     TAB_TEAROFF_DISTANCE = 18
     TAB_INSERT_MARKER_WIDTH = 2
@@ -134,7 +134,7 @@ class DockManager:
                 dpg.add_theme_color(dpg.mvThemeCol_Border, self.BORDER)
                 dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
                 dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
-                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, self.TAB_PADDING_X, 3)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, self.TAB_PADDING_X, 2)
 
         with dpg.theme() as self._inactive_tab_theme:
             with dpg.theme_component(dpg.mvButton):
@@ -142,10 +142,10 @@ class DockManager:
                 dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, self.INACTIVE_HOVER)
                 dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, self.ACTIVE_HOVER)
                 dpg.add_theme_color(dpg.mvThemeCol_Text, self.TEXT)
-                dpg.add_theme_color(dpg.mvThemeCol_Border, self.BORDER)
+                dpg.add_theme_color(dpg.mvThemeCol_Border, QtFusionPalette.BORDER_LIGHT)
                 dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
                 dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
-                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, self.TAB_PADDING_X, 3)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, self.TAB_PADDING_X, 2)
 
     @property
     def active_key(self):

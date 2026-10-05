@@ -96,7 +96,7 @@ def stage_release(source_dir, local_dir, manifest=None, progress_callback=None):
                 "Copying {0}/{1}: {2}".format(index, len(files), entry["path"]),
             )
         # The shared manifest may point at an immutable release directory such
-        # as ``releases/1.4.0``.  The installed local deployment is flattened,
+        # as ``releases/<version>``.  The installed local deployment is flattened,
         # so persist an equivalent local manifest whose release_path is ``.``.
         local_manifest = dict(manifest)
         local_manifest["release_path"] = "."
@@ -250,9 +250,151 @@ def synchronize_project(source_dir, local_dir, progress_callback=None, health_ch
         raise
 
 
+def install_versioned_release(source_dir, current_dir, progress_callback=None, health_check=None,
+                              environ=None, keep_previous=2, source_label=None,
+                              before_activate=None):
+    """Install a complete release beside the current build and atomically activate it.
+
+    Unlike ``install_staged`` this never renames or mutates the currently
+    running deployment.  The verified target lives under the per-user WinUx
+    runtime store and only a tiny state pointer is changed after the health
+    check succeeds.  The historical flat deployment therefore remains an
+    emergency fallback and existing S:/folder sources are fully supported.
+    """
+    from winux_installation_state import (
+        activate_version,
+        begin_transaction,
+        cleanup_versions,
+        clear_transaction,
+        update_transaction,
+        valid_deployment,
+        version_dir,
+    )
+
+    source_dir = os.path.abspath(source_dir)
+    current_dir = os.path.abspath(current_dir)
+    descriptor = _descriptor_for_install(source_dir, progress_callback=progress_callback)
+    manifest = descriptor["manifest"]
+    target_version = manifest["version"]
+    target_dir = os.path.abspath(version_dir(target_version, environ))
+    previous_version = read_version(current_dir)
+
+    begin_transaction(
+        previous_version, target_version, target_dir,
+        source_label=source_label or source_dir, environ=environ,
+    )
+    stage_dir = None
+    try:
+        # A previous interrupted attempt may have left a complete immutable
+        # version directory behind. Re-verify and reuse it instead of copying
+        # a multi-megabyte package a second time.
+        if valid_deployment(target_dir, expected_version=target_version):
+            try:
+                verify_deployment(target_dir, manifest)
+            except Exception:
+                _remove_path(target_dir)
+            else:
+                _notify(progress_callback, 82, "Verified version already staged; reusing it...")
+
+        if not valid_deployment(target_dir, expected_version=target_version):
+            parent = os.path.dirname(target_dir)
+            if not os.path.isdir(parent):
+                os.makedirs(parent)
+            _notify(progress_callback, 3, "Preparing immutable WinUx version {}...".format(target_version))
+            stage_dir = stage_release(
+                source_dir, target_dir, manifest=manifest, progress_callback=progress_callback
+            )
+            update_transaction("staged", environ=environ, stage_dir=stage_dir)
+            validate_stage(stage_dir, manifest, progress_callback=progress_callback)
+            update_transaction("verified", environ=environ)
+            if os.path.exists(target_dir):
+                _remove_path(target_dir)
+            os.rename(stage_dir, target_dir)
+            stage_dir = None
+
+        _notify(progress_callback, 92, "Running health check for version {}...".format(target_version))
+        verify_deployment(target_dir, manifest)
+        if health_check is not None:
+            result = health_check(target_dir, manifest)
+            if result is False:
+                raise RuntimeError("WinUx post-install health check failed.")
+
+        if before_activate is not None:
+            _notify(progress_callback, 95, "Closing the current WinUx instance...")
+            before_activate()
+        update_transaction("activating", environ=environ)
+        activate_version(
+            target_version, environ=environ, keep_previous=keep_previous, reason="update"
+        )
+        update_transaction("activated", environ=environ)
+        _notify(progress_callback, 97, "Activated WinUx {}...".format(target_version))
+
+        # Bootstrap modules are versioned independently from the application.
+        # Failure here is non-destructive: the stable Abaqus plug-in shim keeps
+        # using its previous/bundled bootstrap while the verified application
+        # version remains active.
+        bootstrap_result = None
+        bootstrap_error = None
+        try:
+            from winux_bootstrap_state import install_from_deployment
+            _notify(progress_callback, 98, "Updating WinUx bootstrap...")
+            bootstrap_result = install_from_deployment(
+                target_dir, target_version, environ=environ, keep_previous=keep_previous
+            )
+        except Exception as bootstrap_exc:
+            bootstrap_error = _text(bootstrap_exc)
+
+        cleanup_versions(environ=environ, keep_previous=keep_previous)
+        clear_transaction(environ=environ)
+        _notify(progress_callback, 100, "Update complete. Starting WinUx...")
+        return {
+            "version": target_version,
+            "active_dir": target_dir,
+            "previous_version": previous_version,
+            "mode": "versioned",
+            "bootstrap": bootstrap_result,
+            "bootstrap_error": bootstrap_error,
+        }
+    except Exception as exc:
+        try:
+            update_transaction("failed", environ=environ, error=_text(exc))
+        except Exception:
+            pass
+        # The state pointer is deliberately changed only after verification and
+        # the optional health check, so failure requires no destructive rollback.
+        # Remove only incomplete targets; a complete verified target can remain
+        # as a harmless retry cache.
+        if target_dir and os.path.exists(target_dir):
+            try:
+                if not valid_deployment(target_dir, expected_version=target_version):
+                    _remove_path(target_dir)
+            except Exception:
+                pass
+        raise
+    finally:
+        if stage_dir and os.path.exists(stage_dir):
+            try:
+                _remove_path(stage_dir)
+            except Exception:
+                pass
+
+
+def synchronize_versioned_project(source_dir, current_dir, progress_callback=None, health_check=None,
+                                  environ=None, keep_previous=2, source_label=None,
+                                  before_activate=None):
+    """Public versioned installer used by the bootstrap on production Windows."""
+    return install_versioned_release(
+        source_dir, current_dir, progress_callback=progress_callback,
+        health_check=health_check, environ=environ, keep_previous=keep_previous,
+        source_label=source_label, before_activate=before_activate,
+    )
+
+
 __all__ = [
     "install_staged",
+    "install_versioned_release",
     "stage_release",
     "synchronize_project",
+    "synchronize_versioned_project",
     "validate_stage",
 ]

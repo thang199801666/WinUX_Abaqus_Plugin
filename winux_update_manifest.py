@@ -22,7 +22,8 @@ IGNORED_DIRECTORIES = {
     ".pytest_cache",
     ".mypy_cache",
 }
-IGNORED_SUFFIXES = (".pyc", ".pyo")
+IGNORED_SUFFIXES = (".pyc", ".pyo", ".log", ".pem", ".key", ".p12", ".pfx")
+PRIVATE_FILES = {".env", "settings.json", "known_hosts", "OPTIMIZATION_GOAL.md", "REFACTOR_NOTES.md"}
 REQUIRED_FILES = (
     VERSION_FILENAME,
     "WinUx_plugin.py",
@@ -66,7 +67,12 @@ def _safe_relative_path(value):
 
 
 def _is_ignored_name(name):
-    return name in IGNORED_DIRECTORIES or name.lower().endswith(IGNORED_SUFFIXES)
+    return (
+        name in IGNORED_DIRECTORIES
+        or name in PRIVATE_FILES
+        or name.startswith((".env.", "id_rsa", "id_ed25519"))
+        or name.lower().endswith(IGNORED_SUFFIXES)
+    )
 
 
 def read_version(project_dir):
@@ -169,6 +175,8 @@ def iter_deployment_files(project_dir):
             if _is_ignored_name(name) or name == MANIFEST_FILENAME:
                 continue
             relative_path = name if relative_root == "." else os.path.join(relative_root, name)
+            if relative_root == "tools" and name.lower().endswith(".json"):
+                continue
             paths.append(relative_path)
     return sorted(paths, key=lambda item: item.lower())
 

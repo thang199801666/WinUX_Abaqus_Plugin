@@ -13,16 +13,17 @@ class BlockingDialog(QtDialog):
         self.on_result = on_result
         self.result = {"done": False, "value": None}
         self.intent = intent
-        super().__init__(view, title, width=500, height=240)
+        super().__init__(view, title, width=500, height=220)
         lines = sum(max(1, (len(line) + 64)//65) for line in str(message).splitlines() or [""])
-        self.preferred_size = (480, max(165, min(300, 125 + 17*lines + (34 if kind == "input" else 0))))
+        self.preferred_size = (480, max(160, min(282, 118 + 17*lines + (36 if kind == "input" else 0))))
         headings = {"Confirm Close App": "Exit WinUx?",
                     "Warning: Permanent Delete": "Delete permanently?",
                     "Overwrite?": "Replace existing item?"}
-        self.header(headings.get(title, title))
-        dpg.add_text(str(message), wrap=425, parent=self.content)
+        role = str(intent or ("question" if kind == "confirm" else "info"))
+        self.message_box_body(headings.get(title, title), str(message), intent=role)
         self.entry = None
         if kind == "input":
+            dpg.add_spacer(parent=self.content, height=2)
             self.entry = self.line_edit(str(initial or ""), parent=self.content)
             dpg.focus_item(self.entry)
         actions = [(primary_text or "OK", self.accept,

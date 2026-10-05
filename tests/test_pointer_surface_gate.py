@@ -60,14 +60,14 @@ class PointerSurfaceGateRegressionTests(unittest.TestCase):
         toolbar = TOOLBAR.read_text(encoding="utf-8")
         combo = COMBO.read_text(encoding="utf-8")
         rename = RENAME.read_text(encoding="utf-8")
-        self.assertIn("register_pointer_protected_item(popup)", toolbar)
-        # The editable combo is now a pure Dear ImGui composite rather than
-        # dpg.add_combo(). Its custom popup must explicitly participate in the
-        # global pointer-surface gate to prevent click-through.
-        self.assertNotIn("dpg.add_combo(", combo)
-        self.assertIn("dpg.add_window(", combo)
-        self.assertIn("register_pointer_protected_item(self._popup)", combo)
-        self.assertIn("unregister_pointer_protected_item(self._popup)", combo)
+        self.assertIn("register_pointer_protected_item(popup.tag)", toolbar)
+        # The editable combo now delegates its drop-down to Dear ImGui's native
+        # BeginCombo popup.  It therefore must not register a second custom
+        # pointer-protected child overlay.
+        self.assertIn("self.button = dpg.add_combo(", combo)
+        self.assertIn("no_preview=True", combo)
+        self.assertNotIn("self._popup = dpg.add_child_window(", combo)
+        self.assertNotIn("register_pointer_protected_item(self._popup)", combo)
         self.assertIn("register_pointer_protected_item(self.window_tag)", rename)
 
     def test_job_header_has_priority_over_outer_horizontal_splitter(self):

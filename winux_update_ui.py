@@ -295,7 +295,7 @@ def _centered_position(api, width, height):
     return max(0, (screen_w - width) // 2), max(0, (screen_h - height) // 2)
 
 
-def _register_class(api, class_name, wndproc):
+def _register_class(api, class_name, wndproc, background=None):
     ctypes = api["ctypes"]
     user32 = api["user32"]
     kernel32 = api["kernel32"]
@@ -307,7 +307,7 @@ def _register_class(api, class_name, wndproc):
     wc.hInstance = kernel32.GetModuleHandleW(None)
     wc.hIcon = None
     wc.hCursor = user32.LoadCursorW(None, ctypes.c_void_p(_IDC_ARROW))
-    wc.hbrBackground = ctypes.c_void_p(_COLOR_BTNFACE + 1)
+    wc.hbrBackground = background or ctypes.c_void_p(_COLOR_BTNFACE + 1)
     wc.lpszMenuName = None
     wc.lpszClassName = _text(class_name)
     atom = user32.RegisterClassW(ctypes.byref(wc))
@@ -332,6 +332,17 @@ def _pump_messages(api):
     user32 = api["user32"]
     msg = wintypes.MSG()
     while user32.PeekMessageW(ctypes.byref(msg), None, 0, 0, _PM_REMOVE):
+        dialog = api.get("update_dialog")
+        if dialog and msg.message == 0x0100:  # WM_KEYDOWN
+            user32.GetFocus.restype = ctypes.c_void_p
+            update, cancel = api["update_actions"]
+            if msg.wParam in (13, 27):
+                command = 1002 if msg.wParam == 27 or user32.GetFocus() == cancel else 1001
+                user32.SendMessageW(dialog, _WM_COMMAND, command, 0)
+                continue
+            if msg.wParam == 9:
+                user32.SetFocus(cancel if user32.GetFocus() == update else update)
+                continue
         user32.TranslateMessage(ctypes.byref(msg))
         user32.DispatchMessageW(ctypes.byref(msg))
 
@@ -361,6 +372,122 @@ def _create_control(api, parent, class_name, text, style, x, y, width, height, c
     )
 
 
+class _UpdateStyle(object):
+    """DPI-aware Segoe UI typography and a small native update palette."""
+
+    WHITE = 0xFFFFFF
+    INK = 0x30251B
+    MUTED = 0x77695D
+    PANEL = 0xFAF7F4
+    BLUE = 0xD96D16
+
+    def __init__(self, api):
+        self.api = api
+        c, w = api["ctypes"], api["wintypes"]
+        u, g = api["user32"], api["gdi32"]
+        handle = c.c_void_p
+        g.CreateSolidBrush.argtypes = [c.c_uint32]
+        g.CreateSolidBrush.restype = handle
+        g.CreateFontW.argtypes = [c.c_int] * 5 + [c.c_uint32] * 8 + [c.c_wchar_p]
+        g.CreateFontW.restype = handle
+        g.DeleteObject.argtypes = [handle]
+        g.DeleteObject.restype = c.c_int
+        g.SetTextColor.argtypes = [handle, c.c_uint32]
+        g.SetBkColor.argtypes = [handle, c.c_uint32]
+        g.SetBkMode.argtypes = [handle, c.c_int]
+        g.SelectObject.argtypes = [handle, handle]
+        g.SelectObject.restype = handle
+        g.RoundRect.argtypes = [handle] + [c.c_int] * 6
+        u.DrawTextW.argtypes = [handle, c.c_wchar_p, c.c_int, c.POINTER(w.RECT), c.c_uint]
+        u.DrawFocusRect.argtypes = [handle, c.POINTER(w.RECT)]
+        u.AdjustWindowRectEx.argtypes = [c.POINTER(w.RECT), c.c_uint, c.c_int, c.c_uint]
+        u.SetWindowPos.argtypes = [handle, handle] + [c.c_int] * 4 + [c.c_uint]
+        self.scale = 1.0
+        try:
+            self.scale = max(1.0, float(u.GetDpiForSystem()) / 96.0)
+        except AttributeError:
+            pass
+        self.brushes = dict((color, g.CreateSolidBrush(color)) for color in (
+            self.WHITE, self.PANEL, self.BLUE, 0xB9550F,
+        ))
+        self.fonts = {}
+        for name, size, weight in (("body", 14, 400), ("small", 12, 400),
+                                   ("heading", 24, 600), ("version", 23, 600),
+                                   ("button", 14, 600)):
+            self.fonts[name] = g.CreateFontW(
+                -self.px(size), 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, "Segoe UI"
+            )
+        self.labels = {}
+        self.buttons = {}
+
+        class DrawItem(c.Structure):
+            _fields_ = [("type", c.c_uint), ("id", c.c_uint), ("item", c.c_uint),
+                        ("action", c.c_uint), ("state", c.c_uint), ("hwnd", handle),
+                        ("dc", handle), ("rect", w.RECT), ("data", c.c_size_t)]
+        self.DrawItem = DrawItem
+
+    def px(self, value):
+        return int(round(value * self.scale))
+
+    def window_size(self, width, height):
+        rect = self.api["wintypes"].RECT(0, 0, self.px(width), self.px(height))
+        self.api["user32"].AdjustWindowRectEx(
+            self.api["ctypes"].byref(rect), _WS_CAPTION | _WS_SYSMENU, 0, _WS_EX_DLGMODALFRAME
+        )
+        return rect.right - rect.left, rect.bottom - rect.top
+
+    def label(self, parent, text, x, y, width, height, font="body", color=None, panel=False):
+        hwnd = _create_control(self.api, parent, "STATIC", text, _WS_CHILD | _WS_VISIBLE | 0x04000000,
+                               *[self.px(v) for v in (x, y, width, height)])
+        self.labels[hwnd] = (self.INK if color is None else color, self.PANEL if panel else self.WHITE)
+        self.api["user32"].SendMessageW(hwnd, _WM_SETFONT, self.fonts[font], 1)
+        self.api["user32"].SetWindowPos(hwnd, 1 if not text else 0, 0, 0, 0, 0, 0x0013)
+        return hwnd
+
+    def button(self, parent, text, x, y, width, height, control_id, primary=False):
+        hwnd = _create_control(self.api, parent, "BUTTON", text,
+                               _WS_CHILD | _WS_VISIBLE | _WS_TABSTOP | 0x04000000 | 0x000B,
+                               *[self.px(v) for v in (x, y, width, height)], control_id=control_id)
+        self.buttons[control_id] = (text, primary)
+        self.api["user32"].SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0013)
+        return hwnd
+
+    def message(self, message, wparam, lparam):
+        g, u, c = self.api["gdi32"], self.api["user32"], self.api["ctypes"]
+        if message == 0x0138:  # WM_CTLCOLORSTATIC
+            color, background = self.labels.get(lparam, (self.INK, self.WHITE))
+            g.SetTextColor(wparam, color)
+            g.SetBkColor(wparam, background)
+            return self.brushes[background]
+        if message == 0x002B:  # WM_DRAWITEM: rounded primary/secondary buttons
+            item = c.cast(lparam, c.POINTER(self.DrawItem)).contents
+            if item.id not in self.buttons:
+                return None
+            text, primary = self.buttons[item.id]
+            background = (0xB9550F if item.state & 1 else self.BLUE) if primary else self.PANEL
+            old_brush = g.SelectObject(item.dc, self.brushes[background])
+            old_pen = g.SelectObject(item.dc, g.GetStockObject(8))  # NULL_PEN
+            r = item.rect
+            g.RoundRect(item.dc, r.left, r.top, r.right, r.bottom, self.px(8), self.px(8))
+            old_font = g.SelectObject(item.dc, self.fonts["button"])
+            g.SetBkMode(item.dc, 1)
+            g.SetTextColor(item.dc, self.WHITE if primary else self.INK)
+            u.DrawTextW(item.dc, text, -1, c.byref(r), 0x0001 | 0x0004 | 0x0020)
+            if item.state & 0x0010:  # ODS_FOCUS
+                focus = self.api["wintypes"].RECT(r.left + 4, r.top + 4, r.right - 4, r.bottom - 4)
+                u.DrawFocusRect(item.dc, c.byref(focus))
+            g.SelectObject(item.dc, old_font)
+            g.SelectObject(item.dc, old_pen)
+            g.SelectObject(item.dc, old_brush)
+            return 1
+        return None
+
+    def close(self):
+        for handle in list(self.fonts.values()) + list(self.brushes.values()):
+            if handle:
+                self.api["gdi32"].DeleteObject(handle)
+
+
 def confirm_update(local_version, server_version, server_dir):
     """Return True only when the user clicks **Update Now**."""
     api = _win32()
@@ -372,8 +499,12 @@ def confirm_update(local_version, server_version, server_dir):
     state = {"done": False, "result": False}
     class_name = _next_dialog_class_name("WinUxUpdateAvailableDialog")
     controls = {}
+    theme = _UpdateStyle(api)
 
     def window_proc(hwnd, message, wparam, lparam):
+        themed = theme.message(message, wparam, lparam)
+        if themed is not None:
+            return themed
         if message == _WM_COMMAND:
             command_id = _loword(wparam)
             if command_id == 1001:
@@ -397,53 +528,59 @@ def confirm_update(local_version, server_version, server_dir):
         return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
     wndproc = api["WNDPROC"](window_proc)
-    wc = _register_class(api, class_name, wndproc)
-    width, height = 560, 300
+    wc = _register_class(api, class_name, wndproc, theme.brushes[theme.WHITE])
+    width, height = theme.window_size(560, 350)
     x, y = _centered_position(api, width, height)
     hwnd = user32.CreateWindowExW(
         _WS_EX_DLGMODALFRAME,
         _text(class_name),
         _text("WinUx Update"),
-        _WS_OVERLAPPED | _WS_CAPTION | _WS_SYSMENU | _WS_VISIBLE,
+        _WS_OVERLAPPED | _WS_CAPTION | _WS_SYSMENU | _WS_VISIBLE | 0x02000000,
         x, y, width, height,
         None, None,
         api["kernel32"].GetModuleHandleW(None),
         None,
     )
     if not hwnd:
+        _unregister_class(api, class_name)
+        theme.close()
         return False
 
-    body = (
-        "A new WinUx version is available.\r\n\r\n"
-        "Current version: {0}\r\n"
-        "New version: {1}\r\n\r\n"
-        "Update source:\r\n{2}\r\n\r\n"
-        "Choose Update Now to install it before WinUx starts, or Cancel to "
-        "continue with the current local version."
-    ).format(local_version or "unknown", server_version or "unknown", server_dir)
-    controls["label"] = _create_control(
-        api, hwnd, "STATIC", body,
-        _WS_CHILD | _WS_VISIBLE | _SS_LEFT,
-        24, 20, 510, 174,
-    )
-    controls["update"] = _create_control(
-        api, hwnd, "BUTTON", "Update Now",
-        _WS_CHILD | _WS_VISIBLE | _WS_TABSTOP | _BS_DEFPUSHBUTTON,
-        330, 215, 100, 32, 1001,
-    )
-    controls["cancel"] = _create_control(
-        api, hwnd, "BUTTON", "Cancel",
-        _WS_CHILD | _WS_VISIBLE | _WS_TABSTOP,
-        440, 215, 90, 32, 1002,
-    )
-    _apply_font(api, hwnd, controls["label"], controls["update"], controls["cancel"])
+    theme.label(hwnd, "WINUX  /  SOFTWARE UPDATE", 28, 22, 504, 20, "small", theme.BLUE)
+    theme.label(hwnd, "A new version is ready", 28, 49, 504, 36, "heading")
+    theme.label(hwnd, "Keep WinUx up to date with the latest improvements.", 28, 91, 504, 24,
+                color=theme.MUTED)
+    theme.label(hwnd, "", 28, 132, 504, 84, panel=True)
+    theme.label(hwnd, "CURRENT VERSION", 48, 145, 180, 18, "small", theme.MUTED, True)
+    theme.label(hwnd, local_version or "Unknown", 48, 171, 180, 34, "version", panel=True)
+    theme.label(hwnd, u"\u2192", 259, 167, 42, 36, "version", theme.MUTED, True)
+    theme.label(hwnd, "NEW VERSION", 328, 145, 180, 18, "small", theme.MUTED, True)
+    theme.label(hwnd, server_version or "Unknown", 328, 171, 180, 34, "version", theme.BLUE, True)
+    source = _text(server_dir or "Configured update source")
+    if source.startswith("GitHub Releases: "):
+        source = source[len("GitHub Releases: "):]
+        source_title = "GITHUB RELEASES"
+    else:
+        source_title = "UPDATE SOURCE"
+    theme.label(hwnd, source_title, 28, 233, 504, 18, "small", theme.MUTED)
+    theme.label(hwnd, source, 28, 255, 504, 36, "small")
+    theme.label(hwnd, "", 0, 298, 560, 52, panel=True)
+    theme.label(hwnd, "Verified before installation", 28, 317, 225, 18, "small", theme.MUTED, True)
+    controls["cancel"] = theme.button(hwnd, "Cancel", 294, 307, 96, 34, 1002)
+    controls["update"] = theme.button(hwnd, "Update Now", 402, 307, 130, 34, 1001, True)
+    api["update_dialog"] = hwnd
+    api["update_actions"] = (controls["update"], controls["cancel"])
     user32.ShowWindow(hwnd, _SW_SHOW)
     user32.SetForegroundWindow(hwnd)
     user32.SetFocus(controls["update"])
+    user32.UpdateWindow(hwnd)
     _run_modal_loop(api, state)
     # Keep callback/class structure alive until after the modal loop, then
     # unregister it so subsequent plug-in launches cannot reuse a stale proc.
     _unregister_class(api, class_name)
+    api.pop("update_dialog", None)
+    api.pop("update_actions", None)
+    theme.close()
     del wc, wndproc, ctypes
     return bool(state["result"])
 
@@ -648,9 +785,14 @@ class UpdateProgressDialog(object):
         user32 = api["user32"]
         class_name = _next_dialog_class_name("WinUxUpdateProgressDialog")
         self._class_name = class_name
+        theme = None
 
         try:
+            theme = _UpdateStyle(api)
             def window_proc(hwnd, message, wparam, lparam):
+                themed = theme.message(message, wparam, lparam)
+                if themed is not None:
+                    return themed
                 if message == _WM_PROGRESS_UPDATE:
                     self._apply_pending_update()
                     return 0
@@ -672,14 +814,14 @@ class UpdateProgressDialog(object):
                 return user32.DefWindowProcW(hwnd, message, wparam, lparam)
 
             self._wndproc = api["WNDPROC"](window_proc)
-            self._wc = _register_class(api, class_name, self._wndproc)
-            width, height = 590, 230
+            self._wc = _register_class(api, class_name, self._wndproc, theme.brushes[theme.WHITE])
+            width, height = theme.window_size(560, 234)
             x, y = _centered_position(api, width, height)
             self._hwnd = user32.CreateWindowExW(
                 _WS_EX_DLGMODALFRAME | _WS_EX_TOPMOST,
                 _text(class_name),
                 _text("Updating WinUx"),
-                _WS_OVERLAPPED | _WS_CAPTION | _WS_SYSMENU | _WS_VISIBLE,
+                _WS_OVERLAPPED | _WS_CAPTION | _WS_SYSMENU | _WS_VISIBLE | 0x02000000,
                 x, y, width, height,
                 None, None,
                 api["kernel32"].GetModuleHandleW(None),
@@ -688,37 +830,32 @@ class UpdateProgressDialog(object):
             if not self._hwnd:
                 raise RuntimeError("CreateWindowExW returned NULL.")
 
-            title = "Updating WinUx {0}  ->  {1}".format(
+            title = "WinUx {0}  ->  {1}".format(
                 local_version or "unknown", server_version or "unknown"
             )
-            header = _create_control(
-                api, self._hwnd, "STATIC", title,
-                _WS_CHILD | _WS_VISIBLE | _SS_LEFT,
-                24, 22, 535, 24,
-            )
-            self._status = _create_control(
-                api, self._hwnd, "STATIC", "Preparing update...",
-                _WS_CHILD | _WS_VISIBLE | _SS_LEFT,
-                24, 58, 535, 26,
-            )
+            theme.label(self._hwnd, "Installing your update", 28, 22, 504, 36, "heading")
+            theme.label(self._hwnd, title, 28, 64, 504, 22, color=theme.MUTED)
+            self._status = theme.label(self._hwnd, "Preparing update...", 28, 99, 504, 42, "small")
             self._bar = _create_control(
                 api, self._hwnd, "msctls_progress32", "",
-                _WS_CHILD | _WS_VISIBLE,
-                24, 100, 475, 26,
+                _WS_CHILD | _WS_VISIBLE | 0x0001,  # PBS_SMOOTH
+                *[theme.px(v) for v in (28, 150, 446, 10)]
             )
-            self._percent = _create_control(
-                api, self._hwnd, "STATIC", "0%",
-                _WS_CHILD | _WS_VISIBLE | _SS_LEFT,
-                512, 103, 48, 24,
-            )
-            hint = _create_control(
-                api, self._hwnd, "STATIC",
-                "WinUx is updating locally. Abaqus/CAE remains available.",
-                _WS_CHILD | _WS_VISIBLE | _SS_LEFT,
-                24, 143, 535, 24,
-            )
-            _apply_font(api, self._hwnd, header, self._status, self._percent, hint)
+            self._percent = theme.label(self._hwnd, "0%", 490, 144, 56, 26, "button", theme.BLUE)
+            theme.label(self._hwnd, "", 0, 186, 560, 48, panel=True)
+            theme.label(self._hwnd, "WinUx will open automatically when the update is ready.",
+                        28, 203, 504, 20, "small", theme.MUTED, True)
             if self._bar:
+                try:
+                    # A flat, continuous blue bar instead of legacy green blocks.
+                    set_theme = api["ctypes"].windll.uxtheme.SetWindowTheme
+                    set_theme.argtypes = [api["ctypes"].c_void_p,
+                                          api["ctypes"].c_wchar_p, api["ctypes"].c_wchar_p]
+                    set_theme(self._bar, "", "")
+                    user32.SendMessageW(self._bar, _WM_USER + 9, 0, theme.BLUE)
+                    user32.SendMessageW(self._bar, _WM_USER + 1, 0, theme.PANEL)
+                except AttributeError:
+                    pass
                 user32.SendMessageW(self._bar, _PBM_SETRANGE32, 0, 100)
                 user32.SendMessageW(self._bar, _PBM_SETPOS, 0, 0)
 
@@ -751,6 +888,8 @@ class UpdateProgressDialog(object):
             self._finished.set()
             if self._class_name:
                 _unregister_class(api, self._class_name)
+            if theme is not None:
+                theme.close()
 
     def update(self, percent, message=None):
         if self._api is None or self._closed:

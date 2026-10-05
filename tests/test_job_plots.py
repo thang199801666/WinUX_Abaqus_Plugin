@@ -146,7 +146,7 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertNotIn('label="Auto fit"', source)
         self.assertIn("PANEL_GAP = 8", source)
         self.assertIn("HISTORY_ROW_GAP = 3", source)
-        self.assertIn("OUTER_MARGIN = 8", source)
+        self.assertIn("OUTER_MARGIN = 6", source)
         self.assertIn('dpg.mvPlotCol_PlotBg', source)
         self.assertIn("panel_surface_theme(", source)
         self.assertIn("checkbox_theme(dpg)", source)
@@ -247,7 +247,7 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("self._close_line_a = dpg.draw_line", dock)
         self.assertIn("self.title_bar = dpg.add_child_window", dock)
         self.assertIn("FRAME = 1", dock)
-        self.assertIn("TITLE_HEIGHT = 24", dock)
+        self.assertIn("TITLE_HEIGHT = 22", dock)
         self.assertIn("def set_floating", dock)
 
     def test_floating_titlebar_double_click_restores_previous_dock(self):
@@ -265,8 +265,8 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("def set_features", dock)
         self.assertIn("def set_feature_enabled", dock)
         self.assertIn("def _show_title_menu", dock)
-        self.assertIn('label="Float"', dock)
-        self.assertIn('label="Close"', dock)
+        self.assertIn('"label": "Dock" if self.floating else "Float"', dock)
+        self.assertIn('"id": "close", "label": "Close"', dock)
         self.assertIn("def _elide_title", dock)
 
     def test_dock_exposes_qmainwindow_style_allowed_dock_areas(self):
@@ -280,8 +280,9 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("AllDockWidgetAreas", dock)
         self.assertIn("def set_allowed_areas", dock)
         self.assertIn("def set_dock_area", dock)
-        self.assertIn('("left", "Dock Left")', dock)
-        self.assertIn('("bottom", "Dock Bottom")', dock)
+        self.assertIn('for area_name in ("left", "right", "top", "bottom")', dock)
+        self.assertIn('"checkable": True', dock)
+        self.assertIn('"label": "Dock {}".format(area_name.title())', dock)
         self.assertIn("on_dock_area_change", plots)
         self.assertIn("def _job_plot_dock_area_change", source)
         self.assertIn("dock_area=self._plot_dock_area", source)
@@ -515,7 +516,7 @@ class JobPlotsArchitectureTests(unittest.TestCase):
 
     def test_v1523_floating_dock_uses_windows11_rounded_chrome_without_grip(self):
         source = VIEW_RUNTIME_SOURCE
-        self.assertIn("dpg.mvStyleVar_WindowRounding, 8", source)
+        self.assertIn("dpg.mvStyleVar_WindowRounding, 1", source)
         self.assertIn("dpg.mvThemeCol_ResizeGrip, (0, 0, 0, 0)", source)
         self.assertIn("no_resize=True", source)
         self.assertIn("FloatingWindowResizer(", source)

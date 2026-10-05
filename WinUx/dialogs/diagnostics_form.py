@@ -13,15 +13,16 @@ class DiagnosticsDialog(QtDialog):
         self._report_provider = report_provider or build_diagnostics_report
         super().__init__(view, "WinUx Diagnostics", 720, 480, modal=False)
         self.header("Diagnostics", "Runtime, dependencies and crash-log information.")
-        self.text = self.line_edit("", multiline=True, readonly=True, width=-1,
-                                   height=-30, parent=self.content)
+        self.text = self.plain_text_edit("", readonly=True, width=-1,
+                                        height=-30, parent=self.content)
         self.enter_editors.add(self.text)
         self.status = self.status_text()
         self.button_box([("Close", self.destroy, "primary", True)],
             left_actions=[("Refresh", self.refresh, "secondary", False),
                           ("Copy", self.copy, "secondary", False),
                           ("Save Report", self.save, "secondary", False),
-                          ("Open Logs", self.open_logs, "secondary", False)])
+                          ("Open Logs", self.open_logs, "secondary", False)],
+            status_item=self.status)
         self.refresh()
 
     def refresh(self, *_args):

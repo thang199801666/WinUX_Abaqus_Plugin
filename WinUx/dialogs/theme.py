@@ -34,28 +34,28 @@ class DialogMetrics:
     # Shared QDialog/QFormLayout metrics.  Keep these values centralized so a
     # control never becomes taller or more padded merely because it lives in a
     # different dialog.  The dimensions are deliberately close to Qt Fusion on
-    # Windows: compact 24 px controls, 8 px content margins and a 38 px
+    # Windows: compact 26 px controls, 10 px content margins and a 42 px
     # QDialogButtonBox-style footer.
-    LABEL_WIDTH = 96
-    BUTTON_WIDTH = 76
-    BUTTON_HEIGHT = 24
+    LABEL_WIDTH = 104
+    BUTTON_WIDTH = 82
+    BUTTON_HEIGHT = 26
     BUTTON_GAP = 6
-    FOOTER_HEIGHT = 38
-    WINDOW_PAD_X = 8
-    WINDOW_PAD_Y = 7
-    ROW_SPACING = 4
+    FOOTER_HEIGHT = 40
+    WINDOW_PAD_X = 10
+    WINDOW_PAD_Y = 8
+    ROW_SPACING = 5
     FRAME_PAD_X = 5
-    FRAME_PAD_Y = 3
-    GROUP_PAD_X = 7
+    FRAME_PAD_Y = 4
+    GROUP_PAD_X = 8
     GROUP_PAD_Y = 6
     BODY_FONT_SIZE = 14
     HEADING_FONT_SIZE = 15
-    MIN_DIALOG_WIDTH = 340
-    MIN_DIALOG_HEIGHT = 170
-    NAV_WIDTH = 148
+    MIN_DIALOG_WIDTH = 360
+    MIN_DIALOG_HEIGHT = 190
+    NAV_WIDTH = 156
     STATUS_HEIGHT = 18
-    CONTROL_HEIGHT = 24
-    COMBO_ARROW_WIDTH = 26
+    CONTROL_HEIGHT = 26
+    COMBO_ARROW_WIDTH = 24
 
 
 _DIALOG_THEME = None
@@ -81,6 +81,7 @@ _LINE_EDIT_EDITOR_DISABLED_THEME = None
 _COMBO_THEME = None
 _COMBO_FOCUS_THEME = None
 _COMBO_DISABLED_THEME = None
+_PLAIN_TEXT_EDIT_THEME = None
 
 
 def _is_theme(item):
@@ -104,7 +105,10 @@ def _control_frame(theme_component, *, focused=False, disabled=False):
         dpg.add_theme_color(cursor_role, p.TEXT_DISABLED if disabled else p.TEXT)
     dpg.add_theme_color(dpg.mvThemeCol_Border, border)
     dpg.add_theme_color(dpg.mvThemeCol_TextSelectedBg, (0, 120, 215, 115))
-    dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 3)
+    # Use the same effective 26 px editor height as QLineEdit/QSpinBox.
+    # A 5 px vertical frame pad keeps native mvCombo and mvInputText frames
+    # visually equal to the 26 px retained spin-box shell.
+    dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 5)
     dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
     # QLineEdit/QComboBox frames on Fusion are effectively square.  One pixel
     # rounding avoids harsh raster corners without the pill-like ImGui look.
@@ -246,6 +250,35 @@ def combo_theme(*, focused=False, disabled=False):
         _COMBO_DISABLED_THEME = theme
     return theme
 
+
+
+def plain_text_edit_theme():
+    """Qt/Fusion QPlainTextEdit-like theme for multiline diagnostics/log views.
+
+    Multiline ``mvInputText`` items keep Dear ImGui's native editing and
+    scrolling behavior, but their frame/scrollbar chrome should match the
+    rest of WinUx rather than inheriting the generic dialog theme.
+    """
+    global _PLAIN_TEXT_EDIT_THEME
+    if _is_theme(_PLAIN_TEXT_EDIT_THEME):
+        return _PLAIN_TEXT_EDIT_THEME
+    p = QtFusionPalette
+    with dpg.theme() as theme:
+        with dpg.theme_component(dpg.mvInputText):
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, p.BASE)
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, p.BASE)
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, p.BASE)
+            dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT)
+            dpg.add_theme_color(dpg.mvThemeCol_TextDisabled, p.TEXT_DISABLED)
+            dpg.add_theme_color(dpg.mvThemeCol_Border, p.BORDER)
+            dpg.add_theme_color(dpg.mvThemeCol_TextSelectedBg, (0, 120, 215, 115))
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 5)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+        with dpg.theme_component(dpg.mvAll):
+            add_dpg_scroller_style(dpg, track=p.WINDOW_ALT)
+    _PLAIN_TEXT_EDIT_THEME = theme
+    return theme
 
 def _item_enabled(item):
     try:
@@ -589,8 +622,10 @@ def footer_theme():
     if not _is_theme(_FOOTER_THEME):
         with dpg.theme() as _FOOTER_THEME:
             with dpg.theme_component(dpg.mvChildWindow):
-                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, QtFusionPalette.WINDOW_ALT)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 9, 6)
+                # QDialogButtonBox is part of the dialog surface; avoid a
+                # separate gray footer band that makes small forms look split in two.
+                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, QtFusionPalette.WINDOW)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 10, 6)
                 dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, DialogMetrics.BUTTON_GAP, 0)
             with dpg.theme_component(dpg.mvTable):
                 dpg.add_theme_style(dpg.mvStyleVar_CellPadding, 0, 0)
@@ -616,22 +651,31 @@ def error_text_theme():
 
 
 def navigation_theme():
-    """QListView-like navigation pane used by Settings and future dialogs."""
+    """QListView-like navigation pane used by Settings and future dialogs.
+
+    The pane intentionally reads as a navigation view, not a stack of ImGui
+    buttons: flat rows, one subtle selected fill, no rounded cards and a light
+    frame around the whole viewport.
+    """
     global _NAV_THEME
     if not _is_theme(_NAV_THEME):
         p = QtFusionPalette
         with dpg.theme() as _NAV_THEME:
             with dpg.theme_component(dpg.mvChildWindow):
-                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.WINDOW_ALT)
-                dpg.add_theme_color(dpg.mvThemeCol_Border, p.BORDER)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 6, 7)
-                dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 1)
+                dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.WINDOW)
+                dpg.add_theme_color(dpg.mvThemeCol_Border, p.BORDER_LIGHT)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 6, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
                 dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 1)
+                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 1)
             with dpg.theme_component(dpg.mvSelectable):
                 dpg.add_theme_color(dpg.mvThemeCol_Header, p.HIGHLIGHT_SOFT)
                 dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, p.HIGHLIGHT_HOVER)
-                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, p.HIGHLIGHT_SOFT)
+                dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, p.BUTTON_ACTIVE)
+                dpg.add_theme_color(dpg.mvThemeCol_NavHighlight, p.FOCUS)
                 dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT)
                 dpg.add_theme_style(dpg.mvStyleVar_SelectableTextAlign, 0.0, 0.5)
-                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 8, 4)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 8, 3)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
     return _NAV_THEME

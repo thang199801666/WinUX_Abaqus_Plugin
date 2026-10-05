@@ -39,8 +39,8 @@ def test_file_panels_use_shared_qt_itemview_metrics_not_winscp_theme():
     source = (COMPONENTS / "file_panel.py").read_text(encoding="utf-8")
     assert 'theme="Explorer"' in source
     assert 'theme="WinSCP"' not in source
-    assert "row_height=24" in source
-    assert "header_height=28" in source
+    assert "row_height=23" in source
+    assert "header_height=26" in source
     assert 'auto_fit_column_key="name"' in source
     assert "header.setSectionResizeMode(0, header.Stretch)" in source
 

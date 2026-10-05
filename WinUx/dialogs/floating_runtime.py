@@ -291,7 +291,8 @@ class FloatingDialogRuntime:
         else:
             self.native._resizable = bool(initial.get("resizable", True))
         self.native.configure(owner)
-        self.native.install_close_handler(self.view, self.form._close_from_escape,
+        self.native.install_close_handler(self.view,
+                                          getattr(self.form, "_close_from_native", self.form._close_from_escape),
                                          getattr(self.form, "native_character", None))
         self.form.hide = self.hide
         self.form.show = self.form.lift = self.show

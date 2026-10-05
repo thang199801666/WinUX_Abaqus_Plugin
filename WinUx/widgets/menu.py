@@ -118,7 +118,7 @@ class ImGuiMenu(QObject):
     row hover; rows support textures, checkable state and runtime enablement.
     """
 
-    ROW_HEIGHT = 24
+    ROW_HEIGHT = 23
     ICON_SIZE = 16
     CHECK_SLOT = 16
     ICON_SLOT = 20
@@ -246,7 +246,7 @@ class ImGuiMenu(QObject):
         self._clear_rows()
         visible = [spec for spec in self._actions if spec.get("visible", True)]
         width = self._estimate_width(visible)
-        height = 8
+        height = 6
         for spec in visible:
             height += 7 if spec.get("separator") else self.ROW_HEIGHT
             self._build_row(spec, width)
@@ -295,6 +295,39 @@ class ImGuiMenu(QObject):
         self._rows.clear()
         self._row_specs.clear()
 
+    def _glyph_color(self, enabled=True):
+        return QtFusionPalette.TEXT if enabled else QtFusionPalette.TEXT_DISABLED
+
+    def _redraw_check(self, canvas, *, checked=False, enabled=True):
+        """Paint a compact Qt-style check mark with draw primitives."""
+        if canvas is None:
+            return
+        b = self.backend
+        try:
+            b.delete_item(canvas, children_only=True)
+        except Exception:
+            pass
+        if not checked:
+            return
+        color = self._glyph_color(enabled)
+        b.draw_line((3, 12), (6, 15), color=color, thickness=1.4, parent=canvas)
+        b.draw_line((6, 15), (12, 8), color=color, thickness=1.4, parent=canvas)
+
+    def _redraw_submenu_arrow(self, canvas, *, visible=False, enabled=True):
+        """Paint a compact right chevron without depending on font glyphs."""
+        if canvas is None:
+            return
+        b = self.backend
+        try:
+            b.delete_item(canvas, children_only=True)
+        except Exception:
+            pass
+        if not visible:
+            return
+        color = self._glyph_color(enabled)
+        b.draw_line((5, 8), (9, 12), color=color, thickness=1.2, parent=canvas)
+        b.draw_line((9, 12), (5, 16), color=color, thickness=1.2, parent=canvas)
+
     def _build_row(self, spec, width):
         b = self.backend
         if spec.get("separator"):
@@ -327,8 +360,12 @@ class ImGuiMenu(QObject):
             b.add_table_column(width_stretch=True, init_width_or_weight=1.0)
             b.add_table_column(width_fixed=True, init_width_or_weight=self.ARROW_SLOT)
             with b.table_row():
-                mark = "✓" if spec.get("checkable") and spec.get("checked") else ""
-                check_item = b.add_text(mark)
+                check_item = b.add_drawlist(width=self.CHECK_SLOT, height=self.ROW_HEIGHT)
+                self._redraw_check(
+                    check_item,
+                    checked=bool(spec.get("checkable") and spec.get("checked")),
+                    enabled=bool(spec.get("enabled", True)),
+                )
                 icon = spec.get("icon")
                 if icon is not None:
                     try:
@@ -338,13 +375,17 @@ class ImGuiMenu(QObject):
                 else:
                     b.add_spacer(width=self.ICON_SIZE, height=self.ICON_SIZE)
                 label_item = b.add_text(str(spec.get("label", "")))
-                arrow_item = b.add_text("›" if spec.get("children") else "")
-        for item in (check_item, label_item, arrow_item):
-            try:
-                b.bind_item_theme(item, _text_theme(
-                    b, disabled=not bool(spec.get("enabled", True))))
-            except Exception:
-                pass
+                arrow_item = b.add_drawlist(width=self.ARROW_SLOT, height=self.ROW_HEIGHT)
+                self._redraw_submenu_arrow(
+                    arrow_item,
+                    visible=bool(spec.get("children")),
+                    enabled=bool(spec.get("enabled", True)),
+                )
+        try:
+            b.bind_item_theme(label_item, _text_theme(
+                b, disabled=not bool(spec.get("enabled", True))))
+        except Exception:
+            pass
         self._items[action_id] = {
             "row": row,
             "check": check_item,
@@ -398,10 +439,9 @@ class ImGuiMenu(QObject):
         if spec.get("checkable"):
             spec["checked"] = not bool(spec.get("checked"))
             item = self._items.get(action_id, {})
-            try:
-                self.backend.set_value(item.get("check"), "✓" if spec["checked"] else "")
-            except Exception:
-                pass
+            self._redraw_check(
+                item.get("check"), checked=bool(spec["checked"]),
+                enabled=bool(spec.get("enabled", True)))
         root = self._root_menu()
         root.triggered.emit(action, root._context)
         root.hide()
@@ -502,14 +542,19 @@ class ImGuiMenu(QObject):
             local_spec["enabled"] = bool(enabled)
             menu._set_row_hover(target, False)
             items = menu._items.get(target, {})
-            for key in ("check", "label", "arrow"):
-                item = items.get(key)
-                if item is not None:
-                    try:
-                        menu.backend.bind_item_theme(
-                            item, _text_theme(menu.backend, disabled=not bool(enabled)))
-                    except Exception:
-                        pass
+            label_item = items.get("label")
+            if label_item is not None:
+                try:
+                    menu.backend.bind_item_theme(
+                        label_item, _text_theme(menu.backend, disabled=not bool(enabled)))
+                except Exception:
+                    pass
+            menu._redraw_check(
+                items.get("check"), checked=bool(local_spec.get("checked")),
+                enabled=bool(enabled))
+            menu._redraw_submenu_arrow(
+                items.get("arrow"), visible=bool(local_spec.get("children")),
+                enabled=bool(enabled))
             return True
         return True
 
@@ -526,10 +571,9 @@ class ImGuiMenu(QObject):
             local_spec["checked"] = bool(checked)
             item = menu._items.get(target, {}).get("check")
             if item is not None:
-                try:
-                    menu.backend.set_value(item, "✓" if checked else "")
-                except Exception:
-                    pass
+                menu._redraw_check(
+                    item, checked=bool(checked),
+                    enabled=bool(local_spec.get("enabled", True)))
             return True
         return True
 

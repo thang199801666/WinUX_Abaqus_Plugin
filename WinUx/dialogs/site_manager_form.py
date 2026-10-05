@@ -17,9 +17,16 @@ class SiteManagerDialog(QtDialog):
             lambda: self.combo([], callback=self._selection_changed),
         )
         with self.section("Site details") as details:
-            self.fields = {name: self.field(label, "22" if name == "port" else "", parent=details) for name, label in (
-                ("name", "Site name"), ("host", "Host"), ("port", "Port"),
-                ("username", "Username"), ("remote_path", "Initial remote folder"))}
+            form = self.form_layout(parent=details)
+            self.fields = {}
+            for name, label in (
+                    ("name", "Site name"), ("host", "Host"), ("port", "Port"),
+                    ("username", "Username"), ("remote_path", "Initial remote folder")):
+                initial = "22" if name == "port" else ""
+                self.fields[name] = self.form_layout_row(
+                    form, label,
+                    lambda parent, value=initial: self.line_edit(value, parent=parent),
+                )
         self.note("Passwords use the DPAPI-protected credentials for the selected username.",
                   wrap=650)
         self.error = self.status_text(error=True)
@@ -52,7 +59,7 @@ class SiteManagerDialog(QtDialog):
         self._selected_id = str(site.get("id") or "") or None
         for name, item in self.fields.items():
             dpg.set_value(item, str(site.get(name) or (22 if name == "port" else "")))
-        dpg.set_value(self.error, "")
+        self.set_status_text(self.error, "", error=True)
 
     def _new(self):
         self._load_site({})
@@ -76,7 +83,7 @@ class SiteManagerDialog(QtDialog):
         return None if error else values
 
     def show_error(self, message):
-        dpg.set_value(self.error, str(message))
+        self.set_status_text(self.error, message, error=True)
 
     def request_save(self, values):
         self.view.after(0, self._on_save, dict(values))

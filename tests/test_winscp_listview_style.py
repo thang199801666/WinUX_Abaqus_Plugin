@@ -10,8 +10,8 @@ LAYOUT = ROOT / "WinUx" / "components" / "explorer_layout.py"
 def test_file_panels_use_shared_qt_theme_and_metrics():
     source = FILE_PANEL.read_text(encoding="utf-8")
     assert 'theme="Explorer"' in source
-    assert 'row_height=24' in source
-    assert 'header_height=28' in source
+    assert 'row_height=23' in source
+    assert 'header_height=26' in source
     assert 'cell_padding=6' in source
     assert 'auto_fit_column_key="name"' in source
 

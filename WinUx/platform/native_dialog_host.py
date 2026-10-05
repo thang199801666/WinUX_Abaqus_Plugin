@@ -1222,6 +1222,9 @@ class NativeDialogController:
         self._native_modal_input_acquired = False
         self._finalized = False
         self._return_foreground_on_finalize = False
+        # Monotonic token used to invalidate stale deferred owner-focus repairs.
+        # A newly shown dialog increments this token before it can become visible.
+        self._owner_focus_generation = 0
         self._geometry_after_id = None
         self._geometry_preferences = DialogGeometryPreferences()
         explicit_geometry_key = getattr(self, "DIALOG_GEOMETRY_KEY", None)
@@ -1486,6 +1489,8 @@ class NativeDialogController:
                     self.restore_owner_foreground_async()
             return True
 
+        self._owner_focus_generation = int(
+            getattr(self, "_owner_focus_generation", 0)) + 1
         self._refresh_parent_for_show(window)
         # Dear PyGui uses global handler registries and can still observe the
         # physical mouse while its HWND is disabled. Acquire the application
@@ -1840,34 +1845,34 @@ class NativeDialogController:
     def toggle_maximize(self):
         return self.post("toggle_maximize")
 
-    def restore_owner_focus_async(self, delay=0):
-        """Activate WinUx on its own UI thread after a native window closes.
-
-        The WinUx HWND is created/owned by the Dear PyGui thread.  Calling
-        ``SetFocus``/``AttachThreadInput`` from the shared Tk thread during a
-        Toplevel teardown can race Tcl/Tk and the embedded Abaqus host.  Queue
-        the operation through the thread-safe UI dispatcher instead.
-        """
+    def _queue_owner_restore(self, callback, delay=0):
         owner_hwnd = self._parent_hwnd or self._owner_hwnd
         if not owner_hwnd:
             return False
+        self._owner_focus_generation = int(
+            getattr(self, "_owner_focus_generation", 0)) + 1
+        generation = self._owner_focus_generation
+
+        def deliver():
+            # If this controller showed/activated another window after the close
+            # request, this callback is stale and must not steal focus back.
+            if generation != int(getattr(self, "_owner_focus_generation", 0)):
+                return
+            callback(owner_hwnd)
+
         try:
-            self.view.after(max(0, int(delay or 0)), restore_owner_focus, owner_hwnd)
+            self.view.after(max(0, int(delay or 0)), deliver)
             return True
         except Exception:
             return False
+
+    def restore_owner_focus_async(self, delay=0):
+        """Queue a coalesced keyboard-focus return to the WinUx owner."""
+        return self._queue_owner_restore(restore_owner_focus, delay)
 
     def restore_owner_foreground_async(self, delay=0):
-        """Queue a one-shot foreground/Z-order hand-off after dialog close."""
-        owner_hwnd = self._parent_hwnd or self._owner_hwnd
-        if not owner_hwnd:
-            return False
-        try:
-            self.view.after(
-                max(0, int(delay or 0)), restore_owner_foreground, owner_hwnd)
-            return True
-        except Exception:
-            return False
+        """Queue one coalesced foreground/Z-order hand-off after dialog close."""
+        return self._queue_owner_restore(restore_owner_foreground, delay)
 
     def destroy(self, wait=False, timeout=1.0):
         if not self._closed.is_set():

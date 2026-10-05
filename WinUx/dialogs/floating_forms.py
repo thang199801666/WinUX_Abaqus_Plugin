@@ -66,7 +66,7 @@ def create_form(kind, payload, view, emit):
             return state["rows"]
         form = JobScheduleDialog(view, provider, lambda action, kind, key: emit("action", action=action, kind=kind, key=key))
     elif kind == "settings":
-        form = SettingsDialog(view)
+        form = SettingsDialog(view, on_install_update=lambda: emit("install_update"))
     elif kind == "diagnostics":
         state["report"] = str(payload.get("report", ""))
         def provider():

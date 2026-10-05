@@ -14,12 +14,12 @@ class JobsView:
     """PBS jobs rendered by the same ExplorerListView used for files."""
 
     COLUMNS = (
-        {"key": "job_id", "label": "Job ID", "weight": 1.0, "align": "left", "visible": True},
+        {"key": "job_id", "label": "Job ID", "weight": 1.0, "align": "center", "visible": True},
         {"key": "job_name", "label": "Name", "weight": 1.0, "align": "left", "visible": True},
         {"key": "user", "label": "User", "weight": 1.0, "align": "left", "visible": True},
-        {"key": "tokens", "label": "Tokens", "weight": 1.0, "align": "left", "visible": True},
-        {"key": "status", "label": "Status", "weight": 1.0, "align": "left", "visible": True},
-        {"key": "elapsed", "label": "Elapsed", "weight": 1.0, "align": "left", "visible": True},
+        {"key": "tokens", "label": "Tokens", "weight": 1.0, "align": "center", "visible": True},
+        {"key": "status", "label": "Status", "weight": 1.0, "align": "center", "visible": True},
+        {"key": "elapsed", "label": "Elapsed", "weight": 1.0, "align": "center", "visible": True},
     )
 
     FIXED_COLUMN_WIDTH = 120.0
@@ -68,7 +68,12 @@ class JobsView:
         dpg.configure_item(self.container, width=-1, height=-1)
         self.listview.resize(width=-1, height=-1)
 
-        self._fit_name_column_to_available_width(width)
+        if self.listview.auto_width_enabled:
+            self.listview._fit_columns_auto_width(
+                self.listview._available_width())
+            self.listview._last_available_width = self.listview._available_width()
+        else:
+            self._fit_name_column_to_available_width(width)
         self._layout_now_and_next_frame()
 
     def _apply_default_column_widths(self):
@@ -117,7 +122,12 @@ class JobsView:
             try:
                 actual_width = float(dpg.get_item_rect_size(self.container)[0])
                 if actual_width > 20:
-                    self._fit_name_column_to_available_width(actual_width)
+                    if self.listview.auto_width_enabled:
+                        self.listview._fit_columns_auto_width(
+                            self.listview._available_width())
+                        self.listview._last_available_width = self.listview._available_width()
+                    else:
+                        self._fit_name_column_to_available_width(actual_width)
                 self.listview._text_fit_cache.clear()
                 self.listview._resize_layout_pending = True
                 self.listview._layout_all()
@@ -185,7 +195,7 @@ class JobsView:
             theme=ListViewTheme.JOB_VIEWER,
             tag="jobs_list",
         )
-        listview.set_metrics(row_height=24, header_height=28, cell_padding=5)
+        listview.set_metrics(row_height=23, header_height=26, cell_padding=6)
         return listview
 
     def _install_context_menu_fallback(self):

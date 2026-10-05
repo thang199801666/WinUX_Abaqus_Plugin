@@ -7,7 +7,10 @@ because the supported Python version depends on the Abaqus release.
 
 from __future__ import print_function
 
+import json
 import os
+import sys
+import tempfile
 
 from abaqusConstants import ALL
 from abaqusGui import (
@@ -20,18 +23,72 @@ from abaqusGui import (
     showAFXInformationDialog,
 )
 
-from winux_launcher import launch_winux
+def _activate_self_updated_bootstrap():
+    """Prefer the per-user immutable bootstrap while keeping this file stable.
+
+    The plug-in shim itself is intentionally tiny and remains in the Abaqus
+    plug-in folder.  All substantial bootstrap modules can therefore update
+    without overwriting files imported by Abaqus/CAE.  Invalid state always
+    falls back to the bundled copy beside this shim.
+    """
+    if str(os.environ.get("WINUX_BOOTSTRAP_MODE", "")).strip().lower() in (
+            "legacy", "bundled", "off", "disabled"):
+        return None
+    base = (os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA") or tempfile.gettempdir())
+    root = os.path.join(os.path.abspath(base), "WinUx", "bootstrap")
+    state_path = os.path.join(root, "state", "current.json")
+    try:
+        with open(state_path, "r") as handle:
+            state = json.load(handle)
+    except Exception:
+        return None
+    versions = []
+    active = str(state.get("active_version") or "").strip()
+    if active:
+        versions.append(active)
+    previous = state.get("previous_versions")
+    if isinstance(previous, list):
+        versions.extend(str(item).strip() for item in previous if str(item).strip())
+    required = ("winux_launcher.py", "winux_updater.py", "run_winux.py", "VERSION")
+    for version in versions:
+        safe = "".join(ch if ch.isalnum() or ch in "._+-" else "_" for ch in version)
+        candidate = os.path.join(root, "versions", safe)
+        if not all(os.path.isfile(os.path.join(candidate, name)) for name in required):
+            continue
+        try:
+            with open(os.path.join(candidate, "VERSION"), "r") as handle:
+                if handle.read().strip() != version:
+                    continue
+        except Exception:
+            continue
+        if candidate not in sys.path:
+            sys.path.insert(0, candidate)
+        os.environ["WINUX_BOOTSTRAP_DIR"] = candidate
+        return candidate
+    return None
+
+
+_activate_self_updated_bootstrap()
+
+from winux_launcher import launch_winux, resolve_project_dir
 
 
 def _plugin_version():
-    """Read the deployment VERSION so local/server packages share one codebase."""
+    """Report the active immutable runtime version when one is available."""
     try:
-        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+        root = resolve_project_dir()
+        path = os.path.join(root, "VERSION")
         with open(path, "r") as handle:
             value = handle.read().strip()
         return value or "unknown"
     except Exception:
-        return "unknown"
+        try:
+            path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+            with open(path, "r") as handle:
+                value = handle.read().strip()
+            return value or "unknown"
+        except Exception:
+            return "unknown"
 
 
 class WinUxMenuTarget(FXObject):

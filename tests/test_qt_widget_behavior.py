@@ -81,27 +81,26 @@ class QtWidgetBehaviorTests(unittest.TestCase):
         ):
             self.assertIn(token, source)
 
-    def test_qcombobox_uses_dpg_popup_and_selectables_for_modal_safe_selection(self):
+    def test_qcombobox_uses_native_imgui_combo_popup_for_modal_safe_selection(self):
         source = (COMPONENTS / "qt_combo_box.py").read_text(encoding="utf-8")
-        self.assertIn("dpg.add_window(", source)
-        self.assertIn("popup=True", source)
-        self.assertIn("dpg.add_selectable(", source)
-        self.assertIn("callback=self._popup_selected", source)
-        self.assertNotIn("dpg.add_combo(", source)
+        self.assertIn("self.button = dpg.add_combo(", source)
+        self.assertIn("no_preview=True", source)
+        self.assertIn("callback=self._native_selected", source)
+        self.assertNotIn("self._popup = dpg.add_child_window(", source)
+        self.assertNotIn("dpg.add_selectable(", source)
         self.assertNotIn("add_mouse_release_handler", source)
 
-    def test_qcombobox_arrow_and_popup_share_qt_fusion_theme(self):
+    def test_qcombobox_native_arrow_shares_qt_fusion_shell_theme(self):
         source = (COMPONENTS / "qt_combo_box.py").read_text(encoding="utf-8")
-        self.assertIn("with dpg.theme_component(dpg.mvButton):", source)
-        self.assertIn("dpg.mvThemeCol_PopupBg, p.MENU", source)
-        self.assertIn("dpg.mvThemeCol_HeaderHovered, p.MENU_HOVER", source)
+        self.assertIn("with dpg.theme_component(dpg.mvCombo):", source)
         self.assertIn("self.container = dpg.add_child_window(", source)
         self.assertIn("dpg.mvStyleVar_ChildBorderSize, 1", source)
         self.assertIn("dpg.mvStyleVar_CellPadding, 0, 0", source)
-        self.assertIn('self._arrow_triangle = dpg.draw_triangle(', source)
+        self.assertIn("no_preview=True", source)
         self.assertNotIn('label="v"', source)
         self.assertNotIn('▾', source)
         self.assertIn("self.search = None", source)
+
 
     def test_dialog_line_edit_and_combo_helpers_use_qt_focus_themes(self):
         theme = (ROOT / "WinUx" / "dialogs" / "theme.py").read_text(encoding="utf-8")
@@ -133,22 +132,23 @@ class QtWidgetBehaviorTests(unittest.TestCase):
         self.assertIn("ARROW_WIDTH = METRICS.arrow_width", source)
         self.assertIn("auto_select_all=False", source)
         self.assertIn("FrameBorderSize, 0", source)
-        self.assertIn("self.button = dpg.add_drawlist(", source)
-        self.assertIn("dpg.draw_triangle(", source)
-        self.assertIn("dpg.add_window(", source)
-        self.assertIn("popup=True", source)
-        self.assertIn("dpg.add_selectable(", source)
-        self.assertNotIn("dpg.add_combo(", source)
+        self.assertIn("self.button = dpg.add_combo(", source)
+        self.assertIn("no_preview=True", source)
+        self.assertIn("callback=self._native_selected", source)
+        self.assertNotIn("dpg.draw_triangle(", source)
+        self.assertNotIn("self._popup = dpg.add_child_window(", source)
         input_handlers = source.split("def _install_input_state_handlers", 1)[1].split(
-            "def _install_button_state_handlers", 1)[0]
+            "def _button_activated", 1)[0]
         self.assertNotIn("add_item_clicked_handler", input_handlers)
         self.assertNotIn("focus_item(self.input)", input_handlers)
 
-    def test_qcombobox_popup_is_an_imgui_popup_inside_the_same_viewport(self):
+    def test_qcombobox_dropdown_uses_native_begincombo_inside_modal(self):
         source = (COMPONENTS / "qt_combo_box.py").read_text(encoding="utf-8")
-        self.assertIn("implemented entirely in Dear PyGui", source)
-        self.assertIn("popup=True", source)
-        self.assertIn("dpg.add_selectable(", source)
+        self.assertIn("Dear PyGui only", source)
+        self.assertIn("self.button = dpg.add_combo(", source)
+        self.assertIn("no_preview=True", source)
+        self.assertNotIn("self._find_popup_parent()", source)
+        self.assertNotIn("self._popup = dpg.add_child_window(", source)
         self.assertNotIn("tkinter", source)
         self.assertNotIn("PyQt", source)
         self.assertNotIn("NativeQt", source)

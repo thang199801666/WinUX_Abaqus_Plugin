@@ -10,13 +10,23 @@ class SyncPreviewDialog(QtDialog):
         self._on_refresh, self._on_transfer = on_refresh, on_transfer
         super().__init__(view, "Directory Synchronization Preview", 820, 470, modal=False)
         self.header("Directory synchronization", "Review differences before starting a transfer.")
-        self.paths = dpg.add_text("", parent=self.content, wrap=780)
-        self.table = QtTable(self.content, ("Name", "Status", "Local", "Server", "Recommended action"),
-                             height=-30, multiple=True)
+        paths_form = self.form_layout(parent=self.content, label_width=54)
+        self.local_path = self.form_layout_row(
+            paths_form, "Local", lambda parent: dpg.add_text("", parent=parent, wrap=690))
+        self.server_path = self.form_layout_row(
+            paths_form, "Server", lambda parent: dpg.add_text("", parent=parent, wrap=690))
+        self.table = QtTable(self.content, (
+            {"key": "name", "label": "Name", "stretch": 2.2, "sortable": False},
+            {"key": "status", "label": "Status", "width": 112, "sortable": False},
+            {"key": "local", "label": "Local", "width": 88, "sortable": False},
+            {"key": "server", "label": "Server", "width": 88, "sortable": False},
+            {"key": "action", "label": "Recommended action", "width": 156, "sortable": False},
+        ), height=-30, multiple=True)
         self.status = self.status_text()
         self.button_box([("Refresh", self.request_refresh, "secondary", False),
                          ("Transfer", self._transfer_selected, "primary", True),
-                         ("Close", self.destroy, "secondary", False)])
+                         ("Close", self.destroy, "secondary", False)],
+                        status_item=self.status)
         self.refresh(rows, local_path, server_path)
 
     @staticmethod
@@ -34,7 +44,8 @@ class SyncPreviewDialog(QtDialog):
         # silently apply to a different file after a new scan.
         self.table.selected.clear()
         self._rows = [dict(row) for row in rows or []]
-        dpg.set_value(self.paths, "Local: {} | Server: {}".format(local_path, server_path))
+        dpg.set_value(self.local_path, str(local_path))
+        dpg.set_value(self.server_path, str(server_path))
         self.table.set_rows([(i, (row.get("name") or "", row.get("status") or "",
             self._size_text(row.get("local_size"), bool(row.get("local_exists"))),
             self._size_text(row.get("server_size"), bool(row.get("server_exists"))),

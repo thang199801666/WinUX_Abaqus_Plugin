@@ -74,9 +74,9 @@ class QtDialogStyleTests(unittest.TestCase):
     def test_dialog_density_is_compact_and_shared(self):
         source = (DIALOGS / "theme.py").read_text(encoding="utf-8")
         for token in (
-            "LABEL_WIDTH = 96", "BUTTON_WIDTH = 76", "BUTTON_HEIGHT = 24",
-            "FOOTER_HEIGHT = 38", "WINDOW_PAD_X = 8", "ROW_SPACING = 4",
-            "NAV_WIDTH = 148",
+            "LABEL_WIDTH = 104", "BUTTON_WIDTH = 82", "BUTTON_HEIGHT = 26",
+            "FOOTER_HEIGHT = 40", "WINDOW_PAD_X = 10", "ROW_SPACING = 5",
+            "NAV_WIDTH = 156",
         ):
             self.assertIn(token, source)
 
@@ -84,8 +84,8 @@ class QtDialogStyleTests(unittest.TestCase):
         login = (DIALOGS / "login_form.py").read_text(encoding="utf-8")
         settings = (DIALOGS / "settings_form.py").read_text(encoding="utf-8")
         blocking = (DIALOGS / "blocking_form.py").read_text(encoding="utf-8")
-        self.assertIn("self.preferred_size = (420, 220)", login)
-        self.assertIn("self.preferred_size = (700, 440)", settings)
+        self.assertIn("self.preferred_size = (420, 184)", login)
+        self.assertIn("self.preferred_size = (760, 520)", settings)
         self.assertIn("self.preferred_size = (480,", blocking)
 
 

@@ -174,7 +174,7 @@ class DragPreviewHelper:
         display_names = []
         for name in names:
             if len(name) > 42:
-                name = name[:39] + "…"
+                name = name[:39] + "..."
             display_names.append(name)
 
         max_text_width = max(
