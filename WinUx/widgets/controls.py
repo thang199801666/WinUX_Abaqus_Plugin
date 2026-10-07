@@ -298,6 +298,14 @@ class ImGuiPushButton(QWidget):
         if not self._deleted:
             self.clicked.emit()
 
+    def click(self):
+        """Programmatically click the button, matching QPushButton::click()."""
+        self._require_ui()
+        if self._deleted or not self.isEnabled():
+            return False
+        self.clicked.emit()
+        return True
+
     def setText(self, text):
         self._on_ui("label", self._configure, "label", str(text))
 

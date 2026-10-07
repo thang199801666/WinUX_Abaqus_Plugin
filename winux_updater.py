@@ -214,12 +214,50 @@ def _use_versioned_install(environ=None, settings_path=None):
     )
 
 
+def _effective_local_dir(local_dir, environ=None):
+    """Return the deployment that is actually active for version comparison.
+
+    Update discovery must not trust a stale ``WINUX_APP_DIR``/launcher path.
+    During migration a long-lived Abaqus/CAE process can still pass the old
+    flat plug-in directory even after a versioned update has successfully
+    activated a newer immutable runtime.  Comparing GitHub against that stale
+    directory makes the same release appear available on every launch.
+
+    The immutable active pointer is therefore consulted *before* discovery,
+    independent of the install strategy selected for the next update.
+    ``resolve_active_installation`` already falls back to ``local_dir`` when
+    the pointer is missing/invalid or when the bundled deployment is newer.
+    """
+    local_dir = os.path.abspath(local_dir)
+    try:
+        resolved = resolve_active_installation(local_dir, environ=environ)
+    except Exception:
+        resolved = None
+    return os.path.abspath(resolved or local_dir)
+
+
 def _refresh_active_local(local_dir, environ=None, settings_path=None):
     """Re-resolve the active immutable build after the shared update lock."""
     if not _use_versioned_install(environ=environ, settings_path=settings_path):
         return os.path.abspath(local_dir)
-    resolved = resolve_active_installation(local_dir, environ=environ)
-    return os.path.abspath(resolved or local_dir)
+    return _effective_local_dir(local_dir, environ=environ)
+
+
+def _is_windows_swap_lock(error):
+    """Return True for Windows errors caused by a live/locked deployment.
+
+    Legacy in-place installs rename the entire plug-in directory.  WinError 32
+    (sharing violation) and WinError 5 (access denied, commonly another open
+    handle) are recoverable by switching to the immutable versioned installer.
+    """
+    if os.name != "nt":
+        return False
+    code = getattr(error, "winerror", None)
+    if code in (5, 32):
+        return True
+    # Some Python/Abaqus combinations expose only errno for Win32 failures.
+    errno_value = getattr(error, "errno", None)
+    return errno_value in (5, 13)
 
 
 def _default_sync(source_dir, local_dir, progress_callback=None, health_check=None,
@@ -243,10 +281,43 @@ def _default_sync(source_dir, local_dir, progress_callback=None, health_check=No
             health_check=health_check, environ=environ, source_label=source_label,
             before_activate=before_activate,
         )
-    return _synchronize_project(
-        source_dir, local_dir, progress_callback=progress_callback,
-        health_check=health_check,
-    )
+    try:
+        return _synchronize_project(
+            source_dir, local_dir, progress_callback=progress_callback,
+            health_check=health_check,
+        )
+    except OSError as exc:
+        if not _is_windows_swap_lock(exc):
+            raise
+        # A legacy flat install can be blocked by Abaqus, antivirus, Explorer,
+        # or a WinUx helper retaining a handle anywhere under the plug-in tree.
+        # Do not fail the update or keep retrying a destructive directory swap;
+        # install the exact same verified release into the immutable runtime
+        # store and atomically move only the tiny active-version pointer.
+        _notify_progress(
+            progress_callback, 40,
+            "The live WinUx folder is in use; switching to safe versioned install...",
+        )
+        result = _synchronize_versioned_project(
+            source_dir, local_dir, progress_callback=progress_callback,
+            health_check=health_check, environ=environ, source_label=source_label,
+            # In legacy mode the caller already closes the old instance before
+            # entering this function, so there is nothing left to close here.
+            before_activate=None,
+        )
+        # A sharing violation proves that this machine cannot safely maintain
+        # the old in-place swap workflow.  Persist the successful versioned
+        # migration so later launches do not repeatedly enter legacy mode.
+        try:
+            save_install_mode(
+                "versioned", environ=environ, settings_path=settings_path
+            )
+        except Exception as persist_exc:
+            _log(
+                "could not persist versioned install mode after legacy-lock "
+                "fallback: {}".format(persist_exc), environ
+            )
+        return result
 
 
 def _sync_result(status, result):
@@ -910,7 +981,7 @@ def check_for_updates(local_dir, server_dir=None, environ=None, settings_path=No
     legacy S:/shared-folder source remains the compatibility fallback.
     """
     environ = os.environ if environ is None else environ
-    local_dir = os.path.abspath(local_dir)
+    local_dir = _effective_local_dir(local_dir, environ=environ)
     if environ.get("WINUX_SKIP_UPDATE", "").strip() == "1":
         return {
             "provider": None,
@@ -984,6 +1055,10 @@ def update_local_if_newer(local_dir, server_dir=None, environ=None,
     Abaqus instances from swapping the same local folder concurrently.
     """
     environ = os.environ if environ is None else environ
+    # Resolve the active immutable runtime before comparing versions.  This
+    # prevents a stale flat 1.1.2 launcher path from re-triggering a 1.1.3
+    # update after 1.1.3 has already been activated successfully.
+    local_dir = _effective_local_dir(local_dir, environ=environ)
     started = time.time()
     version_cache = {}
     dialog_available = dialog_available or show_update_available

@@ -25,6 +25,7 @@ from ..widgets import (
 
 _DIALOGS = []
 _KEYS = None
+_DIALOG_REJECT_CAPTIONS = {"cancel", "close", "dismiss", "no"}
 
 
 def _editor_is_active():
@@ -67,6 +68,9 @@ def _install_keys():
     if _KEYS is None or not dpg.does_item_exist(_KEYS):
         with dpg.handler_registry() as _KEYS:
             dpg.add_key_press_handler(key=dpg.mvKey_Return, callback=_dispatch_return)
+            numpad_enter = getattr(dpg, "mvKey_NumPadEnter", None)
+            if numpad_enter is not None:
+                dpg.add_key_press_handler(key=numpad_enter, callback=_dispatch_return)
             for key in (dpg.mvKey_Up, dpg.mvKey_Down, dpg.mvKey_Home, dpg.mvKey_End,
                         dpg.mvKey_Prior, dpg.mvKey_Next, dpg.mvKey_A,
                         dpg.mvKey_Spacebar, dpg.mvKey_F2, dpg.mvKey_Delete, dpg.mvKey_C):
@@ -90,6 +94,14 @@ class QtDialog(DialogBase):
         self._resize_registry = None
         self._default = None
         self._default_button = None
+        self._reject = None
+        self._reject_button = None
+        self._focus_order = []
+        self._initial_focus_item = None
+        try:
+            self._focus_restore_item = dpg.get_focused_item() or None
+        except Exception:
+            self._focus_restore_item = None
         self._ui_thread = threading.get_ident()
         self._latest_updates = LatestCallQueue(view.after)
         self._widget_owner = QObject(after=view.after)
@@ -105,7 +117,7 @@ class QtDialog(DialogBase):
                         modal=self.modal, no_collapse=True, no_scrollbar=True,
                         no_scroll_with_mouse=True,
                         min_size=(DialogMetrics.MIN_DIALOG_WIDTH, DialogMetrics.MIN_DIALOG_HEIGHT),
-                        on_close=lambda: self._close_from_escape()):
+                        on_close=lambda: self.reject()):
             self.content = dpg.add_child_window(width=-1, height=-(DialogMetrics.FOOTER_HEIGHT+1) if footer else -1,
                                                 border=False, no_scrollbar=False, no_scroll_with_mouse=False,
                                                 always_use_window_padding=True)
@@ -147,12 +159,15 @@ class QtDialog(DialogBase):
             return False
         # Explorer's custom global pollers must not see through a dialog.
         register_modal_window(self.tag)
-        register_escape_target(self.tag, self._close_from_escape)
+        register_escape_target(self.tag, self.reject)
         if self in _DIALOGS:
             _DIALOGS.remove(self)
             _DIALOGS.append(self)
         dpg.show_item(self.tag)
         dpg.focus_item(self.tag)
+        # Like QWidget::show(), a re-shown QDialog restores child focus rather
+        # than leaving keyboard navigation on the top-level container.
+        self.view.after(0, self._focus_initial)
         return True
 
     lift = show
@@ -164,6 +179,10 @@ class QtDialog(DialogBase):
             dpg.hide_item(self.tag)
             unregister_escape_target(self.tag)
             unregister_modal_window(self.tag)
+            # QWidget::hide() releases child focus back to the parent just as
+            # destruction does.  Queue it so a sibling shown in the same UI
+            # transaction wins naturally instead of producing a focus flash.
+            self.view.after(0, self._restore_embedded_owner_focus)
 
     def post(self, command, *args, **kwargs):
         if self._closed:
@@ -211,16 +230,23 @@ class QtDialog(DialogBase):
             wrappers[button] = widget
         # ImGuiPushButton owns the shared state/theme contract.  Avoid rebinding
         # a second dialog-local theme here so hover/disabled/default behavior is
-        # identical in dialogs and non-dialog tool panels.
-        if default:
+        # identical in dialogs and non-dialog tool panels.  QDialog promotes the
+        # first primary action to the default button even when the caller did not
+        # spell out default=True; a focused push button still wins on Return.
+        if default or (str(role or "secondary").lower() == "primary" and self._default_button is None):
             self._default, self._default_button = callback, button
+            widget.setDefault(True)
+        caption = str(label or "").strip().lower().replace("&", "")
+        if caption in _DIALOG_REJECT_CAPTIONS and self._reject_button is None:
+            self._reject, self._reject_button = callback, button
+        self._remember_focusable(button)
         return button
 
     @staticmethod
     def action_width(label):
         return max(DialogMetrics.BUTTON_WIDTH, len(label) * 7 + 16)
 
-    def button_box(self, actions, left_actions=(), status_item=None, status_left_padding=0):
+    def button_box(self, actions, left_actions=(), status_item=None, status_left_padding=0, button_gap=None):
         """QDialogButtonBox-like layout with auxiliary actions on the left.
 
         The old footer placed status text and auxiliary buttons in the same
@@ -230,12 +256,13 @@ class QtDialog(DialogBase):
         """
         actions = list(actions or ())
         left_actions = list(left_actions or ())
+        button_gap = DialogMetrics.BUTTON_GAP if button_gap is None else max(0, int(button_gap))
 
         def group_width(items):
             if not items:
                 return 0
             return sum(self.action_width(item[0]) for item in items) + \
-                DialogMetrics.BUTTON_GAP * max(0, len(items) - 1)
+                button_gap * max(0, len(items) - 1)
 
         right_width = group_width(actions)
         left_width = group_width(left_actions)
@@ -264,7 +291,7 @@ class QtDialog(DialogBase):
             dpg.add_table_column(width_fixed=True, init_width_or_weight=max(1, right_width))
             with dpg.table_row():
                 if left_actions:
-                    with dpg.group(horizontal=True, horizontal_spacing=DialogMetrics.BUTTON_GAP) as left:
+                    with dpg.group(horizontal=True, horizontal_spacing=button_gap) as left:
                         self.left_buttons = [
                             self.action(label, callback, role, default, left)
                             for label, callback, role, default in left_actions
@@ -287,7 +314,7 @@ class QtDialog(DialogBase):
                             wrap=max(80, self.width-left_width-right_width-60-status_pad))
                 else:
                     dpg.add_spacer(width=1)
-                with dpg.group(horizontal=True, horizontal_spacing=DialogMetrics.BUTTON_GAP) as group:
+                with dpg.group(horizontal=True, horizontal_spacing=button_gap) as group:
                     return [
                         self.action(label, callback, role, default, group)
                         for label, callback, role, default in actions
@@ -486,6 +513,7 @@ class QtDialog(DialogBase):
             str(value), parent=native_parent, after=self.view.after, backend=dpg,
             width=requested_width, **options))
         self._control_wrappers[widget.tag] = widget
+        self._remember_focusable(widget.tag)
         return widget.tag
 
 
@@ -513,6 +541,10 @@ class QtDialog(DialogBase):
             dpg.bind_item_theme(item, plain_text_edit_theme())
         except Exception:
             pass
+        # QTextEdit/QPlainTextEdit own Return; QDialog must not translate it to
+        # the default button while this editor has focus.
+        self.enter_editors.add(item)
+        self._remember_focusable(item)
         return item
 
 
@@ -524,6 +556,7 @@ class QtDialog(DialogBase):
             step=step, callback=callback,
         ))
         self._control_wrappers[widget.tag] = widget
+        self._remember_focusable(widget.tag)
         return widget.tag
 
     def spin_float(self, value=0.0, parent=None, *, minimum=None, maximum=None,
@@ -534,6 +567,7 @@ class QtDialog(DialogBase):
             step=step, decimals=decimals, callback=callback,
         ))
         self._control_wrappers[widget.tag] = widget
+        self._remember_focusable(widget.tag)
         return widget.tag
 
     def checkbox(self, text="", *, checked=False, parent=None):
@@ -542,6 +576,7 @@ class QtDialog(DialogBase):
             text, checked=checked, parent=parent, after=self.view.after, backend=dpg,
         ))
         self._control_wrappers[widget.tag] = widget
+        self._remember_focusable(widget.tag)
         return widget.tag
 
     def radio_group(self, items=(), *, current=None, horizontal=False,
@@ -561,6 +596,7 @@ class QtDialog(DialogBase):
             callback=callback,
         ))
         self._control_wrappers[widget.tag] = widget
+        self._remember_focusable(widget.tag)
         return widget.tag
 
     def progress_bar(self, value=0.0, *, parent=None, overlay=None):
@@ -584,6 +620,7 @@ class QtDialog(DialogBase):
         registry = bind_combo_style(item)
         if registry is not None:
             self._control_handler_registries.append(registry)
+        self._remember_focusable(item)
         return item
 
     def set_control_enabled(self, item, enabled):
@@ -792,15 +829,119 @@ class QtDialog(DialogBase):
         with box:
             yield box.content
 
+    def _remember_focusable(self, item):
+        if item is not None and item not in self._focus_order:
+            self._focus_order.append(item)
+        return item
+
+    @staticmethod
+    def _item_is_focusable(item):
+        if item is None:
+            return False
+        try:
+            if not dpg.does_item_exist(item) or not dpg.is_item_shown(item):
+                return False
+            config = dpg.get_item_configuration(item) or {}
+            return bool(config.get("enabled", True))
+        except Exception:
+            return False
+
+    @staticmethod
+    def _item_belongs_to(item, ancestor):
+        if item is None or ancestor is None:
+            return False
+        try:
+            current = item
+            seen = set()
+            for _ in range(64):
+                if current == ancestor:
+                    return True
+                if not current or current in seen or not dpg.does_item_exist(current):
+                    break
+                seen.add(current)
+                current = (dpg.get_item_info(current) or {}).get("parent")
+            return False
+        except Exception:
+            return False
+
+    def set_initial_focus(self, item):
+        """Set the QWidget-style initial focus target for this dialog."""
+        self._initial_focus_item = item
+        self._remember_focusable(item)
+        return item
+
+    def _focus_initial(self):
+        if not self.winfo_exists() or not dpg.is_item_shown(self.tag):
+            return False
+        candidates = []
+        if self._initial_focus_item is not None:
+            candidates.append(self._initial_focus_item)
+        # Editors/options precede dialog buttons, matching QDialog tab order.
+        candidates.extend(item for item in self._focus_order if item != self._default_button)
+        if self._default_button is not None:
+            candidates.append(self._default_button)
+        for item in candidates:
+            if self._item_is_focusable(item):
+                try:
+                    dpg.focus_item(item)
+                    return True
+                except Exception:
+                    continue
+        try:
+            dpg.focus_item(self.tag)
+        except Exception:
+            return False
+        return True
+
+    def accept(self):
+        """QDialog-compatible accept action: invoke the current default action."""
+        self.invoke_default()
+
+    def reject(self):
+        """QDialog-compatible reject action preserving subclass Escape semantics."""
+        # Forms with a specialized Escape state machine (combo popup, inline
+        # editor, progress cancellation, etc.) remain authoritative.  Plain
+        # dialogs mirror QDialogButtonBox and invoke their registered reject
+        # button so X/Escape/Cancel share exactly one code path.
+        if type(self)._close_from_escape is DialogBase._close_from_escape:
+            if callable(self._reject) and self._item_is_focusable(self._reject_button):
+                self._reject()
+                return
+        self._close_from_escape()
+
     def invoke_default(self):
-        if not callable(self._default) or self._default_button is None:
-            return
-        if not dpg.get_item_configuration(self._default_button).get("enabled", True):
-            return
         # Multiline editors and result views own Enter; single-line forms use
         # QDialog's default action, with no duplicate on_enter callback.
-        if any(dpg.does_item_exist(item) and dpg.is_item_focused(item)
+        if any(self._item_is_focusable(item)
+               and (dpg.is_item_focused(item) or dpg.is_item_active(item))
                for item in self.enter_editors):
+            return
+        table = self.active_table
+        if table is not None:
+            try:
+                if table.hasFocus():
+                    return
+            except Exception:
+                pass
+
+        # QPushButton::autoDefault semantics: Return activates the focused push
+        # button before falling back to the dialog's default button.
+        try:
+            focused = dpg.get_focused_item()
+        except Exception:
+            focused = None
+        wrapper = self._control_wrappers.get(focused)
+        if isinstance(wrapper, QPushButton):
+            try:
+                if wrapper.isEnabled():
+                    wrapper.click()
+                    return
+            except Exception:
+                pass
+
+        if not callable(self._default) or self._default_button is None:
+            return
+        if not self._item_is_focusable(self._default_button):
             return
         self._default()
 
@@ -813,28 +954,35 @@ class QtDialog(DialogBase):
         return widget
 
     def _restore_embedded_owner_focus(self):
-        """Return Dear ImGui navigation focus to the main client safely.
+        """Restore the same child focus Qt would return to after QDialog close.
 
-        Embedded QDialogs share the application's native viewport.  Deleting a
-        focused modal window can leave ImGui's nav focus attached to an item
-        that no longer exists, so keyboard input appears lost until the user
-        clicks the main window.  Restore only when no newer embedded/floating
-        dialog is visible; this mirrors Qt's parent activation semantics without
-        stealing OS foreground focus from another application.
+        Nested dialogs return focus to the control that launched them.  When no
+        parent dialog remains, restore the previously focused main-window item;
+        only then fall back to the primary viewport.  Never steal OS focus while
+        a foreign floating dialog owns activation.
         """
         if getattr(self.view, "_floating_focus_suppressed", False):
             return
         try:
-            for dialog in tuple(_DIALOGS):
-                if dialog is self or not dialog.winfo_exists():
-                    continue
-                if dpg.does_item_exist(dialog.tag) and dpg.is_item_shown(dialog.tag):
-                    return
-            for dialog in tuple(getattr(self.view, "_floating_dialogs", ())):
-                if (not getattr(dialog, "_closed", False)
-                        and getattr(dialog, "_visible", False)):
-                    return
-            if dpg.does_item_exist("winux_primary"):
+            remaining = [
+                dialog for dialog in tuple(_DIALOGS)
+                if dialog is not self and dialog.winfo_exists()
+                and dpg.does_item_exist(dialog.tag) and dpg.is_item_shown(dialog.tag)
+            ]
+            if remaining:
+                parent = remaining[-1]
+                target = self._focus_restore_item
+                if (self._item_is_focusable(target)
+                        and self._item_belongs_to(target, parent.tag)):
+                    dpg.focus_item(target)
+                else:
+                    parent._focus_initial()
+                return
+
+            target = self._focus_restore_item
+            if self._item_is_focusable(target):
+                dpg.focus_item(target)
+            elif dpg.does_item_exist("winux_primary"):
                 dpg.focus_item("winux_primary")
         except Exception:
             pass

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import codecs
 import json
+import re
 import stat
 import threading
 import time
@@ -17,7 +18,91 @@ from .odb_history_live import build_remote_odb_history_live_script, parse_live_m
 class RemoteODBMixin:
     """Remote Abaqus ODB operations multiplexed over the shared SSH transport."""
 
-    def _resolve_abaqus_for_odb_on(self, client, path, abaqus_commands=None):
+    def _available_abaqus_candidates_on(self, client, candidates):
+        """Return only launchers visible in the remote login environment.
+
+        Compatibility probing is expensive because every failed candidate can
+        start a full Abaqus Python runtime.  Most clusters expose only a small
+        subset of WinUx's built-in fallback chain, so first resolve all command
+        names with one cheap ``command -v`` pass.  Discovery failures are
+        deliberately non-fatal and fall back to the original candidate list.
+        """
+        candidates = list(candidates or ())
+        if not candidates:
+            return []
+
+        cache_key = (
+            str(self.host or ""),
+            str(self.username or ""),
+            tuple(candidates),
+        )
+        now = time.monotonic()
+        with self._odb_abaqus_command_cache_lock:
+            cached = self._abaqus_available_command_cache.get(cache_key)
+        if cached:
+            cached_at, available = cached
+            if now - float(cached_at) <= self.ABAQUS_DISCOVERY_CACHE_SECONDS:
+                return list(available)
+
+        marker = "__WINUX_ABAQUS_FOUND__"
+        values = " ".join(self._shell_quote(value) for value in candidates)
+        discovery = (
+            "for _winux_cmd in {}; do "
+            "if command -v \"$_winux_cmd\" >/dev/null 2>&1; then "
+            "printf '{}%s\\n' \"$_winux_cmd\"; fi; done"
+        ).format(values, marker)
+        command = self._login_shell_command(discovery)
+        try:
+            status, output, _error = self._exec_client(
+                client, command, timeout=self.ABAQUS_DISCOVERY_TIMEOUT_SECONDS)
+        except Exception:
+            return candidates
+        if status != 0:
+            return candidates
+
+        candidate_set = set(candidates)
+        available = []
+        for line in str(output or "").splitlines():
+            line = line.strip()
+            if not line.startswith(marker):
+                continue
+            value = line[len(marker):].strip()
+            if value in candidate_set and value not in available:
+                available.append(value)
+
+        with self._odb_abaqus_command_cache_lock:
+            self._abaqus_available_command_cache[cache_key] = (
+                now, tuple(available))
+        return available
+
+    @staticmethod
+    def _prioritize_abaqus_candidates(candidates, *hints):
+        """Move valid cached hints to the front without removing fallbacks."""
+        candidates = list(candidates or ())
+        priority = []
+        for hint in hints:
+            if hint in candidates and hint not in priority:
+                priority.append(hint)
+        priority.extend(value for value in candidates if value not in priority)
+        return priority
+
+    @staticmethod
+    def _newest_first_abaqus_candidates(candidates):
+        """Sort explicit releases numerically, retaining custom launchers."""
+        def release_key(command):
+            launcher = str(command).rsplit("/", 1)[-1]
+            match = re.fullmatch(
+                r"(?:abq|abaqus)(20\d{2})(?:hf(\d+))?(?:[._-].*)?",
+                launcher, re.IGNORECASE)
+            if match:
+                return (0, -int(match.group(1)), -int(match.group(2) or 0))
+            if launcher.casefold() in ("abaqus", "abaqus.bat", "abaqus.cmd", "abaqus.exe"):
+                return (2, 0, 0)
+            return (1, 0, 0)
+        return sorted(candidates or (), key=release_key)
+
+    def _resolve_abaqus_for_odb_on(self, client, path, abaqus_commands=None,
+                                 *, newest_first=False):
         """Return the first installed Abaqus release that can open *path*.
 
         Importing ``odbAccess`` is not enough for ODB compatibility.  A newer
@@ -27,27 +112,59 @@ class RemoteODBMixin:
         every configured/fallback release and select the first one for which
         ``openOdb(..., readOnly=True)`` succeeds.
 
-        The configured default (normally ``abq2026``) remains the first
-        candidate.  If it cannot open the ODB WinUx automatically falls back
-        through ``abq2025``, ``abq2024``, ``abq2023`` ... and finally the
-        generic ``abaqus`` launcher.
+        On a cold session the configured default (normally ``abq2026``) is
+        preferred.  WinUx first removes launcher names that are not available
+        in the remote login environment, then promotes releases that succeeded
+        for this ODB, directory, or server earlier in the session.  Every hint
+        is still verified against the real ODB; failures continue through the
+        remaining configured/fallback releases and finally ``abaqus``.
+
+        Live Plots requests ``newest_first``: explicit release numbers are
+        always probed descending, even if a default or previous successful
+        ODB/directory/host hint names an older release.
         """
         path = PurePosixPath(str(path))
-        candidates = self._abaqus_candidate_commands(abaqus_commands)
-        cache_key = (str(self.host or ""), str(self.username or ""), str(path))
+        all_candidates = self._abaqus_candidate_commands(abaqus_commands)
+        if newest_first:
+            all_candidates = self._newest_first_abaqus_candidates(all_candidates)
+        candidates = self._available_abaqus_candidates_on(client, all_candidates)
+        identity = (str(self.host or ""), str(self.username or ""))
+        cache_key = identity + (str(path),)
+        directory_key = identity + (str(path.parent),)
         with self._odb_abaqus_command_cache_lock:
             cached = self._odb_abaqus_command_cache.get(cache_key)
-        if cached in candidates:
-            candidates.remove(cached)
-            candidates.insert(0, cached)
+            directory_hint = self._odb_abaqus_directory_hint_cache.get(directory_key)
+            host_hint = self._odb_abaqus_host_hint_cache.get(identity)
+        if newest_first:
+            # Discovery output/caches must not change the requested order.
+            available = set(candidates)
+            candidates = [value for value in all_candidates if value in available]
+        else:
+            candidates = self._prioritize_abaqus_candidates(
+                candidates, cached, directory_hint, host_hint)
+
+        if not candidates:
+            raise RuntimeError(
+                "None of the configured Abaqus commands are available on the "
+                "server login PATH. Checked: {}. Update Settings > Abaqus "
+                "Versions if the cluster uses a different launcher name."
+                .format(", ".join(all_candidates) or "(none)"))
 
         marker = "__WINUX_ODB_RELEASE_OK__"
         # Keep this one-line probe compatible with Abaqus releases that still
         # embed Python 2.  Passing the path as argv also avoids shell escaping
         # bugs for spaces/special characters in job directories.
+        # ``isUpgradeRequiredForOdb`` reads only the compatibility metadata and
+        # is substantially cheaper than opening a large database.  Use it as a
+        # fast rejection path for newer Abaqus releases before paying the full
+        # ``openOdb`` cost.  A False result is still verified with ``openOdb``
+        # so older-runtime/newer-ODB cases cannot be accepted accidentally.
         probe_code = (
-            "from odbAccess import openOdb; import sys; "
-            "odb=openOdb(path=sys.argv[1], readOnly=True); "
+            "from odbAccess import openOdb,isUpgradeRequiredForOdb; import sys; "
+            "p=sys.argv[1]; "
+            "needs=isUpgradeRequiredForOdb(upgradeRequiredOdbPath=p); "
+            "sys.exit(3) if needs else None; "
+            "odb=openOdb(path=p, readOnly=True); "
             "print(%r); odb.close()" % marker
         )
         attempted = []
@@ -65,6 +182,8 @@ class RemoteODBMixin:
             if status == 0 and marker in output:
                 with self._odb_abaqus_command_cache_lock:
                     self._odb_abaqus_command_cache[cache_key] = candidate
+                    self._odb_abaqus_directory_hint_cache[directory_key] = candidate
+                    self._odb_abaqus_host_hint_cache[identity] = candidate
                 return candidate
 
             detail = (error or output or "exit {}".format(status)).strip()
@@ -368,7 +487,7 @@ class RemoteODBMixin:
                 "message": "Detecting compatible Abaqus release...",
             })
             executable = self._resolve_abaqus_for_odb_on(
-                client, path, abaqus_commands)
+                client, path, abaqus_commands, newest_first=True)
             on_payload({
                 "type": "status", "state": "opening",
                 "message": "Opening ODB with {}...".format(executable),
@@ -570,4 +689,3 @@ class RemoteODBMixin:
                 self.sftp.remove(str(validator))
             except Exception:
                 pass
-

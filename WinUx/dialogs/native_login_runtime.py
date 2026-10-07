@@ -23,6 +23,7 @@ from ..platform.native_dialog_host import (
     center_native_dialog_over_owner,
     handoff_owner_before_close,
     is_native_window_foreground,
+    prepare_owned_dialog_stack,
 )
 from ..services.floating_protocol import encode_message
 
@@ -199,7 +200,7 @@ class NativeQtLoginRuntime:
         root.protocol("WM_DELETE_WINDOW", self._request_close)
         root.configure(background="#f0f0f0")
 
-        outer = ttk.Frame(root, style="WinUx.Qt.TFrame", padding=(10, 9, 10, 10))
+        outer = ttk.Frame(root, style="WinUx.Qt.TFrame", padding=(10, 9, 10, 14))
         outer.grid(row=0, column=0, sticky="nsew")
         outer.columnconfigure(0, weight=1)
 
@@ -336,6 +337,8 @@ class NativeQtLoginRuntime:
         if self.desired_visible:
             try:
                 self.root.deiconify()
+                if self.owner_hwnd and self.hwnd:
+                    prepare_owned_dialog_stack(self.owner_hwnd, self.hwnd)
                 self.root.lift()
                 self.root.focus_force()
                 self._focus_initial()
@@ -360,6 +363,8 @@ class NativeQtLoginRuntime:
                               "visible": self.desired_visible})
         if self.desired_visible:
             try:
+                if self.owner_hwnd and self.hwnd:
+                    prepare_owned_dialog_stack(self.owner_hwnd, self.hwnd)
                 self.root.lift()
                 self.root.focus_force()
                 self._focus_initial()
@@ -376,6 +381,8 @@ class NativeQtLoginRuntime:
             self.root.deiconify()
             if os.name == "nt" and self.hwnd and cloaked(self.hwnd):
                 set_cloaked(self.hwnd, False)
+            if self.owner_hwnd and self.hwnd:
+                prepare_owned_dialog_stack(self.owner_hwnd, self.hwnd)
             self.root.lift()
             self.root.focus_force()
             self._focus_initial()

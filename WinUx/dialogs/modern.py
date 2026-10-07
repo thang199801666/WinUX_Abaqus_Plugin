@@ -57,7 +57,7 @@ class ModernDialogMetrics:
     BUTTON_HEIGHT = 32
     BUTTON_GAP = 8
     FOOTER_PAD_X = 14
-    FOOTER_PAD_Y = 10
+    FOOTER_PAD_Y = 12
     ICON_SIZE = 36
     MIN_WIDTH = 410
     MIN_HEIGHT = 168

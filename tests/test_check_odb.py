@@ -299,14 +299,15 @@ class ODBIntegrationArchitectureTests(unittest.TestCase):
             SSHServerModel._exec_client = original
 
         self.assertEqual(command, "abq2023")
+        probe_calls = [call for call in calls if " python -c " in call[0]]
         self.assertEqual([
             next(name for name in ("abq2026", "abq2025", "abq2023")
                  if name + " python" in call[0])
-            for call in calls[:3]
+            for call in probe_calls[:3]
         ], ["abq2026", "abq2025", "abq2023"])
-        self.assertIn("Test Job/job.odb", calls[-1][0])
+        self.assertIn("Test Job/job.odb", probe_calls[-1][0])
         self.assertTrue(all(timeout == model.ABAQUS_PROBE_TIMEOUT_SECONDS
-                            for _command, timeout in calls[:3]))
+                            for _command, timeout in probe_calls[:3]))
 
     def test_odb_compatibility_resolver_reuses_successful_release_as_priority_hint(self):
         calls = []
@@ -333,14 +334,93 @@ class ODBIntegrationArchitectureTests(unittest.TestCase):
 
         self.assertEqual(first, "abq2023")
         self.assertEqual(second, "abq2023")
-        self.assertTrue(calls[0].find("abq2023 python") >= 0)
+        probe_calls = [call for call in calls if " python -c " in call]
+        self.assertTrue(probe_calls[0].find("abq2023 python") >= 0)
+
+
+    def test_odb_discovery_skips_missing_launchers_before_heavy_probe(self):
+        calls = []
+        original = SSHServerModel._exec_client
+
+        def fake_exec(_client, command, timeout=None):
+            calls.append((command, timeout))
+            if "command -v" in command:
+                return 0, "\n".join((
+                    "__WINUX_ABAQUS_FOUND__abq2023",
+                    "__WINUX_ABAQUS_FOUND__abaqus",
+                )), ""
+            if "abq2023 python" in command:
+                return 0, "__WINUX_ODB_RELEASE_OK__", ""
+            return 1, "", "should not be probed"
+
+        model = SSHServerModel()
+        model.host = "cluster"
+        model.username = "tester"
+        try:
+            SSHServerModel._exec_client = staticmethod(fake_exec)
+            command = model._resolve_abaqus_for_odb_on(
+                object(), "/scratch/job.odb",
+                ["abq2026", "abq2025", "abq2023"])
+        finally:
+            SSHServerModel._exec_client = original
+
+        self.assertEqual(command, "abq2023")
+        probe_commands = [command for command, _timeout in calls
+                          if " python -c " in command]
+        self.assertEqual(len(probe_commands), 1)
+        self.assertIn("abq2023 python", probe_commands[0])
+        self.assertNotIn("abq2026 python", "\n".join(probe_commands))
+        self.assertNotIn("abq2025 python", "\n".join(probe_commands))
+        discovery_calls = [item for item in calls if "command -v" in item[0]]
+        self.assertEqual(len(discovery_calls), 1)
+        self.assertEqual(
+            discovery_calls[0][1], model.ABAQUS_DISCOVERY_TIMEOUT_SECONDS)
+
+    def test_odb_discovery_and_host_hint_are_reused_for_next_job(self):
+        calls = []
+        original = SSHServerModel._exec_client
+
+        def fake_exec(_client, command, timeout=None):
+            calls.append((command, timeout))
+            if "command -v" in command:
+                return 0, "\n".join((
+                    "__WINUX_ABAQUS_FOUND__abq2026",
+                    "__WINUX_ABAQUS_FOUND__abq2023",
+                )), ""
+            if "abq2023 python" in command:
+                return 0, "__WINUX_ODB_RELEASE_OK__", ""
+            if "abq2026 python" in command:
+                return 1, "", "release mismatch"
+            return 1, "", "unexpected"
+
+        model = SSHServerModel()
+        model.host = "cluster"
+        model.username = "tester"
+        try:
+            SSHServerModel._exec_client = staticmethod(fake_exec)
+            first = model._resolve_abaqus_for_odb_on(
+                object(), "/scratch/job-a/job-a.odb", ["abq2026", "abq2023"])
+            calls[:] = []
+            second = model._resolve_abaqus_for_odb_on(
+                object(), "/scratch/job-b/job-b.odb", ["abq2026", "abq2023"])
+        finally:
+            SSHServerModel._exec_client = original
+
+        self.assertEqual(first, "abq2023")
+        self.assertEqual(second, "abq2023")
+        self.assertFalse(any("command -v" in command for command, _timeout in calls))
+        probe_commands = [command for command, _timeout in calls
+                          if " python -c " in command]
+        self.assertEqual(len(probe_commands), 1)
+        self.assertIn("abq2023 python", probe_commands[0])
 
     def test_server_odb_tools_probe_the_real_database_for_release_compatibility(self):
         source = REMOTE_ODB.read_text(encoding="utf-8")
         facade = SERVER.read_text(encoding="utf-8")
         self.assertIn("RemoteODBMixin", facade)
         self.assertIn("def _resolve_abaqus_for_odb_on", source)
-        self.assertIn("odb=openOdb(path=sys.argv[1], readOnly=True)", source)
+        self.assertIn("isUpgradeRequiredForOdb(upgradeRequiredOdbPath=p)", source)
+        self.assertIn("odb=openOdb(path=p, readOnly=True)", source)
         self.assertIn("Detecting compatible Abaqus release", source)
         self.assertGreaterEqual(
             source.count("self._resolve_abaqus_for_odb_on("), 4)

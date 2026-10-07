@@ -178,6 +178,7 @@ class WindowsIconRegistry:
 
     @classmethod
     def _add_texture(cls, image: Image.Image, tag: str):
+        """Upload one Windows Shell icon at the legacy 16px contract."""
         cls._ensure_texture_registry()
         image = image.convert("RGBA")
         if image.size != (ICON_SIZE, ICON_SIZE):
@@ -191,6 +192,34 @@ class WindowsIconRegistry:
         return dpg.add_static_texture(
             width=ICON_SIZE,
             height=ICON_SIZE,
+            default_value=pixels,
+            tag=tag,
+            parent=cls._texture_registry,
+        )
+
+    @classmethod
+    def _add_native_texture(cls, image: Image.Image, tag: str):
+        """Upload an RGBA image without silently forcing it to 16x16.
+
+        Shell/list-view icons intentionally keep the historical 16px contract
+        through :meth:`_add_texture`.  Toolbar resources, however, are already
+        rasterized for their final device-pixel size and must be uploaded 1:1;
+        resampling them back to 16px and stretching them again in Dear ImGui
+        destroys edge contrast on Windows.
+        """
+        cls._ensure_texture_registry()
+        image = image.convert("RGBA")
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            raise ValueError("Texture dimensions must be positive.")
+
+        pixels = [channel / 255.0 for channel in image.tobytes()]
+        if dpg.does_item_exist(tag):
+            dpg.delete_item(tag)
+
+        return dpg.add_static_texture(
+            width=width,
+            height=height,
             default_value=pixels,
             tag=tag,
             parent=cls._texture_registry,
@@ -254,6 +283,33 @@ class WindowsIconRegistry:
             SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
         )
         return info.hIcon if result else None
+
+    @staticmethod
+    def _center_visible_icon(image: Image.Image) -> Image.Image:
+        """Center the *visible* Shell glyph inside its 16 px texture.
+
+        Windows small HICONs can contain asymmetric transparent padding.  A
+        correctly centered Dear ImGui image widget can therefore still look
+        vertically/horizontally offset.  Normalize the alpha bounds without
+        scaling the glyph so row alignment is based on visible pixels, not the
+        HICON canvas.
+        """
+        image = image.convert("RGBA")
+        alpha = image.getchannel("A")
+        # Ignore tiny anti-aliased fringe pixels when finding visual bounds.
+        mask = alpha.point(lambda value: 255 if value > 8 else 0)
+        bbox = mask.getbbox()
+        if not bbox:
+            return image
+        glyph = image.crop(bbox)
+        width, height = glyph.size
+        if width > ICON_SIZE or height > ICON_SIZE:
+            return image
+        canvas = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
+        x = (ICON_SIZE - width) // 2
+        y = (ICON_SIZE - height) // 2
+        canvas.alpha_composite(glyph, (x, y))
+        return canvas
 
     @classmethod
     def _hicon_to_image(cls, hicon) -> Optional[Image.Image]:
@@ -335,7 +391,7 @@ class WindowsIconRegistry:
                 )
                 image.putalpha(alpha)
 
-            return image
+            return cls._center_visible_icon(image)
         finally:
             if old_bitmap:
                 gdi32.SelectObject(memory_dc, old_bitmap)

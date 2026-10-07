@@ -212,3 +212,14 @@ def test_child_bootstrap_switches_import_root_to_new_active_version(tmp_path, mo
     assert run_winux.sys.path[0] == str(active.resolve())
     assert str(old.resolve()) not in run_winux.sys.path
     assert os.environ["WINUX_APP_DIR"] == str(active.resolve())
+
+
+def test_newer_bundled_hotfix_is_not_shadowed_by_older_active_runtime(tmp_path):
+    bundled = _deployment(tmp_path / "bundled", "1.6.46")
+    active = _deployment(tmp_path / "profile" / "WinUx" / "runtime" / "versions" / "1.6.45", "1.6.45")
+    environ = {"LOCALAPPDATA": str(tmp_path / "profile")}
+    state.write_state("1.6.45", [], environ=environ)
+
+    resolved = state.resolve_active_installation(str(bundled), environ=environ)
+    assert resolved == str(bundled.resolve())
+    assert winux_update_manifest.read_version(active) == "1.6.45"

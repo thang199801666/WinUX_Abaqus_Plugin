@@ -1,15 +1,12 @@
 """Qt/Fusion-like editable combo box implemented with Dear PyGui only.
 
-The control deliberately uses one *full-width* native ``mvCombo`` as the visual
-frame and popup owner, then places a borderless ``mvInputText`` over the preview
-region.  This mirrors Qt's editable QComboBox composition: one outer frame, an
-editable line edit inside it, and one arrow sub-control at the right.  Because
-the native combo spans the entire control, Dear ImGui anchors the drop-down to
-the full control width instead of to a tiny arrow-only widget.
-
-The editor is an overlay only over the preview region; the native combo arrow
-remains exposed and owns the popup interaction.  No nested WinUx popup, child
-drop-down or font arrow glyph is used.
+The editable text field and the history drop-down share one visual shell, but
+use Dear ImGui's native combo popup stack so the list remains visible above
+modal dialogs.  The input is submitted first and reserves the arrow strip; a
+full-width transparent ``mvCombo`` is then drawn over the shell.  ImGui's
+first-item hover rule leaves text clicks with the input while the uncovered
+right-hand arrow remains owned by the combo.  Because the combo itself spans
+the complete shell, its native drop-down inherits the full control width.
 """
 from __future__ import annotations
 
@@ -85,7 +82,7 @@ def _arrow_theme(*, disabled=False):
     if dpg.does_item_exist(tag):
         return tag
     p = QtFusionPalette
-    base = p.BUTTON_DISABLED if disabled else p.BASE
+    base = (0, 0, 0, 0)
     # Qt/Fusion keeps the arrow area only subtly different from the editor.
     # That visual edge replaces the old thick separator strip.
     arrow = p.BUTTON_DISABLED if disabled else (248, 248, 248, 255)
@@ -95,6 +92,9 @@ def _arrow_theme(*, disabled=False):
     text = p.TEXT_DISABLED if disabled else p.TEXT
     with dpg.theme(tag=tag):
         with dpg.theme_component(dpg.mvCombo):
+            # The combo spans the whole shell only to own a modal-safe native
+            # popup.  Its preview frame stays transparent so the real editable
+            # InputText underneath remains the visible editor.
             dpg.add_theme_color(dpg.mvThemeCol_FrameBg, base)
             dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, base)
             dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, base)
@@ -119,12 +119,13 @@ def _arrow_theme(*, disabled=False):
 
 
 class ImGuiComboBox:
-    """Editable QComboBox-like retained control with one native outer frame.
+    """Editable QComboBox-like retained control with reliable text editing.
 
-    ``mvCombo`` spans the complete control and owns the drop-down.  A borderless
-    editable ``mvInputText`` is layered over only the preview region.  The result
-    is one visual control rather than an InputText and arrow widget glued
-    together, while popup geometry remains native Dear ImGui behavior.
+    A borderless ``mvInputText`` owns the editable area while a transparent,
+    full-width native ``mvCombo`` owns the arrow and modal-safe history popup.
+    The input is submitted first and stops before the arrow strip, so text
+    clicks still activate the real editor even though both controls share the
+    same visual shell.
     """
 
     ARROW_WIDTH = METRICS.arrow_width
@@ -166,41 +167,46 @@ class ImGuiComboBox:
         self.shell = self.container
         dpg.bind_item_theme(self.shell, _shell_theme())
 
-        # The native combo is intentionally full-width.  Do NOT use
-        # ``no_preview=True`` here: Dear ImGui makes a no-preview combo only as
-        # wide as its arrow button, which is exactly why earlier WinUx builds
-        # produced a narrow popup anchored to the right edge.
-        self.button = dpg.add_combo(
-            self.items,
-            label="",
-            parent=self.shell,
-            width=-1,
-            pos=(0, 0),
-            default_value=self._native_value_for(self._value),
-            no_preview=False,
-            popup_align_left=True,
-            fit_width=False,
-            callback=self._native_selected,
-        )
-        dpg.bind_item_theme(self.button, _arrow_theme())
+        # The editor is submitted before the transparent popup owner and stops
+        # before the arrow strip.  ImGui therefore gives text-region hover/click
+        # ownership to InputText, while only the uncovered right-hand strip is
+        # available to the native combo's arrow.
+        self._row = dpg.add_group(
+            parent=self.shell, horizontal=True, horizontal_spacing=0, pos=(1, 1))
 
-        # Overlay the editable field on the combo preview only.  Negative width
-        # follows ImGui's fill-minus-N convention, so it tracks dialog resizing
-        # without a table or a second independently-sized widget.  One pixel is
-        # left before the arrow sub-control to read as a Qt separator.
         editor_right_reserve = self.ARROW_WIDTH + 1
         self.input = dpg.add_input_text(
             tag=self.tag,
-            parent=self.shell,
+            parent=self._row,
             default_value=self._value,
             width=-editor_right_reserve,
-            pos=(1, 1),
             readonly=not self.editable,
             callback=self._input_changed,
             on_enter=False,
             auto_select_all=False,
         )
         dpg.bind_item_theme(self.input, _input_theme())
+
+        # Native modal-safe popup owner.  This combo deliberately spans the
+        # complete shell so Dear ImGui gives its drop-down the same minimum
+        # width.  It is created *after* the editor, while the editor itself is
+        # narrower by ARROW_WIDTH.  Therefore InputText wins hit testing over
+        # the text region and the combo wins only in the uncovered arrow strip.
+        # The preview value is kept empty and the frame is transparent, so the
+        # user sees exactly one editor rather than two overlapping controls.
+        self.button = dpg.add_combo(
+            self.items,
+            label="",
+            parent=self.shell,
+            pos=(0, 0),
+            width=-1,
+            default_value="",
+            no_preview=False,
+            popup_align_left=True,
+            fit_width=False,
+            callback=self._native_selected,
+        )
+        dpg.bind_item_theme(self.button, _arrow_theme())
 
         # Compatibility names retained for callers written against earlier
         # wrappers. The native combo itself is the popup/list owner.
@@ -257,10 +263,10 @@ class ImGuiComboBox:
         self._value = str(value or "")
         if dpg.does_item_exist(self.input):
             dpg.set_value(self.input, self._value)
-        if self.button and dpg.does_item_exist(self.button) and self._value in self.items:
-            # The preview is hidden, but keeping the native combo selection in
-            # sync makes its popup highlight the same item as the editor.
-            dpg.set_value(self.button, self._value)
+        if self.button and dpg.does_item_exist(self.button):
+            # Keep the overlay preview blank; selection is mirrored only into
+            # the editable InputText.  The history list remains unchanged.
+            dpg.set_value(self.button, "")
         new_index = self.current_index() if dpg.does_item_exist(self.input) else -1
         if old_text != self._value:
             self.currentTextChanged.emit(self._value)
@@ -369,10 +375,8 @@ class ImGuiComboBox:
         if not self.button or not dpg.does_item_exist(self.button):
             return
         dpg.configure_item(self.button, items=list(self.items))
-        if self.current_text() in self.items:
-            dpg.set_value(self.button, self.current_text())
-        elif self.items:
-            dpg.set_value(self.button, self.items[0])
+        # Never draw a second preview over the editable field.
+        dpg.set_value(self.button, "")
 
     def _native_selected(self, sender=None, app_data=None, user_data=None):
         value = str(app_data or "")
@@ -385,6 +389,8 @@ class ImGuiComboBox:
             return
         self._native_popup_hint = False
         self.set_current_text(value, emit=True)
+        if self.button and dpg.does_item_exist(self.button):
+            dpg.set_value(self.button, "")
         self.activated.emit(self.current_index())
 
     # -------------------------------------------------------------- behavior
@@ -455,21 +461,23 @@ class ImGuiComboBox:
             self._geometry_handlers = None
 
     def _sync_geometry(self, *_args):
-        # The negative width already tracks the right edge. Reasserting pos is
-        # cheap and protects against Dear ImGui cursor/layout state changes when
-        # dialogs are reparented or DPI changes at runtime.
+        # The horizontal row owns layout; only reassert the fill-minus-arrow
+        # editor width and compact arrow width after DPI/reparent changes.
+        if self._row and dpg.does_item_exist(self._row):
+            try:
+                dpg.configure_item(self._row, pos=(1, 1))
+            except Exception:
+                pass
         if self.input and dpg.does_item_exist(self.input):
             try:
-                dpg.configure_item(
-                    self.input,
-                    pos=(1, 1),
-                    width=-(self.ARROW_WIDTH + 1),
-                )
+                dpg.configure_item(self.input, width=-(self.ARROW_WIDTH + 1))
             except Exception:
                 pass
         if self.button and dpg.does_item_exist(self.button):
             try:
-                dpg.configure_item(self.button, pos=(0, 0), width=-1)
+                # Keep Dear ImGui's popup owner bound to the complete available
+                # shell width. Negative width tracks DPI/reflow automatically.
+                dpg.configure_item(self.button, width=-1, pos=(0, 0))
             except Exception:
                 pass
 
@@ -546,8 +554,10 @@ class ImGuiComboBox:
             old_index = -1
         self._value = value
         new_index = self.current_index()
-        if self.button and dpg.does_item_exist(self.button) and value in self.items:
-            dpg.set_value(self.button, value)
+        if self.button and dpg.does_item_exist(self.button):
+            # The native combo owns only the arrow/popup.  Never let its preview
+            # paint a duplicate value over the editable InputText.
+            dpg.set_value(self.button, "")
         if value != old:
             self.editTextChanged.emit(value)
             self.currentTextChanged.emit(value)

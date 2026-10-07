@@ -247,11 +247,11 @@ def qt_item_row_theme(backend, *, selected=False, disabled=False, current=False,
                 text = p.TEXT_DISABLED
                 border = p.SELECTION_INACTIVE_BORDER
             elif selected and active:
-                selected_fill = p.HIGHLIGHT
-                hover = p.PRIMARY_HOVER
-                pressed = p.PRIMARY_ACTIVE
-                text = p.HIGHLIGHT_TEXT
-                border = p.FOCUS
+                selected_fill = p.SELECTION_ACTIVE
+                hover = p.SELECTION_ACTIVE_HOVER
+                pressed = p.SELECTION_ACTIVE_PRESSED
+                text = p.SELECTION_TEXT
+                border = p.SELECTION_BORDER
             elif selected:
                 selected_fill = p.SELECTION_INACTIVE
                 hover = p.SELECTION_INACTIVE
@@ -308,7 +308,7 @@ def qt_item_text_theme(backend, *, selected=False, disabled=False, active=True):
             return tag
     except Exception:
         pass
-    color = p.HIGHLIGHT_TEXT if selected else p.TEXT
+    color = p.SELECTION_TEXT if selected else p.TEXT
     if selected and not active:
         color = p.TEXT
     if disabled:

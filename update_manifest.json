@@ -1,5 +1,5 @@
 {
-  "file_count": 964,
+  "file_count": 1034,
   "files": [
     {
       "path": ".gitattributes",
@@ -33,8 +33,8 @@
     },
     {
       "path": "run_winux.py",
-      "sha256": "f29fb772b643f9ce547e562c58e5e803842413d6602a17105d76ff79180bc03b",
-      "size": 14744
+      "sha256": "afda4e3826795b69ff0c4308b9236f33c24eb43dec03b07f5cef3338dcf7ef9f",
+      "size": 15706
     },
     {
       "path": "tests/conftest.py",
@@ -72,9 +72,14 @@
       "size": 5288
     },
     {
+      "path": "tests/test_bootstrap_hotfix_precedence_rev36.py",
+      "sha256": "9f017f48e28aa802d323ff4c0d6b76ca28aca00bf568376ac3c7f1dda4fd9cc5",
+      "size": 619
+    },
+    {
       "path": "tests/test_check_odb.py",
-      "sha256": "4e0e5c1c4c10593e0c2ad9828327f83b45a295d79de84aee2cd1b9cc8412de70",
-      "size": 16672
+      "sha256": "7013c1aa8f07c5de7da9366dc4041ff667be6bf0234df2a14a09e0a763bdd012",
+      "size": 20179
     },
     {
       "path": "tests/test_checkbox_wrappers.py",
@@ -133,8 +138,13 @@
     },
     {
       "path": "tests/test_dialog_flicker_regressions.py",
-      "sha256": "6aa593ecc14b3e739dc9d94ef05f903570fcb1d39c9e227afd7ce169fb4e567d",
-      "size": 22310
+      "sha256": "1239b1a85d35cb4caf0b79b45693b44639d0d0787f5ff75850d5cae981ca5be6",
+      "size": 23961
+    },
+    {
+      "path": "tests/test_dialog_footer_spacing_rev39.py",
+      "sha256": "dd39d269fd506cd7d823ebec315a0adfdd8a3aa307609670566c172728e8e75a",
+      "size": 944
     },
     {
       "path": "tests/test_dialog_logic.py",
@@ -150,6 +160,16 @@
       "path": "tests/test_dialog_prewarm.py",
       "sha256": "02b32c225f0c3f30bb1063b19bfca2dde4dc1c847a88ddac3f0a29647e027bfc",
       "size": 3784
+    },
+    {
+      "path": "tests/test_dialog_zorder_rev47.py",
+      "sha256": "1d4c0456efb80e942c5cd6af99e4bfae555069a2c8f9a285153e362828a3cf04",
+      "size": 2727
+    },
+    {
+      "path": "tests/test_dpg_callback_pump_rev36.py",
+      "sha256": "4eae2dea1dc7ae476c58c5a2aa457f980e42726b075d132e88dfd044067fc990",
+      "size": 2048
     },
     {
       "path": "tests/test_dpg_dialog_migration.py",
@@ -227,9 +247,174 @@
       "size": 9496
     },
     {
+      "path": "tests/test_floating_runtime_size_guard_rev36.py",
+      "sha256": "ed931a2741740151fa1711c47ac10ce9e7d5431a2249a4d3f7e1d2b2301efb49",
+      "size": 994
+    },
+    {
+      "path": "tests/test_folder_browser_drive_click_release_rev40.py",
+      "sha256": "f7c05c3791a17235d4015a0b44dae84fcf775d285bf591e6f8b8c82947828607",
+      "size": 1019
+    },
+    {
+      "path": "tests/test_folder_browser_polish_rev34.py",
+      "sha256": "360e8dadf6b44640f8869137ebd186a022335b097584b5e64aa3fc46b47f00c3",
+      "size": 1510
+    },
+    {
+      "path": "tests/test_folder_browser_polish_rev35.py",
+      "sha256": "a715c3b40d5564821883464586cc00e50b24cfe1fc51db1f0eb583d43b04f830",
+      "size": 1145
+    },
+    {
+      "path": "tests/test_folder_browser_polish_rev37.py",
+      "sha256": "72fced653824fececbfccc72e90d638649104e2d0413b2ef66877acef70429e4",
+      "size": 1080
+    },
+    {
+      "path": "tests/test_folder_browser_qt_behavior_rev37.py",
+      "sha256": "19e55eca12c9b24deeab5aadb4583c18975f4f08d5204c73725b58259bca76bf",
+      "size": 1470
+    },
+    {
+      "path": "tests/test_folder_browser_qt_sidebar_rev38.py",
+      "sha256": "e812d726c98d075054ff76447c7b2962f68e7fda0f7450d2ab908731cff4366b",
+      "size": 1191
+    },
+    {
+      "path": "tests/test_folder_browser_qt_sidebar_rev39.py",
+      "sha256": "503296c74b76b0b5f68dbc9c0012a4e94a795f39849f4af07d4462ebbf4f365d",
+      "size": 893
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev38.py",
+      "sha256": "af248423c6b7952fd710f367a4353002df5d02f9b538ef4346f57f19daf128d1",
+      "size": 1922
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev40.py",
+      "sha256": "2bbcd2079be8892ea4246466b19c5e0d4d39ac070310e4604a58ff800a52074e",
+      "size": 1508
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev41.py",
+      "sha256": "317a47aa6457f45e4cf73cfeb3d1552ec4e9d01b8838262676481201ab179ceb",
+      "size": 1785
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev42.py",
+      "sha256": "435613e5e63fdd5df3c37088fd4fecfca2f2c3d278f115cd15897e81076eda0f",
+      "size": 1755
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev43.py",
+      "sha256": "da878f79b4971fd9d8ee545fc246c9660d5db94d21fc57bf3b83d61e7845faf9",
+      "size": 1367
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev44.py",
+      "sha256": "c39a6e406fed5aab0009461bd7d243a750432d070ad0797e9ad0365e3be203c6",
+      "size": 1073
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev45.py",
+      "sha256": "83eca1bede7a21f638e9e4c53dcd7201cbd979db7e3e818f5bf83f26e11523e7",
+      "size": 1009
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev46.py",
+      "sha256": "f686f04f6fcc986bae54f5d2474c6d97c3a0d96179fd9624e558bd82eabf415e",
+      "size": 1084
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev47.py",
+      "sha256": "a479cc85011b3acd0ab8a27dbe67bfcc52e26c5b463389123660be581cabaf53",
+      "size": 1476
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev48.py",
+      "sha256": "f74d7bd75f0719661b06343515560798322726ee205b7717549088247244985a",
+      "size": 1747
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev49.py",
+      "sha256": "e41d3b44ececbcfd4a9b57dd4ea5bfbb408c1008156c0c33367d41a603fc3be1",
+      "size": 810
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev50.py",
+      "sha256": "af829ae272b61bd0c8fa881750c52455c79565f51164944c45df2c8b989df5e8",
+      "size": 600
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev51.py",
+      "sha256": "c88cc0e9f85e2264b5d46fd5e69b76ec2a05f7bf3a6e162b93a8aae4547277e9",
+      "size": 695
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev52.py",
+      "sha256": "c4b41df27a121eced8cfe88cde15ccf020c28c41d41ff7b5330176cbb5e1395b",
+      "size": 642
+    },
+    {
+      "path": "tests/test_folder_browser_qt_visual_rev53.py",
+      "sha256": "7875d1220de077df5a0605b537871fbc9e453624bc8460170009c41b95b911e8",
+      "size": 613
+    },
+    {
+      "path": "tests/test_folder_browser_stability_rev36.py",
+      "sha256": "bd9cba355a754299e7dc170074bb80ac8ff76214ebe74153325a13031e8e7ec1",
+      "size": 1730
+    },
+    {
+      "path": "tests/test_folder_browser_tuple_guard_rev36.py",
+      "sha256": "ff1857d6eb9bba5e6ba1e6238836ce2d86c0aaa754a98687084acb0379725e9b",
+      "size": 599
+    },
+    {
       "path": "tests/test_folder_chooser.py",
       "sha256": "f96e4ad52047fa18da27f12655f8ca7fa2f4d41564c7cac5dc3f884b0c82a622",
       "size": 1426
+    },
+    {
+      "path": "tests/test_folder_selector_crisp_render_rev38.py",
+      "sha256": "c993af0e9a0b4fbb83cc52db458965a7a8b08e9e5a8df9362b2fdda9981a71e4",
+      "size": 1329
+    },
+    {
+      "path": "tests/test_folder_selector_generated_icons_rev34.py",
+      "sha256": "20fa8f7a9c573977f44c1a95c0613018c9ec789cfc6e859675641f5528b9be0b",
+      "size": 1455
+    },
+    {
+      "path": "tests/test_folder_selector_generated_icons_size_rev35.py",
+      "sha256": "a43341c44ef3f1d8c62c2a5aa604b4281ee82c9dd04df38a2e4bcb306ceabc18",
+      "size": 953
+    },
+    {
+      "path": "tests/test_folder_selector_icon_crisp_assets_rev37.py",
+      "sha256": "a08d6776a8a71ac091ce10d535fb6d815eccd38fb599d91338f9df2684c971e0",
+      "size": 906
+    },
+    {
+      "path": "tests/test_folder_selector_icon_fill_rev36.py",
+      "sha256": "f5b8af261c943888487c6cc8d679e5f191e37e761614b7450eca91111dec4d1e",
+      "size": 1726
+    },
+    {
+      "path": "tests/test_folder_selector_icon_sync_rev41.py",
+      "sha256": "0e8430be79934b77c87986136221cdc933929451d7937dc47c789b9c9b98a916",
+      "size": 1588
+    },
+    {
+      "path": "tests/test_folder_selector_native_texture_rev39.py",
+      "sha256": "1bc7580d7463ad75920eac549764172784a4f341f5be5f33360209a24e05db49",
+      "size": 1109
+    },
+    {
+      "path": "tests/test_folder_selector_toolbar_polish_rev40.py",
+      "sha256": "26ffc949219f01fd9321ddffb7f85b59eaf318294ecd97e8abe9734c16cee91a",
+      "size": 1387
     },
     {
       "path": "tests/test_github_release_integration.py",
@@ -240,6 +425,11 @@
       "path": "tests/test_github_update_provider_phase17.py",
       "sha256": "42d161610eaac352f89eb3bf3bd61e1916eec241dc4d5f716d06135552b02e6c",
       "size": 12057
+    },
+    {
+      "path": "tests/test_global_explorer_selection_palette_rev53.py",
+      "sha256": "1a38874e4da6fc3adc08d66a89e8c9124a816f34017792c0e930b2b505115f87",
+      "size": 1525
     },
     {
       "path": "tests/test_grid_layout.py",
@@ -318,8 +508,8 @@
     },
     {
       "path": "tests/test_job_plots.py",
-      "sha256": "913178daa56f44fa4777c187d652001ff1a221b25f3ddf21661aa8399ad3058a",
-      "size": 29068
+      "sha256": "c9e732a26c9e241c4f570a40855ba419a3f853af45cc2982e2b75256e3368832",
+      "size": 29083
     },
     {
       "path": "tests/test_job_refresh_concurrency.py",
@@ -448,7 +638,7 @@
     },
     {
       "path": "tests/test_qt_component_polish_rev13.py",
-      "sha256": "9adf0e326b69d63b40918c45fbabdfbf103ff841e23157272f8bb826e641d171",
+      "sha256": "ddb01c2772006a270ad8f77a72503f27b82e3ecb47176b310db29faee74d00b1",
       "size": 2314
     },
     {
@@ -487,13 +677,18 @@
       "size": 1563
     },
     {
+      "path": "tests/test_qt_dialog_behavior_rev48.py",
+      "sha256": "d4657b3e6a536c0105f116425dd5338b001aa66e14e80c94a295074a17a68fc5",
+      "size": 1960
+    },
+    {
       "path": "tests/test_qt_dialog_lifecycle.py",
       "sha256": "a6539d0099f07ab339000ed4522ef1ce34d12c39d4f944f3eb3231584b8f55a5",
       "size": 8291
     },
     {
       "path": "tests/test_qt_dialog_style.py",
-      "sha256": "d993a4f699285e4fb7ac5c5dc14d67bef262514531fb05a42bcf7c98d02d42d0",
+      "sha256": "940ec36519b5feda7696bb5e2b0dfd89ee45e5641f612f48d494ad3d662ca606",
       "size": 4274
     },
     {
@@ -637,6 +832,46 @@
       "size": 1127
     },
     {
+      "path": "tests/test_ssh_console_context_menu_rev31.py",
+      "sha256": "61a3f07542da1b16218a8177e8fd41b23ad6987dfcf175a8864875f9637c3d86",
+      "size": 2190
+    },
+    {
+      "path": "tests/test_ssh_console_context_menu_rev32.py",
+      "sha256": "c7ab3b6ba28ec548eb91f2a517ad361bb5af3a91a7e2129ce8ad7050c252649d",
+      "size": 1947
+    },
+    {
+      "path": "tests/test_ssh_console_context_menu_rev33.py",
+      "sha256": "a467db47aa4a663fba999a3808213363f0e4453452dc7c7ad2b227e7bbcb3fc3",
+      "size": 2572
+    },
+    {
+      "path": "tests/test_ssh_console_context_menu_rev34.py",
+      "sha256": "1555046372490831aea820c98c981d3045ce7783872ac88138f8096425dad287",
+      "size": 2381
+    },
+    {
+      "path": "tests/test_ssh_console_context_menu_rev35.py",
+      "sha256": "11a2cd6713905c478b92a030b4a2a3dd95aaae3d2581cbc29a8f7cf7307461c4",
+      "size": 1763
+    },
+    {
+      "path": "tests/test_ssh_console_context_menu_rev36.py",
+      "sha256": "bd4eaf6baef7211139fb238285df7f411f824d20e370651935529c68709f7451",
+      "size": 1399
+    },
+    {
+      "path": "tests/test_ssh_console_context_menu_rev37.py",
+      "sha256": "36f4205a0f15ef52d2588b11df6fd4e0bc0a4b6591a7e5f8a774451c346449d5",
+      "size": 1713
+    },
+    {
+      "path": "tests/test_ssh_console_context_menu_rev38.py",
+      "sha256": "3b30518265f1995aea78eb82a7122b3a4fd70c6230c0b745c9253c0854c6bd46",
+      "size": 1832
+    },
+    {
       "path": "tests/test_ssh_console_noise_crash_rev30.py",
       "sha256": "6c321e28e26d07c17a2df02da045d576c26a95d1f8f34f34418bdc97e6f36d4f",
       "size": 1002
@@ -645,6 +880,31 @@
       "path": "tests/test_ssh_console_noise_rev25.py",
       "sha256": "bc303727be7ec674d675c34312e8f8bad145059a433cb839e46033c00c1b38ad",
       "size": 693
+    },
+    {
+      "path": "tests/test_ssh_login_combo_arrow_button_rev49.py",
+      "sha256": "2498923ef6145fac1c5fa71536b3fcadaf1cf3a1365386d9d6c8e3b27cc7e4d4",
+      "size": 1891
+    },
+    {
+      "path": "tests/test_ssh_login_combo_arrow_hit_rev48.py",
+      "sha256": "c364ca83bb1dac24a5d7c37d24a86d82a5adcb48abf37acaa54e6c70bbe987ce",
+      "size": 1458
+    },
+    {
+      "path": "tests/test_ssh_login_combo_modal_popup_rev50.py",
+      "sha256": "8c8fdf9c760c4a3b03638503597b338c1c6890490b93145fe09eddb2949d3abc",
+      "size": 2324
+    },
+    {
+      "path": "tests/test_ssh_login_combo_popup_width_rev47.py",
+      "sha256": "8eeeaacafe5a88ecb0ad26473291e19c72d0b1190b587258410579f21e32c5cd",
+      "size": 1621
+    },
+    {
+      "path": "tests/test_ssh_login_editable_combo_rev46.py",
+      "sha256": "57088ec1a5320549d4c56df1dfa5c4b7053edae33c757254f6eb173ab18d2be6",
+      "size": 1381
     },
     {
       "path": "tests/test_startup_fast_path.py",
@@ -663,8 +923,8 @@
     },
     {
       "path": "tests/test_terminal_buffer.py",
-      "sha256": "27da69aed39a2e848c7cdc6a2f56ba32fce7fdf1bf08d44506419191c830ef0c",
-      "size": 10311
+      "sha256": "885aafa2ac26590df79100ba2c329360df5d61e96e39f622368aae1c1adc26ab",
+      "size": 10630
     },
     {
       "path": "tests/test_text_buffer.py",
@@ -672,14 +932,44 @@
       "size": 3019
     },
     {
+      "path": "tests/test_transfer_center_custom_progress_rev44.py",
+      "sha256": "ce28a41b72efc8169c4e7541f440d48876817e3850432facce68c33a79621cac",
+      "size": 841
+    },
+    {
+      "path": "tests/test_transfer_center_draw_overlay_rev43.py",
+      "sha256": "71fcb9339a03cbbbfc8fa270be48b79ba1fc1f3c818785285fa73aaf052fa88f",
+      "size": 720
+    },
+    {
+      "path": "tests/test_transfer_center_layout_rev41.py",
+      "sha256": "fc66c64ca78951c46c1d33a5ec05fe22b849910f024a369a4446ca0190a4359f",
+      "size": 1319
+    },
+    {
+      "path": "tests/test_transfer_center_progress_centering_rev42.py",
+      "sha256": "93f2992d48e64fa28125881004d854978d21a83966ba6e9b1ecf4ff18119199e",
+      "size": 864
+    },
+    {
       "path": "tests/test_transfer_center_v2.py",
-      "sha256": "813c96a85cc76d047be94e3c235bb074519704ce9589fcfa57712c8cb0ac3477",
-      "size": 3937
+      "sha256": "96e5cd23b90de0a36d9cd44c1e383459fb4f97199a2c8c10667772646efd3a70",
+      "size": 4159
     },
     {
       "path": "tests/test_transfer_stability.py",
       "sha256": "96458c4e3bd86e56911cf63053aeaa16de200dd2c7d6b80e4b02f872cc51ac83",
       "size": 3147
+    },
+    {
+      "path": "tests/test_update_lock_versioned_fallback_rev51.py",
+      "sha256": "59dfe9ef937f961ecb1ed91ca3eb24481e769748c3311f70fa5abc02fc18bc08",
+      "size": 2549
+    },
+    {
+      "path": "tests/test_update_repeat_prompt_rev52.py",
+      "sha256": "6e1f3b3b10ec8d5fa8422ae217128c82ccb6016e7c252007dcf2c9dd6126b785",
+      "size": 5484
     },
     {
       "path": "tests/test_version_policy_110.py",
@@ -688,8 +978,8 @@
     },
     {
       "path": "tests/test_versioned_install_phase18.py",
-      "sha256": "7bcb7dd622175fecb5ffcc6078c0a476adf6f9b88eb9007f0908fca626e42cd9",
-      "size": 9160
+      "sha256": "27093faf003b1b2ac1b56f6374a789b3c71130e24f77302adda991861cba0e53",
+      "size": 9708
     },
     {
       "path": "tests/test_view_decomposition.py",
@@ -3223,7 +3513,7 @@
     },
     {
       "path": "VERSION",
-      "sha256": "1575e1af4a95f12f70b4ee6a6adce8160953d93ea17dc2611b90883ccc3ad3b8",
+      "sha256": "2f66e2158a2645e2455e374272c8deb113173dca586f9159f813519a50436c32",
       "size": 6
     },
     {
@@ -3388,8 +3678,8 @@
     },
     {
       "path": "WinUx/components/explorer_themes.py",
-      "sha256": "63c3cccb5be35b301613991f571c5b2ccaa2e4e7fef62a27f886d9d30ec2f934",
-      "size": 17076
+      "sha256": "96569d6c53c08de8618abd0b1a95c855dddb24c6ac4f4c69846d86acd35735f4",
+      "size": 17303
     },
     {
       "path": "WinUx/components/explorer_virtualization.py",
@@ -3433,13 +3723,13 @@
     },
     {
       "path": "WinUx/components/qt_combo_box.py",
-      "sha256": "e1555aa49fdf3b28678eb6db0e92f3802064821bf3de504f846822cdbaae7800",
-      "size": 23850
+      "sha256": "3d245d01d15ec4c1f5c545d3a7193d1106ef7732907da59308bce02b66af00f9",
+      "size": 24519
     },
     {
       "path": "WinUx/components/qt_style.py",
-      "sha256": "ef2ff21c90908c10a00a778c0e98b34ba43ef8d3c9d894b1b61d458fd012c310",
-      "size": 2700
+      "sha256": "bc5d39408fa6fb433d2768f9b3de1a930f454337b6e749b4375f3ce5feda7956",
+      "size": 3080
     },
     {
       "path": "WinUx/components/server_notepad_tabs.py",
@@ -3613,8 +3903,8 @@
     },
     {
       "path": "WinUx/dialogs/console_form.py",
-      "sha256": "4d44aff71ee00d40bde65c5ed1c045420809433a4fd8004c2303efae4fd1fcb0",
-      "size": 51007
+      "sha256": "bed056e6a3982c5269be8b5191f4579ff884176ea9129cec16b1d862133e892b",
+      "size": 64836
     },
     {
       "path": "WinUx/dialogs/diagnostics_dialog.py",
@@ -3633,8 +3923,8 @@
     },
     {
       "path": "WinUx/dialogs/floating_dialog.py",
-      "sha256": "cdb7adadffd1f539d8fe23e1f490881ca1258679da07eb51e35535df07f64011",
-      "size": 26668
+      "sha256": "b80640b334f5fc247360f4b53e52c1a22b7403e2096ca7f11fa6e6c486b4ef1f",
+      "size": 30288
     },
     {
       "path": "WinUx/dialogs/floating_forms.py",
@@ -3643,18 +3933,18 @@
     },
     {
       "path": "WinUx/dialogs/floating_runtime.py",
-      "sha256": "eb90791116a7c9e218a76986cd88864d80b97f7c9c3695c1d1d06b1a7bb940be",
-      "size": 18686
+      "sha256": "3e8d8c1e48aa53a659b49dab6472481034695445b24049a18ae6d52bca6f0946",
+      "size": 20680
     },
     {
       "path": "WinUx/dialogs/folder_browser_address.py",
-      "sha256": "749c48af95f9981d3dd8071aa98f638ecb5362c690bf87492b4202ebf665b89c",
-      "size": 6029
+      "sha256": "e1ee830a3d3767848f0a4ae08c14b2f02512a8f8f989f6bd8c7f0af80c420812",
+      "size": 9166
     },
     {
       "path": "WinUx/dialogs/folder_browser_style.py",
-      "sha256": "8c83fd25d14e8eba0b1805b4c8622c8e4b5c3acf27fc4e891fc6571d49d08f2c",
-      "size": 4368
+      "sha256": "2a2dc80446d83d4cb127d1fc8d286db2d2f154383a578ee8f1f12e8b10ac1618",
+      "size": 40463
     },
     {
       "path": "WinUx/dialogs/job_edit_dialog.py",
@@ -3693,8 +3983,8 @@
     },
     {
       "path": "WinUx/dialogs/local_folder_form.py",
-      "sha256": "d7b52019e539dbabbed82f3b8f8094f06fc7c85ac0e56a00c7231b8800bcc037",
-      "size": 28086
+      "sha256": "af45b73ee3d41a3110c9ae86ff09dd146a8c59009dba57add3ea3423a973d150",
+      "size": 49906
     },
     {
       "path": "WinUx/dialogs/logic/__init__.py",
@@ -3733,18 +4023,18 @@
     },
     {
       "path": "WinUx/dialogs/login_form.py",
-      "sha256": "aaf5e15b509693917b0733fa49160f3f89ba56c04472702e4960db4f01594a28",
-      "size": 7670
+      "sha256": "4116826392f45ec0f34bf596ee754d53b443ccb2a304091b10280e8934f6869c",
+      "size": 8009
     },
     {
       "path": "WinUx/dialogs/modern.py",
-      "sha256": "1399e5919d404b61ab79ffbd216c5331e69e41dbc6963ecf69c6074ec50ab0f9",
+      "sha256": "2467936fd50e0f8cb4f9cce6f594a5225e04a19d0c051eba2c95c9a2bdd32304",
       "size": 64150
     },
     {
       "path": "WinUx/dialogs/native_login_runtime.py",
-      "sha256": "202ed0033ac48d44e9691eeded3023cfbe3c36f1ac82520730ec5365b9b65f8c",
-      "size": 24455
+      "sha256": "972102a0d2249c16f21507aac9f4fdb89556453480155fcd78158c277a89de05",
+      "size": 24854
     },
     {
       "path": "WinUx/dialogs/odb_check_dialog.py",
@@ -3773,8 +4063,8 @@
     },
     {
       "path": "WinUx/dialogs/prewarm_pool.py",
-      "sha256": "b55b54e98f25e33ed7c08767f6300bab1c7a6c9e1665f00708b86594afa35885",
-      "size": 6215
+      "sha256": "f65c606de6e61508cfe2f5ade229e7c4385fa6d321c6378e94711cb02d0b6450",
+      "size": 6193
     },
     {
       "path": "WinUx/dialogs/progress_dialog.py",
@@ -3788,8 +4078,8 @@
     },
     {
       "path": "WinUx/dialogs/qt_dialog.py",
-      "sha256": "13c5eade642a4e9482f9880b56465d0a8b507d4ccd36880eed889bab813be38b",
-      "size": 41769
+      "sha256": "dd377d6ae6d5931d8e3331169fa34a3ae1b80737b59143ca2f1ef0ea8edbf0d1",
+      "size": 47797
     },
     {
       "path": "WinUx/dialogs/server_notepad_dialog.py",
@@ -3838,7 +4128,7 @@
     },
     {
       "path": "WinUx/dialogs/theme.py",
-      "sha256": "8aa0f5b84594c274b2f6218461a1b973f58b5bb9a40a239a47cbee8e3cf54955",
+      "sha256": "2d0ab32421f448edde496908708f78097cb569ab83050f73a970391e100e238e",
       "size": 31650
     },
     {
@@ -3853,8 +4143,8 @@
     },
     {
       "path": "WinUx/dialogs/transfer_center_form.py",
-      "sha256": "6992c936aee2b8b801b9bfb6daaeb3da382b5128205f80c1d679e3d4be729476",
-      "size": 5800
+      "sha256": "c90de345bf48148bca62bae30eb7549a3f6a6c6700999aeecfe7369cefcf513c",
+      "size": 10649
     },
     {
       "path": "WinUx/general_preferences.py",
@@ -3923,8 +4213,8 @@
     },
     {
       "path": "WinUx/platform/floating_viewport.py",
-      "sha256": "ec40f656e06af20d33b3e49940902e3173042fa4b42b1af677027a17f7720498",
-      "size": 14245
+      "sha256": "abdfca70b5977f397d8d7ebe1eefc7cc96a5066c09c985a25c39e50426261518",
+      "size": 14705
     },
     {
       "path": "WinUx/platform/folder_browser_places.py",
@@ -3933,8 +4223,8 @@
     },
     {
       "path": "WinUx/platform/native_dialog_host.py",
-      "sha256": "5c1ec619561d131921a0299ae08c6e874600c4601900b7a2791d71121c7fcf39",
-      "size": 75103
+      "sha256": "848e75b68122fdaee10d6879a2178dc13408e86e9b76f80fb867ce39282af3f4",
+      "size": 78714
     },
     {
       "path": "WinUx/platform/windows_cursors.py",
@@ -3943,8 +4233,8 @@
     },
     {
       "path": "WinUx/platform/windows_icons.py",
-      "sha256": "9255c2710925efce44208f186a4956f27eb42a9b4cd87179f39bf866084d2681",
-      "size": 15832
+      "sha256": "dda5e6e653165e1887f638dd98e95fc0cc23d53cb0fa684857ad638d893b2dc0",
+      "size": 18159
     },
     {
       "path": "WinUx/preferences/__init__.py",
@@ -4200,6 +4490,61 @@
       "path": "WinUx/Resources/Folder.png",
       "sha256": "41688744ff89096323ebf808c2073f2b19f690b3f24ac502564f30400b01d13d",
       "size": 5465
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/back.png",
+      "sha256": "f598d61a7c7821d937c42bea2f1937ec133ba245ac9484a8df09bde8d2bdc100",
+      "size": 2773
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/chevron.png",
+      "sha256": "6722a3a7ea5a516d41e26d48b3042da1021fec4018b02a30b1ceb487f8f3ab15",
+      "size": 2156
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/details.png",
+      "sha256": "c873fd64be70a9449be515f7b3f5345c99872f035c7ad0638ccb097ac2fccfdb",
+      "size": 4756
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/drive.png",
+      "sha256": "f2acb5cc4313aa492c4f2d24d78e13184fb59c9ca03e453a40eddf35628213b4",
+      "size": 3035
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/folder.png",
+      "sha256": "74398ecdcaf618b276304e9689c59eb77436fa2a0bd415231e7da6fba624cccc",
+      "size": 4194
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/forward.png",
+      "sha256": "d1b38f949da28e57e7fe40ef866bbd74c4092db78f443bbe32191b057725ba64",
+      "size": 2809
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/list.png",
+      "sha256": "e7c9b027b978167f69bc66de1d21e8f1d5d9f6f95eae257877493bfea7aed17b",
+      "size": 2912
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/new_folder.png",
+      "sha256": "8b92e77e00857f5b8904673810456f38be312d726ee2e76824b5266c318d21ec",
+      "size": 4613
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/refresh.png",
+      "sha256": "d6e50c60d0c8568d9365fc65f6d337bea1da1c0083d26436fc235c276f3caf58",
+      "size": 3952
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/search.png",
+      "sha256": "2fa6aeb325f76337130cd62457ef077d5c66925be1d2e22d1b5e370b53e81e6e",
+      "size": 3432
+    },
+    {
+      "path": "WinUx/Resources/folder_selector_icons/up.png",
+      "sha256": "21aafe23d865382a765f413f32887a08634c1d3c7fe9d62047aa0546ecc79a71",
+      "size": 2730
     },
     {
       "path": "WinUx/Resources/Home.png",
@@ -4462,6 +4807,11 @@
       "size": 1253
     },
     {
+      "path": "WinUx/runtime/dpg_callbacks.py",
+      "sha256": "92ac80df41512ad1938152e23455f642bab6a1ce0694e196d2bc0a0c9a1d9a5c",
+      "size": 3054
+    },
+    {
       "path": "WinUx/runtime/hang_watchdog.py",
       "sha256": "ef7651c91ef7559bcee088cd931fc6ed786918cc175122d6edaa72ef6e879aed",
       "size": 4765
@@ -4503,8 +4853,8 @@
     },
     {
       "path": "WinUx/server_model.py",
-      "sha256": "fd1c10d7071e0f63cbf2172b6256c030abc283d03dd268888d4f067c7663ceff",
-      "size": 39054
+      "sha256": "c04cc73a79b7aba6640bfd491d268562872f09859c80d60b2bd1a54deb46d6c6",
+      "size": 39858
     },
     {
       "path": "WinUx/services/__init__.py",
@@ -4523,8 +4873,8 @@
     },
     {
       "path": "WinUx/services/floating_dialog_process.py",
-      "sha256": "cd9404144b6337f6cf64d75d04476fb0074859f51efdfdba2b09c5924bbc62d2",
-      "size": 2111
+      "sha256": "a32a8ceba1e9b26c2fb16b76c5cf304ba10663799d3be3c16d44da9f32b8eeb2",
+      "size": 3041
     },
     {
       "path": "WinUx/services/floating_protocol.py",
@@ -4588,8 +4938,8 @@
     },
     {
       "path": "WinUx/services/remote_odb.py",
-      "sha256": "49f628f9af37fde0daa9e6ca96368833056263a134633055b6f3e4a347b11d97",
-      "size": 26770
+      "sha256": "d7f1834de456baaf52dd1557a8813f4f12ea1b6e7829ca98e486624823561902",
+      "size": 31130
     },
     {
       "path": "WinUx/services/remote_transfer.py",
@@ -4713,8 +5063,8 @@
     },
     {
       "path": "WinUx/view.py",
-      "sha256": "bc82c49aec5e4398cd1f9edd568d8da00974bdd86f35f3e115c6dee33a162e67",
-      "size": 70286
+      "sha256": "aedc0d89d49595f28685940854f94919eeef2e6d5f613ae56d8a0da0bb598eae",
+      "size": 75286
     },
     {
       "path": "WinUx/widgets/__init__.py",
@@ -4723,8 +5073,8 @@
     },
     {
       "path": "WinUx/widgets/controls.py",
-      "sha256": "4798ab2217a9c82efe6b787be3090b4ebce0dd39b65c6509a8d7863d7b4f2f43",
-      "size": 40629
+      "sha256": "81f055d178f0c8ea7cb921671be88f63299558dc5772af43a122cf94484d0c80",
+      "size": 40881
     },
     {
       "path": "WinUx/widgets/core.py",
@@ -4733,13 +5083,13 @@
     },
     {
       "path": "WinUx/widgets/imgui_qt_style.py",
-      "sha256": "d8dd759ae1ea8c735917f32a1eb269f39deb947295876c0da14564944a8d5caa",
-      "size": 42752
+      "sha256": "319a63bd4928dfa1015a32ad2650ef3ce321b4b08cc3cd04c914bb002aa72310",
+      "size": 44016
     },
     {
       "path": "WinUx/widgets/item_views.py",
-      "sha256": "06cc26ee4c3c6ecc2533c0037ca920cdc75bfc80f8aac0f3ff7d3eca0741564a",
-      "size": 53140
+      "sha256": "507004b749e9aa77376f298cea215262b682cb0d42830ef92e03acb77b2fa2b6",
+      "size": 53177
     },
     {
       "path": "WinUx/widgets/layouts.py",
@@ -4773,18 +5123,18 @@
     },
     {
       "path": "winux_installation_state.py",
-      "sha256": "66991fc7a16119a9227c09414a00d2f5e7b93da68f4ab954ec185485dc483233",
-      "size": 17171
+      "sha256": "4b481dd4aa0dd8b23bbab8eedb132f7fe0876bce65ec06e34bc8434e4eea604d",
+      "size": 18189
     },
     {
       "path": "winux_launcher.py",
-      "sha256": "954474a28000b1607ec6e503f07d5682a11666b11761e19a23c8ca3bd02cbf19",
-      "size": 12089
+      "sha256": "48707d2aa59bd84eba4573b79806fe80db9e213adc906f2e0e7365de02bb1921",
+      "size": 12475
     },
     {
       "path": "WinUx_plugin.py",
-      "sha256": "7b32fafb875936cc3de4c224a510f8bd2ca13d4f3d3e0c1a167ec7d9b88cde4a",
-      "size": 5148
+      "sha256": "0da08386d4da92412812a55ca6e982f02f155d0d4a3c12ce22789dbe1731466b",
+      "size": 7070
     },
     {
       "path": "winux_update_diagnostics.py",
@@ -4818,14 +5168,14 @@
     },
     {
       "path": "winux_updater.py",
-      "sha256": "f18f3e96ffa1fb928b1a45df97f8e4275ee1b3b8c2674b258df2f4f0b2d6e491",
-      "size": 47912
+      "sha256": "65cd0877123f81c7d29bccdf6b4011ba453c3c4b21142fe71a8a777cbae98cea",
+      "size": 51498
     }
   ],
   "package_revision": 1,
-  "package_sha256": "86cbcc99f91f14df2941d91794d5e8a8a555ed7a62265339bbcd6f7bf09215d7",
+  "package_sha256": "5e9227a73b1162fcb83bc8150e72728416ddef99b754808849e206a673b7f54a",
   "release_path": ".",
-  "released": "2026-10-05",
+  "released": "2026-10-07",
   "schema_version": 1,
-  "version": "1.1.0"
+  "version": "1.1.6"
 }

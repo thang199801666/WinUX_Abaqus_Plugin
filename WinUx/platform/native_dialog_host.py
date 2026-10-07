@@ -951,13 +951,13 @@ def _restore_owner_activation(owner_hwnd, raise_z_order=False):
 
 
 def handoff_owner_before_close(owner_hwnd, closing_hwnd=None):
-    """Transfer foreground to an owner *before* its owned dialog disappears.
+    """Transfer foreground/Z-order to an owner before its dialog disappears.
 
-    This mirrors the close ordering used by native GUI frameworks.  The owned
-    dialog is still visible while its owner becomes the foreground window, so
-    Windows never needs to choose an unrelated desktop window for an
-    intermediate frame.  Because an owned top-level remains above its owner,
-    the visual dialog stays on top until the subsequent Hide/DestroyWindow.
+    This is a genuine foreground owned-dialog hand-off, so unlike ordinary
+    focus repair it performs one non-TOPMOST Z-order raise.  Doing that while
+    the closing dialog is still visible keeps the dialog visually above its
+    owner and prevents Windows from leaving WinUx underneath an unrelated
+    desktop window after SW_HIDE/DestroyWindow.
 
     The hand-off is intentionally refused when another application already
     owns foreground; background/programmatic closes must not steal focus.
@@ -975,7 +975,9 @@ def handoff_owner_before_close(owner_hwnd, closing_hwnd=None):
             return True
         if closing_hwnd and current != closing_hwnd:
             return False
-        return _restore_owner_activation(owner_hwnd, raise_z_order=False)
+        # A close hand-off is exactly the case for which the strong one-shot
+        # Z-order repair exists.  It is not TOPMOST and changes no geometry.
+        return _restore_owner_activation(owner_hwnd, raise_z_order=True)
     except Exception:
         return False
 
@@ -989,6 +991,55 @@ def restore_owner_foreground(owner_hwnd):
     """Return a foreground dialog's owner to the foreground/Z-order slot."""
     return _restore_owner_activation(owner_hwnd, raise_z_order=True)
 
+
+def prepare_owned_dialog_stack(owner_hwnd, dialog_hwnd):
+    """Keep an owned dialog and WinUx together in the normal Z-order band.
+
+    GLFW/DPG floating dialogs live in a different process from the main WinUx
+    viewport.  Windows honours the GWLP_HWNDPARENT relationship, but on some
+    desktops activating the cross-process owned HWND can leave its owner below
+    an unrelated Explorer/browser/Abaqus window.  Qt keeps the owner/popup
+    stack together.  Reproduce that behaviour without TOPMOST: only when the
+    owner or dialog already owns the foreground slot, raise the owner once and
+    then the dialog, both with SWP_NOACTIVATE.
+
+    This helper never steals focus from another application and never changes
+    size, position, show state or the TOPMOST band.
+    """
+    if os.name != "nt" or not owner_hwnd or not dialog_hwnd:
+        return False
+    try:
+        owner_hwnd, dialog_hwnd = int(owner_hwnd), int(dialog_hwnd)
+        if owner_hwnd == dialog_hwnd:
+            return False
+        user32 = ctypes.windll.user32
+        user32.IsWindow.argtypes = [wintypes.HWND]
+        user32.IsWindow.restype = wintypes.BOOL
+        user32.IsWindowVisible.argtypes = [wintypes.HWND]
+        user32.IsWindowVisible.restype = wintypes.BOOL
+        user32.GetForegroundWindow.argtypes = []
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        owner = wintypes.HWND(owner_hwnd)
+        dialog = wintypes.HWND(dialog_hwnd)
+        if not user32.IsWindow(owner) or not user32.IsWindow(dialog):
+            return False
+        if not user32.IsWindowVisible(owner):
+            return False
+        current = int(user32.GetForegroundWindow() or 0)
+        if current not in (0, owner_hwnd, dialog_hwnd):
+            return False
+        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+        # HWND_TOP is a transient normal-band reorder, never HWND_TOPMOST.
+        if not user32.SetWindowPos(owner, wintypes.HWND(0), 0, 0, 0, 0, flags):
+            return False
+        user32.SetWindowPos(dialog, wintypes.HWND(0), 0, 0, 0, 0, flags)
+        return True
+    except Exception:
+        return False
 
 def is_native_window_foreground(window):
     """Return True when *window* currently owns the Windows foreground slot."""
@@ -1213,7 +1264,9 @@ class NativeDialogController:
         self.modal = bool(modal)
         self._closed = threading.Event()
         self._ready = threading.Event()
-        self._owner_hwnd = find_process_window("WinUX")
+        resolver = getattr(view, "_find_main_viewport_hwnd", None)
+        resolved_owner = resolver() if callable(resolver) else None
+        self._owner_hwnd = int(resolved_owner or find_process_window("WinUX") or 0) or None
         self._parent_hwnd = resolve_native_dialog_parent(self._owner_hwnd)
         self._window = None
         self._modal_owner_hwnd = None
@@ -1493,13 +1546,12 @@ class NativeDialogController:
             getattr(self, "_owner_focus_generation", 0)) + 1
         self._refresh_parent_for_show(window)
         # Dear PyGui uses global handler registries and can still observe the
-        # physical mouse while its HWND is disabled. Acquire the application
-        # input gate as well as Win32 owner modality before mapping the dialog.
+        # physical mouse while a native dialog is being mapped.  Acquire the
+        # application-level input gate immediately, but keep the native owner
+        # enabled until the dialog HWND is mapped/raised.  Disabling a foreground
+        # WinUx HWND before a replacement top-level is active lets Windows pick
+        # Explorer/Chrome/Abaqus as foreground and pushes WinUx behind it.
         self._set_native_modal_input(True)
-        self._set_modal_owner_active(True)
-        # The modal owner is disabled, never the dialog itself.  Keep this
-        # explicit because embedded Tk/Win32 transient wrappers occasionally
-        # inherit a disabled activation state after owner/style changes.
         ensure_native_dialog_interactive(window)
         # A dialog that is being shown from the withdrawn state always starts
         # from its minimum content-safe size.  Do this before mapping so the
@@ -1526,6 +1578,23 @@ class NativeDialogController:
                 and (name == "show" or entry_state == "withdrawn")):
             self._center_window_on_parent(window)
             self._center_window_after_map(window)
+
+        # Finish the Qt-style activation transaction while the owner is still
+        # enabled.  Cross-process/Tk owned windows do not always raise their
+        # owner with them, so explicitly keep the pair in the normal Z-order
+        # band and activate the dialog before native modality is armed.
+        dialog_hwnd = int(_tk_root_hwnd(window) or 0)
+        owner_hwnd = int(self._parent_hwnd or self._owner_hwnd or 0)
+        if dialog_hwnd and owner_hwnd:
+            prepare_owned_dialog_stack(owner_hwnd, dialog_hwnd)
+        if dialog_hwnd and name in ("show", "activate", "focus"):
+            _restore_owner_activation(dialog_hwnd, raise_z_order=True)
+
+        # Only now disable the native owner.  The DPG input gate above already
+        # prevented click-through during mapping, so this ordering is both modal
+        # and free of the foreground/Z-order drop that the old sequence caused.
+        self._set_modal_owner_active(True)
+        ensure_native_dialog_interactive(window)
         if self.modal:
             try:
                 window.grab_set()

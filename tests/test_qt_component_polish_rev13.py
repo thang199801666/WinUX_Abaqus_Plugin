@@ -12,7 +12,7 @@ def read(rel):
 def test_local_folder_browser_uses_shared_qt_controls_and_item_view_chrome():
     src = read("dialogs/local_folder_form.py")
     assert "qt_item_view_theme" in src
-    assert "dpg.bind_item_theme(self.table, qt_item_view_theme(dpg))" in src
+    assert "dpg.bind_item_theme(self.table, browser_details_theme())" in src
     assert 'self.view_mode = self.combo(' in src
     assert 'folder_form = self.form_layout(' in src
     assert 'height=23' in src

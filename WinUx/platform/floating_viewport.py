@@ -7,6 +7,7 @@ import os
 
 from .native_dialog_host import (
     attach_native_owner, apply_native_qt_chrome, handoff_owner_before_close,
+    prepare_owned_dialog_stack,
 )
 
 WM_CREATE = 0x0001
@@ -183,6 +184,7 @@ class NativeViewport:
         self.hwnd, self._resizable = int(hwnd or 0), bool(resizable)
         self.visible = False
         self._published = False
+        self._owner_hwnd = 0
         self._old_proc = None
         self.reveal_count = 0
 
@@ -196,8 +198,9 @@ class NativeViewport:
         return self._resizable, self._resizable
 
     def configure(self, owner_hwnd):
-        if owner_hwnd:
-            attach_native_owner(self, owner_hwnd)
+        self._owner_hwnd = int(owner_hwnd or 0)
+        if self._owner_hwnd:
+            attach_native_owner(self, self._owner_hwnd)
         # Process-isolated DPG viewports must use the full normal dialog
         # caption rather than WS_EX_TOOLWINDOW.  This gives the Close button
         # the native Windows states automatically: neutral at rest, red on
@@ -294,6 +297,11 @@ class NativeViewport:
 
     def activate(self):
         if os.name == "nt" and self.hwnd:
+            # Keep the cross-process owned-window pair in the same normal
+            # Z-order group before activation.  This is a no-op if some other
+            # application owns foreground, so background work never raises WinUx.
+            if self._owner_hwnd:
+                prepare_owned_dialog_stack(self._owner_hwnd, self.hwnd)
             user32 = ctypes.windll.user32
             user32.SetForegroundWindow.argtypes = [wintypes.HWND]
             user32.SetForegroundWindow(self.hwnd)

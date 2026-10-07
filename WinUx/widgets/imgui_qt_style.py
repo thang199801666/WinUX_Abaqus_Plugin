@@ -241,6 +241,35 @@ def progress_theme(backend, *, state="normal"):
     return _make_theme(backend, tag, build)
 
 
+def transfer_progress_host_theme(backend):
+    """Transparent host used to layer a centered percentage over a progress bar."""
+    tag = "winux.imguiqt.transferprogresshost"
+
+    def build():
+        with backend.theme_component(backend.mvChildWindow):
+            backend.add_theme_color(backend.mvThemeCol_ChildBg, (0, 0, 0, 0))
+            backend.add_theme_color(backend.mvThemeCol_Border, (0, 0, 0, 0))
+            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 0, 0)
+            backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 0, 0)
+            backend.add_theme_style(backend.mvStyleVar_ChildBorderSize, 0)
+            backend.add_theme_style(backend.mvStyleVar_ChildRounding, 0)
+    return _make_theme(backend, tag, build)
+
+
+def transfer_progress_text_theme(backend, *, light=False):
+    """Readable centered progress text for light and filled portions."""
+    tag = "winux.imguiqt.transferprogresstext.{}".format("light" if light else "dark")
+    p = QtFusionPalette
+
+    def build():
+        with backend.theme_component(backend.mvText):
+            backend.add_theme_color(
+                backend.mvThemeCol_Text,
+                (255, 255, 255, 255) if light else p.TEXT,
+            )
+    return _make_theme(backend, tag, build)
+
+
 def transfer_row_theme(backend):
     """Flat QFrame-like surface for one Transfer Center item.
 
@@ -255,8 +284,8 @@ def transfer_row_theme(backend):
         with backend.theme_component(backend.mvChildWindow):
             backend.add_theme_color(backend.mvThemeCol_ChildBg, p.BASE)
             backend.add_theme_color(backend.mvThemeCol_Border, p.BORDER_LIGHT)
-            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 7, 5)
-            backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 5, 3)
+            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 8, 6)
+            backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 6, 4)
             backend.add_theme_style(backend.mvStyleVar_ChildBorderSize, 1)
             backend.add_theme_style(backend.mvStyleVar_ChildRounding, 0)
         with backend.theme_component(backend.mvTable):

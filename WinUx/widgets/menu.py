@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from .core import QObject, Signal
 from ..components.qt_style import QtFusionMetrics, QtFusionPalette
+from ..components.shared_scroller import dpg_window_rect
 
 
 def _normalize_action(spec):
@@ -126,7 +127,7 @@ class ImGuiMenu(QObject):
     LABEL_PAD = 8
 
     def __init__(self, actions=(), *, backend=None, after=None,
-                 min_width=150, max_width=420, _parent_menu=None):
+                 min_width=150, max_width=420, _parent_menu=None, parent_window=None):
         super().__init__(after=after)
         if backend is None:
             import dearpygui.dearpygui as backend
@@ -145,15 +146,24 @@ class ImGuiMenu(QObject):
         self._min_width = int(min_width)
         self._max_width = int(max_width)
         self._parent_menu = _parent_menu
+        self._parent_window = parent_window
         self._active_action = None
         self._keyboard_registry = None
         self.tag = backend.generate_uuid()
-        with backend.window(
-                tag=self.tag, popup=True, show=False, width=self._min_width,
-                height=40, no_title_bar=True, no_resize=True, no_move=True,
-                no_saved_settings=True, no_scrollbar=True,
-                no_scroll_with_mouse=True):
-            pass
+        if parent_window is None:
+            with backend.window(
+                    tag=self.tag, popup=True, show=False, width=self._min_width,
+                    height=40, no_title_bar=True, no_resize=True, no_move=True,
+                    no_saved_settings=True, no_scrollbar=True,
+                    no_scroll_with_mouse=True):
+                pass
+        else:
+            # Modal dialogs own their ImGui popup stack. Embed the menu in the
+            # dialog's render/input hierarchy rather than opening a root popup.
+            backend.add_child_window(
+                parent=parent_window, tag=self.tag, show=False,
+                width=self._min_width, height=40, border=True,
+                no_scrollbar=True, no_scroll_with_mouse=True)
         try:
             backend.bind_item_theme(self.tag, _menu_theme(backend))
         except Exception:
@@ -167,10 +177,17 @@ class ImGuiMenu(QObject):
         b = self.backend
         try:
             with b.handler_registry() as registry:
-                for key in (b.mvKey_Up, b.mvKey_Down, b.mvKey_Return,
-                            b.mvKey_Escape, b.mvKey_Left, b.mvKey_Right):
+                keys = [b.mvKey_Up, b.mvKey_Down, b.mvKey_Return,
+                        b.mvKey_Left, b.mvKey_Right]
+                # An embedded modal menu's owner handles Escape. Two handlers
+                # could dismiss the menu and then also reject its dialog.
+                if self._parent_window is None:
+                    keys.append(b.mvKey_Escape)
+                for key in keys:
                     b.add_key_press_handler(
                         key=key, callback=self._key_pressed, user_data=key)
+                b.add_mouse_click_handler(
+                    button=b.mvMouseButton_Left, callback=self._pointer_clicked)
             self._keyboard_registry = registry
         except Exception:
             self._keyboard_registry = None
@@ -182,6 +199,21 @@ class ImGuiMenu(QObject):
             if spec.get("visible", True) and not spec.get("separator")
                and bool(spec.get("enabled", True))
         ]
+
+    def _pointer_clicked(self, *_args):
+        root = self._root_menu()
+        if not root.backend.is_item_shown(root.tag):
+            return
+        menu = root._deepest_open_menu()
+        x, y = menu.backend.get_mouse_pos(local=False)
+        for action, row in tuple(menu._rows.items()):
+            bounds = dpg_window_rect(menu.backend, row, clip=True)
+            if bounds is None:
+                continue
+            left, top, right, bottom = bounds
+            if left <= x < right and top <= y < bottom:
+                menu._row_clicked(user_data=action)
+                return
 
     def _set_active_action(self, action_id):
         action_id = None if action_id is None else str(action_id)
@@ -396,9 +428,8 @@ class ImGuiMenu(QObject):
             with b.item_handler_registry() as registry:
                 b.add_item_hover_handler(
                     callback=self._row_hovered, user_data=action_id)
-                b.add_item_clicked_handler(
-                    button=b.mvMouseButton_Left,
-                    callback=self._row_clicked, user_data=action_id)
+                # Child windows support hover, but not item-click handlers in
+                # DPG 2.x. Root pointer dispatch hit-tests the complete row.
             b.bind_item_handler_registry(row, registry)
             self._handlers.append(registry)
         except Exception:
@@ -462,6 +493,7 @@ class ImGuiMenu(QObject):
                 spec.get("children") or (), backend=self.backend, after=self._after,
                 min_width=self._min_width, max_width=self._max_width,
                 _parent_menu=self,
+                parent_window=self._parent_window,
             )
             # Leaf triggers are emitted by the root menu directly, but keep the
             # signal forwarding useful for programmatic callers/tests.
@@ -489,6 +521,15 @@ class ImGuiMenu(QObject):
             self.aboutToShow.emit(context)
         if position is not None:
             try:
+                if self._parent_window is not None:
+                    bounds = dpg_window_rect(self.backend, self._parent_window)
+                    if bounds is not None:
+                        left, top, right, bottom = bounds
+                        config = self.backend.get_item_configuration(self.tag)
+                        width, height = config["width"], config["height"]
+                        x, y = position
+                        position = (max(0, min(x - left, right - left - width - 2)),
+                                    max(0, min(y - top, bottom - top - height - 2)))
                 self.backend.set_item_pos(self.tag, tuple(position))
             except Exception:
                 pass

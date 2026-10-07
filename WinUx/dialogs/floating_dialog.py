@@ -16,6 +16,7 @@ import socket
 import tempfile
 import threading
 import time
+from datetime import datetime
 
 from ..platform.native_dialog_host import (
     find_process_window, _acquire_modal_owner, _release_modal_owner,
@@ -57,6 +58,25 @@ def floating_dialog_command(script):
     return args
 
 
+def floating_dialog_log_path(name):
+    """Return a stable, user-visible crash-log path and ensure it exists.
+
+    ``tempfile.gettempdir()`` can resolve to an 8.3 alias on Windows and is
+    routinely cleaned by enterprise policies.  Use LocalAppData when possible,
+    and create/touch the file in the parent process before a child is launched
+    so an error popup never advertises a non-existent log.
+    """
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        log_dir = Path(base) / "WinUx" / "logs"
+    else:
+        log_dir = Path(tempfile.gettempdir()) / "WinUx" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    path = log_dir / "floating_dialog_{}.log".format(name)
+    path.touch(exist_ok=True)
+    return str(path)
+
+
 class FloatingDialogController:
     NATIVE_WINDOW = True
     FLOATABLE = True
@@ -73,7 +93,15 @@ class FloatingDialogController:
         self._native_prepared = False
         self._hwnd = None
         self._owner_acquired = False
-        self._owner_hwnd = int(owner_hwnd if owner_hwnd is not None else find_process_window("WinUX") or 0)
+        if owner_hwnd is None:
+            # The main view already has a robust HWND resolver/cache.  Reuse it
+            # instead of independently enumerating process windows for every
+            # dialog; choosing a helper top-level here breaks the owner chain
+            # and is enough to leave the real WinUx viewport behind other apps.
+            resolver = getattr(view, "_find_main_viewport_hwnd", None)
+            resolved_owner = resolver() if callable(resolver) else None
+            owner_hwnd = resolved_owner or find_process_window("WinUX") or 0
+        self._owner_hwnd = int(owner_hwnd or 0)
         self._visible = bool(visible)
         self._native_visible = False
         self._owned_dialogs = []
@@ -114,17 +142,23 @@ class FloatingDialogController:
             self._token = secrets.token_hex(32)
         self._process = None
         self._startup_timer = None
-        if self.modal and self._visible:
-            acquire_native_modal_input(self)
+        # Do not acquire application-wide modal input while the floating child
+        # is still bootstrapping.  A cold Abaqus-Python worker can need a
+        # noticeable amount of time before it owns an HWND; blocking WinUx
+        # during that interval makes every modal command feel delayed/frozen.
+        # Modality is armed from the ``prepared`` event below, after the child
+        # has built/rendered the dialog and immediately before publication.
         script = Path(__file__).resolve().parents[1] / "services" / "floating_dialog_process.py"
-        log_dir = Path(tempfile.gettempdir()) / "WinUx" / "logs"
-        self.log_path = str(log_dir / "floating_dialog_{}.log".format(kind))
+        self.log_path = floating_dialog_log_path(kind)
         try:
             if self._from_prewarm:
                 self._process = self._prepared_worker.process
                 self.log_path = self._prepared_worker.log_path
+                # A claimed prewarm log must also exist before the UI can show
+                # an error path to the user.
+                Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(self.log_path).touch(exist_ok=True)
             else:
-                log_dir.mkdir(parents=True, exist_ok=True)
                 environment = os.environ.copy()
                 environment["WINUX_FLOAT_DIALOG_PORT"] = str(self._listener.getsockname()[1])
                 environment["WINUX_FLOAT_DIALOG_TOKEN"] = self._token
@@ -224,9 +258,12 @@ class FloatingDialogController:
             return
         event = message.get("event")
         if event == "prepared":
-            # Register the foreign HWND while it is still DWM-cloaked.  The DPG
-            # application-input gate was acquired synchronously in __init__, but
-            # deliberately do *not* disable the native WinUx owner yet.  Disabling
+            # Register the foreign HWND while it is still DWM-cloaked.  Arm
+            # Dear PyGui modality only now: the child is fully prepared, so the
+            # interval between background-input blocking and native reveal is
+            # only the short publish transaction rather than the whole process
+            # startup.  Deliberately do *not* disable the native WinUx owner yet.
+            # Disabling
             # the current foreground owner before a replacement HWND is active can
             # make Windows activate another desktop window for one frame.
             self._accept_native_hwnd(message)
@@ -289,7 +326,11 @@ class FloatingDialogController:
                 self._close_return_focus or message.get("return_focus"))
             self._finish()
         elif event == "error":
-            self._failed(str(message.get("message") or "Could not open floating dialog."))
+            self._failed(
+                str(message.get("message") or "Could not open floating dialog."),
+                details=str(message.get("traceback") or ""),
+                stage=str(message.get("stage") or ""),
+            )
         else:
             self.handle_event(event, message)
 
@@ -324,13 +365,45 @@ class FloatingDialogController:
         if not self._closed:
             self._failed("The floating dialog process exited unexpectedly.")
 
-    def _failed(self, message):
+    def _append_failure_log(self, message, details="", stage=""):
+        """Persist the parent-visible failure even if child stderr redirection failed."""
+        try:
+            path = Path(self.log_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8", errors="replace") as log:
+                log.write("\n=== {} ===\n".format(datetime.now().isoformat(timespec="seconds")))
+                if stage:
+                    log.write("Stage: {}\n".format(stage))
+                log.write(str(message).rstrip() + "\n")
+                if details:
+                    log.write(str(details).rstrip() + "\n")
+            return path.is_file()
+        except Exception:
+            return False
+
+    def _failed(self, message, details="", stage=""):
         if self._closed:
             return
+        log_exists = self._append_failure_log(message, details, stage)
         self.destroy()
         callback = getattr(self.view, "show_error", None)
         if callable(callback):
-            self.view.after(0, callback, self.title, message + "\n\nLog: " + self.log_path)
+            text = str(message)
+            if stage:
+                text += "\nStage: " + stage
+            # Put the actionable tail of the traceback directly in the popup.
+            # This keeps diagnostics useful even on machines whose security
+            # policy removes application logs immediately.
+            if details:
+                lines = [line for line in str(details).splitlines() if line.strip()]
+                tail = "\n".join(lines[-8:])
+                if tail:
+                    text += "\n\nTraceback (last lines):\n" + tail
+            if log_exists:
+                text += "\n\nLog: " + self.log_path
+            else:
+                text += "\n\nLog could not be written."
+            self.view.after(0, callback, self.title, text)
 
     def _finish(self):
         if self._finalized:

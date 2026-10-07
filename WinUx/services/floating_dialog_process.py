@@ -18,14 +18,26 @@ from WinUx.services.floating_protocol import encode_message, read_messages
 
 
 def main():
-    connection = socket.create_connection(("127.0.0.1", int(os.environ.pop("WINUX_FLOAT_DIALOG_PORT"))), timeout=25)
-    connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    connection.settimeout(None)
+    port = int(os.environ.pop("WINUX_FLOAT_DIALOG_PORT"))
+    token = os.environ.pop("WINUX_FLOAT_DIALOG_TOKEN")
+    prewarm_requested = os.environ.pop("WINUX_FLOAT_DIALOG_PREWARM", "") == "1"
+    connection = None
     try:
-        connection.sendall(encode_message({"event": "hello", "token": os.environ.pop("WINUX_FLOAT_DIALOG_TOKEN")}))
+        try:
+            connection = socket.create_connection(("127.0.0.1", port), timeout=25)
+        except OSError:
+            # A prewarm worker can be retired while Abaqus' Python wrapper is
+            # still starting. In that race the parent listener has already
+            # closed; this is normal cleanup, not a dialog crash worth logging.
+            if prewarm_requested:
+                return 0
+            raise
+        connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        connection.settimeout(None)
+        connection.sendall(encode_message({"event": "hello", "token": token}))
         messages = read_messages(connection)
         prepared = None
-        if os.environ.pop("WINUX_FLOAT_DIALOG_PREWARM", "") == "1":
+        if prewarm_requested:
             prepared = PreparedViewport(connection, messages)
             initial = prepared.wait_for_init()
             if initial is None:
@@ -37,20 +49,35 @@ def main():
         # All WinUx floating UI is Dear ImGui / Dear PyGui.  Individual
         # controls may emulate Qt/Fusion geometry and behavior, but no Tk/Qt
         # runtime is selected for any dialog kind.
-        FloatingDialogRuntime(connection, messages, initial, prepared=prepared).run()
+        runtime = FloatingDialogRuntime(connection, messages, initial, prepared=prepared)
+        runtime.run()
     except Exception as exc:
-        traceback.print_exc(file=sys.stderr)
+        trace_text = traceback.format_exc()
         try:
-            connection.sendall(encode_message({"event": "error", "message": str(exc)}))
+            sys.stderr.write(trace_text)
+            sys.stderr.flush()
+        except Exception:
+            pass
+        try:
+            connection.sendall(encode_message({
+                "event": "error",
+                "message": str(exc),
+                "traceback": trace_text,
+                "stage": str(getattr(locals().get("runtime", None), "stage", "startup") or "startup"),
+            }))
         except OSError:
             pass
         return 1
     finally:
-        try:
-            connection.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        connection.close()
+        if connection is not None:
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
     return 0
 
 

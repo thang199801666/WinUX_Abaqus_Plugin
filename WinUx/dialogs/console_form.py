@@ -12,7 +12,7 @@ import dearpygui.dearpygui as dpg
 from .qt_dialog import QtDialog
 from ..components.console_renderer import ConsoleRenderer
 from ..runtime.terminal_buffer import TerminalBuffer, clean_output
-from ..components.interaction_gate import register_pointer_protected_item, unregister_pointer_protected_item
+from ..components.interaction_gate import unregister_pointer_protected_item
 from ..components.shared_scroller import add_dpg_scroller_style, DpgScrollerArrowOverlay
 from ..components.qt_style import QtFusionPalette
 from ..widgets.imgui_qt_style import button_theme
@@ -87,6 +87,28 @@ def _win_clipboard_text_get():
     finally:
         user32.CloseClipboard()
 
+def _win_clipboard_has_text():
+    """Cheap availability probe used while opening the context menu.
+
+    Do not open/lock the clipboard merely to decide whether Paste should be
+    enabled.  On Windows this avoids the retry loop in ``_win_clipboard_text_get``
+    and keeps RMB menu presentation immediate even when another process has
+    the clipboard temporarily open.
+    """
+    if os.name != "nt":
+        try:
+            return bool(dpg.get_clipboard_text())
+        except Exception:
+            return False
+    try:
+        user32 = ctypes.windll.user32
+        user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
+        user32.IsClipboardFormatAvailable.restype = wintypes.BOOL
+        return bool(user32.IsClipboardFormatAvailable(_CF_UNICODETEXT))
+    except Exception:
+        return False
+
+
 def _win_clipboard_text_set(value):
     value = str(value or "")
     if os.name != "nt":
@@ -151,98 +173,6 @@ def _win_clipboard_text_set(value):
         user32.CloseClipboard()
 
 
-class _NativeConsoleContextMenu:
-    """Win32 popup menu used by the Windows terminal.
-
-    TrackPopupMenuEx owns its own native modal message loop and returns the
-    chosen command id.  No Dear PyGui item is created and no DPG callback is
-    invoked while the popup is active, which removes the crash-prone re-entry
-    path seen with both retained QMenu rows and DPG button popups.
-    """
-
-    _COMMANDS = ((1001, "copy", "Copy"), (1002, "paste", "Paste"),
-                 (1003, "select_all", "Select All"), (1004, "find", "Find"),
-                 (1005, "clear", "Clear"))
-
-    def __init__(self, owner):
-        self.owner = owner
-        self.tag = None
-        self._enabled = {action: True for _cid, action, _label in self._COMMANDS}
-        self.is_open = False
-
-    def setActionEnabled(self, action, enabled):
-        self._enabled[str(action)] = bool(enabled)
-        return True
-
-    def popup(self, position=None, *, context=None):
-        if os.name != "nt":
-            return None
-        user32 = ctypes.windll.user32
-        user32.CreatePopupMenu.restype = wintypes.HMENU
-        user32.AppendMenuW.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR]
-        user32.AppendMenuW.restype = wintypes.BOOL
-        user32.TrackPopupMenuEx.argtypes = [wintypes.HMENU, wintypes.UINT, ctypes.c_int, ctypes.c_int, wintypes.HWND, ctypes.c_void_p]
-        user32.TrackPopupMenuEx.restype = wintypes.UINT
-        user32.DestroyMenu.argtypes = [wintypes.HMENU]
-        user32.DestroyMenu.restype = wintypes.BOOL
-        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
-        user32.GetCursorPos.restype = wintypes.BOOL
-        user32.GetForegroundWindow.restype = wintypes.HWND
-        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-        user32.SetForegroundWindow.restype = wintypes.BOOL
-        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-        user32.PostMessageW.restype = wintypes.BOOL
-
-        menu = user32.CreatePopupMenu()
-        if not menu:
-            return None
-        MF_STRING, MF_GRAYED, MF_SEPARATOR = 0x0000, 0x0001, 0x0800
-        TPM_RIGHTBUTTON, TPM_RETURNCMD, TPM_NONOTIFY = 0x0002, 0x0100, 0x0080
-        WM_NULL = 0x0000
-        try:
-            for index, (cid, action, label) in enumerate(self._COMMANDS):
-                if action == "clear":
-                    user32.AppendMenuW(menu, MF_SEPARATOR, 0, None)
-                flags = MF_STRING | (0 if self._enabled.get(action, True) else MF_GRAYED)
-                user32.AppendMenuW(menu, flags, cid, label)
-
-            hwnd = 0
-            finder = getattr(self.owner.view, "_find_main_viewport_hwnd", None)
-            if callable(finder):
-                try:
-                    hwnd = int(finder() or 0)
-                except Exception:
-                    hwnd = 0
-            if not hwnd:
-                try:
-                    hwnd = int(user32.GetForegroundWindow() or 0)
-                except Exception:
-                    hwnd = 0
-            point = wintypes.POINT()
-            if not user32.GetCursorPos(ctypes.byref(point)):
-                return None
-            if hwnd:
-                user32.SetForegroundWindow(wintypes.HWND(hwnd))
-            self.is_open = True
-            command = int(user32.TrackPopupMenuEx(
-                menu, TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
-                int(point.x), int(point.y), wintypes.HWND(hwnd or 0), None) or 0)
-            if hwnd:
-                user32.PostMessageW(wintypes.HWND(hwnd), WM_NULL, 0, 0)
-            for cid, action, _label in self._COMMANDS:
-                if command == cid:
-                    return action
-            return None
-        finally:
-            self.is_open = False
-            user32.DestroyMenu(menu)
-
-    def hide(self):
-        return True
-
-    def delete(self):
-        return None
-
 STYLE_COLORS = {
     "output": TEXT,
     "prompt": PROMPT,
@@ -255,96 +185,325 @@ STYLE_COLORS = {
 
 
 class _ConsoleContextMenu:
-    """Small DPG-native context menu dedicated to the terminal.
+    """Qt/QMenu-like *modeless* context surface for the terminal.
 
-    The generic retained QMenu uses child-window row hit handlers.  On the
-    Windows/Dear PyGui combination used by WinUx those rows can hover normally
-    while their click handlers are never delivered.  The console menu uses
-    real ``mvButton`` rows instead, so mouse actions are handled by Dear ImGui
-    directly and do not depend on child-window click handlers.
+    This deliberately remains an ordinary DPG window rather than an ImGui
+    popup or a Win32 TrackPopupMenu loop.  The menu therefore cannot hold the
+    application's popup/modal stack after it closes.  Keyboard current-row
+    state is rendered locally and never steals focus from the terminal.
     """
 
-    WIDTH = 170
-    ROW_HEIGHT = 24
+    WIDTH = 202
+    ROW_HEIGHT = 25
+    SEPARATOR_HEIGHT = 7
+    SEPARATORS_AFTER = frozenset(("paste", "find"))
+    ACTIONS = (
+        ("copy", "Copy", "Ctrl+C"),
+        ("paste", "Paste", "Ctrl+V"),
+        ("select_all", "Select All", "Ctrl+A"),
+        ("find", "Find", "Ctrl+F"),
+        ("clear", "Clear", ""),
+    )
 
     def __init__(self, owner):
         self.owner = owner
         self.tag = dpg.generate_uuid()
-        self._buttons = {}
+        self._items = {}
         self._enabled = {}
+        self._shortcuts = {}
+        self._handler_registry = None
+        self._row_handler_registries = []
+        self._visible = False
+        self._current_action = None
+        self._last_open_time = 0.0
+        self._last_open_position = None
+        self._themes = []
+
+        self._normal_theme = self._make_row_theme(
+            QtFusionPalette.MENU, QtFusionPalette.MENU_HOVER,
+            QtFusionPalette.MENU_ACTIVE, QtFusionPalette.TEXT)
+        self._current_theme = self._make_row_theme(
+            QtFusionPalette.MENU_ACTIVE, QtFusionPalette.MENU_ACTIVE,
+            QtFusionPalette.MENU_ACTIVE, QtFusionPalette.TEXT)
+        self._disabled_theme = self._make_row_theme(
+            QtFusionPalette.MENU, QtFusionPalette.MENU,
+            QtFusionPalette.MENU, QtFusionPalette.TEXT_DISABLED)
+
+        height = (
+            6 + self.ROW_HEIGHT * len(self.ACTIONS)
+            + self.SEPARATOR_HEIGHT * len(self.SEPARATORS_AFTER) + 8
+        )
         with dpg.window(
-                tag=self.tag, show=False, width=self.WIDTH, height=136,
-                no_title_bar=True, no_resize=True, no_move=True,
-                no_saved_settings=True, no_scrollbar=True,
-                no_scroll_with_mouse=True):
-            for action, label in (("copy", "Copy"), ("paste", "Paste"),
-                                  ("select_all", "Select All"),
-                                  ("find", "Find")):
-                self._add_button(action, label)
-            dpg.add_separator()
-            self._add_button("clear", "Clear")
+                tag=self.tag,
+                show=False,
+                width=self.WIDTH,
+                height=height,
+                no_title_bar=True,
+                no_resize=True,
+                no_move=True,
+                no_saved_settings=True,
+                no_scrollbar=True,
+                no_scroll_with_mouse=True,
+                no_bring_to_front_on_focus=False):
+            for action, label, shortcut in self.ACTIONS:
+                self._add_item(action, label, shortcut)
+                if action in self.SEPARATORS_AFTER:
+                    separator = dpg.add_separator()
+                    dpg.bind_item_theme(separator, self._separator_theme())
 
         with dpg.theme() as self._window_theme:
             with dpg.theme_component(dpg.mvWindowAppItem):
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, QtFusionPalette.WINDOW)
+                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, QtFusionPalette.MENU)
                 dpg.add_theme_color(dpg.mvThemeCol_Border, QtFusionPalette.BORDER)
+                dpg.add_theme_color(dpg.mvThemeCol_Separator, QtFusionPalette.BORDER_LIGHT)
                 dpg.add_theme_style(dpg.mvStyleVar_WindowBorderSize, 1)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 1)
                 dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 3, 3)
                 dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 1)
         dpg.bind_item_theme(self.tag, self._window_theme)
 
-    def _add_button(self, action, label):
+        # Deliberately do NOT bind RMB to the draw-list.  A global release
+        # observer defers the DPG hover test/menu open until after input
+        # dispatch, avoiding the old canvas ActiveId/blocking regression.  LMB
+        # and MMB remain item-scoped to the terminal canvas.
+        with dpg.item_handler_registry() as self._handler_registry:
+            dpg.add_item_clicked_handler(
+                button=dpg.mvMouseButton_Left,
+                callback=owner._canvas_left_click,
+            )
+            dpg.add_item_clicked_handler(
+                button=dpg.mvMouseButton_Middle,
+                callback=owner._middle_click,
+            )
+            # Direct canvas fallback for RMB.  This handler only arms a
+            # deferred open; it never mutates the menu/item tree while the
+            # physical right button is down.
+            dpg.add_item_clicked_handler(
+                button=dpg.mvMouseButton_Right,
+                callback=owner._canvas_right_click,
+            )
+        dpg.bind_item_handler_registry(owner.canvas, self._handler_registry)
+
+    def _separator_theme(self):
+        with dpg.theme() as theme:
+            with dpg.theme_component(dpg.mvSeparator):
+                dpg.add_theme_color(dpg.mvThemeCol_Separator, QtFusionPalette.BORDER_LIGHT)
+                dpg.add_theme_color(dpg.mvThemeCol_SeparatorHovered, QtFusionPalette.BORDER_LIGHT)
+                dpg.add_theme_color(dpg.mvThemeCol_SeparatorActive, QtFusionPalette.BORDER_LIGHT)
+        self._themes.append(theme)
+        return theme
+
+    def _make_row_theme(self, face, hover, active, text):
+        with dpg.theme() as theme:
+            with dpg.theme_component(dpg.mvButton):
+                dpg.add_theme_color(dpg.mvThemeCol_Button, face)
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, hover)
+                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, active)
+                dpg.add_theme_color(dpg.mvThemeCol_Text, text)
+                dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
+                dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 7, 3)
+                align = getattr(dpg, "mvStyleVar_ButtonTextAlign", None)
+                if align is not None:
+                    dpg.add_theme_style(align, 0.0, 0.5)
+        self._themes.append(theme)
+        return theme
+
+    @staticmethod
+    def _row_label(label, shortcut):
+        # DPG buttons do not expose Qt's independent shortcut column.  Keep a
+        # compact, deterministic visual gap while retaining one full-row hit
+        # target.  The width is fixed, so this reads like a QMenu shortcut
+        # column without introducing a second non-clickable widget.
+        if not shortcut:
+            return label
+        gap = max(2, 22 - len(label) - len(shortcut))
+        return "{}{}{}".format(label, " " * gap, shortcut)
+
+    def _add_item(self, action, label, shortcut):
         tag = dpg.add_button(
-            label=label, width=self.WIDTH - 8, height=self.ROW_HEIGHT,
-            callback=self._clicked, user_data=action)
-        self._buttons[action] = tag
+            label=self._row_label(label, shortcut),
+            width=self.WIDTH - 8,
+            height=self.ROW_HEIGHT,
+            callback=self._clicked,
+            user_data=action,
+        )
+        self._items[action] = tag
+        self._shortcuts[action] = shortcut
         self._enabled[action] = True
+        dpg.bind_item_theme(tag, self._normal_theme)
+        # QMenu tracks the current action under the pointer.  Keep this local
+        # to each row; no global mouse capture/focus is involved.
         try:
-            dpg.bind_item_theme(tag, button_theme(dpg, role="flat"))
+            with dpg.item_handler_registry() as registry:
+                dpg.add_item_hover_handler(callback=self._hovered, user_data=action)
+            dpg.bind_item_handler_registry(tag, registry)
+            self._row_handler_registries.append(registry)
         except Exception:
             pass
+
+    def _hovered(self, sender=None, app_data=None, user_data=None):
+        if not self._visible:
+            return
+        action = str(user_data or "")
+        if self._enabled.get(action, False):
+            self._set_current(action)
+        elif self._current_action == action:
+            self._set_current(None)
 
     def _clicked(self, sender=None, app_data=None, user_data=None):
         action = str(user_data or "")
         if not self._enabled.get(action, True):
             return
-        # Defer the terminal operation one UI turn.  This lets Dear ImGui finish
-        # the button activation before clipboard/selection/output state mutates.
+        self._set_current(action)
+        # Let Dear ImGui finish this physical click before terminal state or
+        # the Windows clipboard is mutated.
         try:
-            self.owner.view.after(0, self.owner._context_menu_triggered, action, self.owner)
+            self.owner.view.after(
+                0, self.owner._context_menu_triggered, action, self.owner)
         except Exception:
             self.owner._context_menu_triggered(action, self.owner)
+
+    def _apply_theme(self, action):
+        item = self._items.get(action)
+        if item is None:
+            return
+        if not self._enabled.get(action, True):
+            theme = self._disabled_theme
+        elif action == self._current_action:
+            theme = self._current_theme
+        else:
+            theme = self._normal_theme
+        try:
+            if dpg.does_item_exist(item):
+                # Keep the widget technically enabled so DPG cannot replace
+                # our left-aligned menu palette/metrics with disabled-button
+                # defaults.  Logical enablement is enforced in _clicked().
+                dpg.configure_item(item, enabled=True)
+                dpg.bind_item_theme(item, theme)
+        except Exception:
+            pass
+
+    def _set_current(self, action):
+        action = str(action) if action is not None else None
+        if action is not None and not self._enabled.get(action, False):
+            action = None
+        old = self._current_action
+        self._current_action = action
+        if old is not None:
+            self._apply_theme(old)
+        if action is not None:
+            self._apply_theme(action)
+
+    def _enabled_actions(self):
+        return [action for action, _label, _shortcut in self.ACTIONS
+                if self._enabled.get(action, True)]
 
     def setActionEnabled(self, action, enabled):
         action = str(action)
         enabled = bool(enabled)
         self._enabled[action] = enabled
-        button = self._buttons.get(action)
-        if button is None:
+        if not enabled and self._current_action == action:
+            self._current_action = None
+        self._apply_theme(action)
+        return action in self._items
+
+    def move_current(self, delta):
+        if not self._visible:
+            return False
+        actions = self._enabled_actions()
+        if not actions:
+            self._set_current(None)
             return False
         try:
-            dpg.configure_item(button, enabled=enabled)
-            dpg.bind_item_theme(
-                button, button_theme(dpg, role="flat", disabled=not enabled))
-        except Exception:
-            pass
+            index = actions.index(self._current_action)
+        except ValueError:
+            index = -1 if delta >= 0 else 0
+        index = (index + (1 if delta >= 0 else -1)) % len(actions)
+        self._set_current(actions[index])
         return True
 
-    def popup(self, position=None, *, context=None):
-        if position is not None:
-            try:
-                dpg.set_item_pos(self.tag, tuple(map(int, position)))
-            except Exception:
-                pass
+    def activate_current(self):
+        return self.trigger(self._current_action)
+
+    def trigger(self, action):
+        """Activate one logical menu action without relying on button focus."""
+        if not self._visible:
+            return False
+        action = str(action or "")
+        if action not in self._items or not self._enabled.get(action, False):
+            return False
+        self._set_current(action)
         try:
+            self.owner.view.after(
+                0, self.owner._context_menu_triggered, action, self.owner)
+        except Exception:
+            self.owner._context_menu_triggered(action, self.owner)
+        return True
+
+    @property
+    def is_open(self):
+        return bool(self._visible)
+
+    def _clamp_position(self, position):
+        try:
+            x, y = map(int, position)
+        except Exception:
+            x, y = 0, 0
+        try:
+            viewport_w = int(dpg.get_viewport_client_width() or 0)
+            viewport_h = int(dpg.get_viewport_client_height() or 0)
+        except Exception:
+            viewport_w = viewport_h = 0
+        try:
+            _width, height = dpg.get_item_rect_size(self.tag)
+            height = int(height or 0)
+        except Exception:
+            height = 0
+        if height <= 0:
+            height = (
+            6 + self.ROW_HEIGHT * len(self.ACTIONS)
+            + self.SEPARATOR_HEIGHT * len(self.SEPARATORS_AFTER) + 8
+        )
+        if viewport_w > self.WIDTH + 8:
+            x = max(4, min(x, viewport_w - self.WIDTH - 4))
+        if viewport_h > height + 8:
+            y = max(4, min(y, viewport_h - height - 4))
+        return x, y
+
+    def popup(self, position=None, *, context=None):
+        """Open/reposition without entering any popup/modal stack."""
+        try:
+            if position is None:
+                position = dpg.get_mouse_pos(local=False)
+            position = self._clamp_position(position)
+            now = time.monotonic()
+            # Native interception and the release fallback can observe the same
+            # physical gesture on unusual backend/window-hook paths.  Treat a
+            # near-identical open as one event rather than rebuilding state.
+            duplicate = (
+                self._visible
+                and self._last_open_position == position
+                and now - self._last_open_time < 0.12
+            )
+            self._last_open_time = now
+            self._last_open_position = position
+            if duplicate:
+                return True
+            dpg.set_item_pos(self.tag, position)
             dpg.configure_item(self.tag, show=True)
-            dpg.focus_item(self.tag)
+            self._visible = True
+            enabled = self._enabled_actions()
+            self._set_current(enabled[0] if enabled else None)
             return True
         except Exception:
+            self._visible = False
             return False
 
     def hide(self):
+        self._visible = False
+        self._set_current(None)
         try:
             dpg.configure_item(self.tag, show=False)
             return True
@@ -352,16 +511,22 @@ class _ConsoleContextMenu:
             return False
 
     def delete(self):
-        try:
-            if dpg.does_item_exist(self.tag):
-                dpg.delete_item(self.tag)
-        except Exception:
-            pass
-        try:
-            if dpg.does_item_exist(self._window_theme):
-                dpg.delete_item(self._window_theme)
-        except Exception:
-            pass
+        self._visible = False
+        self._current_action = None
+        items = [
+            self.tag, self._handler_registry, *self._row_handler_registries,
+            self._window_theme, *self._themes
+        ]
+        seen = set()
+        for item in items:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            try:
+                if dpg.does_item_exist(item):
+                    dpg.delete_item(item)
+            except Exception:
+                pass
 
 
 
@@ -455,15 +620,15 @@ class ConsoleDialog(QtDialog):
             dpg.add_mouse_wheel_handler(callback=self._wheel)
             dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left, threshold=1.0, callback=self._mouse_drag)
             dpg.add_mouse_release_handler(button=dpg.mvMouseButton_Left, callback=self._mouse_release)
-            dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Right, callback=self._right_click)
-            dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Middle, callback=self._middle_click)
-            # Dear PyGui 2.3.1 can reject mvClickedHandler when an
-            # item_handler_registry is bound to mvChildWindow during floating
-            # dialog prewarm (Error 1000: handler is inapplicable).  Mouse
-            # handlers in a normal handler_registry are global and work for
-            # every item type, so filter the click by hover instead of binding
-            # a click registry directly to the child window.
-            dpg.add_mouse_click_handler(button=dpg.mvMouseButton_Left, callback=self._mouse_click)
+            dpg.add_mouse_release_handler(
+                button=dpg.mvMouseButton_Right, callback=self._right_release_fallback)
+            # Keep one lightweight global LMB observer only to relinquish the
+            # console's WM_CHAR ownership after the user clicks elsewhere. All
+            # terminal click/selection work itself is item-scoped to the
+            # draw-list above; this callback only schedules a deferred focus
+            # check and never mutates the destination widget in this batch.
+            dpg.add_mouse_click_handler(
+                button=dpg.mvMouseButton_Left, callback=self._mouse_click)
         self.focus_input()
         self._refresh()
         self.view.after(0, self._paint_tick)
@@ -479,55 +644,259 @@ class ConsoleDialog(QtDialog):
             # the child area.
             dpg.focus_item(self.tag)
 
-    def _mouse_click(self, sender=None, app_data=None, user_data=None):
+    def native_right_click(self, x=None, y=None):
+        """Open the modeless context surface after Win32 RMB dispatch ends.
+
+        The global RMB release observer defers this callback until after the
+        Dear PyGui callback batch has completed, so it may safely update the
+        modeless menu without entering a native/ImGui popup loop.
+        """
+        if not self.winfo_exists():
+            return False
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is None:
+            return False
+        self._prepare_context_menu_state()
+        try:
+            if x is None or y is None:
+                position = tuple(map(int, dpg.get_mouse_pos(local=False)))
+            else:
+                position = (int(x), int(y))
+            opened = bool(menu.popup(position, context=self))
+        except Exception:
+            opened = False
+        if opened:
+            setter = getattr(self.view, "_set_console_keyboard_active", None)
+            if callable(setter):
+                try:
+                    setter(True, self)
+                except Exception:
+                    pass
+        self._context_menu_pending = False
+        return opened
+
+    def _terminal_rect_contains(self, position):
+        """Hit-test the visible Console viewport using DPG geometry.
+
+        Capture this while the RMB release callback is still being dispatched.
+        ``is_item_hovered`` is intentionally avoided here: for a drawlist inside
+        a scrolling child window its hover flag can already be false by the next
+        deferred callback/frame even though the physical RMB happened over the
+        Console.
+        """
+        try:
+            mx, my = map(float, position)
+            x0, y0 = map(float, dpg.get_item_rect_min(self.content))
+            width, height = map(float, dpg.get_item_rect_size(self.content))
+            return width > 0 and height > 0 and x0 <= mx < x0 + width and y0 <= my < y0 + height
+        except Exception:
+            return False
+
+    def _right_release_fallback(self, sender=None, app_data=None, user_data=None):
+        """Open the terminal menu from the global RMB release observer.
+
+        The decisive hit-test is performed *now*, while this physical release is
+        still associated with the pointer position.  Only the menu mutation is
+        deferred.  This prevents the old failure mode where a next-frame
+        ``is_item_hovered`` query returned False and silently discarded the RMB.
+        """
         if not self.winfo_exists():
             return
-        if time.monotonic() < float(getattr(self, "_suppress_left_click_until", 0.0) or 0.0):
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is None:
             return
-        # The terminal uses a global left-click handler.  When a QMenu is open,
-        # that handler is dispatched for clicks on the menu as well.  Do not
-        # hide the popup before QMenu's own row-click handler has a chance to
-        # emit the selected action; otherwise rows highlight on hover but every
-        # menu command appears dead.
+        try:
+            position = tuple(map(int, dpg.get_mouse_pos(local=False)))
+        except Exception:
+            return
+        if bool(getattr(menu, "is_open", False)):
+            # QMenu-like dismissal is deferred so the target of an outside RMB
+            # still receives that physical click.
+            if not self._mouse_over_context_menu():
+                try:
+                    self.view.after(0, self._hide_context_menu)
+                except Exception:
+                    pass
+            return
+        if self._context_menu_pending or not self._terminal_rect_contains(position):
+            return
+        self._context_menu_pending = True
+        try:
+            # Do not alter the item tree inside the physical RMB callback.
+            # Reuse the position/hit decision captured above after this callback
+            # batch has completed.
+            self.view.after(0, self._open_context_menu_fallback, position)
+        except Exception:
+            self._context_menu_pending = False
+
+    def _open_context_menu_fallback(self, position=None):
+        try:
+            if not self.winfo_exists():
+                return
+            menu = getattr(self, "_context_menu_obj", None)
+            if menu is None or bool(getattr(menu, "is_open", False)):
+                return
+            # The RMB was already hit-tested in _right_release_fallback. Never
+            # re-query hover here; that delayed hover query was the root cause
+            # of the menu apparently doing nothing on the dock Console.
+            if position is None:
+                position = tuple(map(int, dpg.get_mouse_pos(local=False)))
+            self.native_right_click(*position)
+        finally:
+            # Never let a lost/failed open leave RMB permanently suppressed.
+            self._context_menu_pending = False
+
+    def _canvas_right_click(self, sender=None, app_data=None, user_data=None):
+        """Arm a safe RMB open from the terminal drawlist itself.
+
+        Some DearPyGui/GLFW builds do not reliably enqueue the global mouse
+        release handler for a scrolling child window.  The drawlist item-click
+        path is already proven for LMB/MMB, so use it as a second source.  The
+        context surface is still opened only *after* RMB is released.
+        """
+        if not self.winfo_exists():
+            return
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is None or bool(getattr(menu, "is_open", False)):
+            return
+        try:
+            position = tuple(map(int, dpg.get_mouse_pos(local=False)))
+        except Exception:
+            return
+        self._queue_context_menu_after_right_release(position)
+
+    def _queue_context_menu_after_right_release(self, position):
+        if self._context_menu_pending:
+            return
+        self._context_menu_pending = True
+        started = time.monotonic()
+        try:
+            self.view.after(0, self._wait_context_menu_right_release, position, started)
+        except Exception:
+            self._context_menu_pending = False
+
+    def _wait_context_menu_right_release(self, position, started):
+        if not self.winfo_exists():
+            self._context_menu_pending = False
+            return
+        try:
+            down = bool(dpg.is_mouse_button_down(dpg.mvMouseButton_Right))
+        except Exception:
+            down = False
+        if down and time.monotonic() - float(started) < 1.0:
+            try:
+                self.view.after(10, self._wait_context_menu_right_release, position, started)
+                return
+            except Exception:
+                pass
+        # One rendered frame after release guarantees ImGui has cleared any
+        # transient RMB ActiveId before the modeless menu becomes visible.
+        after_render = getattr(self.view, "after_render", None)
+        try:
+            if callable(after_render):
+                after_render(self._open_context_menu_fallback, position)
+            else:
+                self.view.after(0, self._open_context_menu_fallback, position)
+        except Exception:
+            self._context_menu_pending = False
+
+    def _canvas_left_click(self, sender=None, app_data=None, user_data=None):
+        """Handle selection only for a click that belongs to the canvas.
+
+        This callback is bound through an item handler registry, so toolbar,
+        menu and sibling-window clicks never enter terminal selection logic.
+        """
+        if not self.winfo_exists():
+            return
+        if time.monotonic() < float(
+                getattr(self, "_suppress_left_click_until", 0.0) or 0.0):
+            return
         if self._mouse_over_context_menu():
             return
+        self.focus_input(follow_tail=False)
+        cell = self._cell_from_mouse()
+        if cell is None:
+            return
+        now = time.monotonic()
+        same_row = self._last_click_row == cell[0]
+        self._click_count = (
+            self._click_count + 1
+            if same_row and now - self._last_click_time <= 0.45 else 1
+        )
+        self._last_click_time, self._last_click_row = now, cell[0]
+        if self._click_count >= 3:
+            self._select_line_at(cell)
+            self._click_count = 0
+            self._selection_dragging = False
+        elif self._click_count == 2:
+            self._select_word_at(cell)
+            self._selection_dragging = False
+        else:
+            self._selection_anchor = cell
+            self._selection_focus = cell
+            self._selection_dragging = True
+        self._last_paint = None
+
+    def _mouse_click(self, sender=None, app_data=None, user_data=None):
+        """Global LMB callback used only to relinquish console keyboard input.
+
+        Check menu ownership now, but defer focus changes and dismissal so a
+        menu button remains visible until its mouse-release activation.
+        """
+        if not self.winfo_exists():
+            return
+        # Capture menu ownership on mouse-down. Buttons activate on release;
+        # dismissing their window between those events cancels the action.
+        if self._mouse_over_context_menu():
+            return
+        try:
+            self.view.after(0, self._deactivate_keyboard_if_pointer_outside)
+        except Exception:
+            pass
+
+    def _deactivate_keyboard_if_pointer_outside(self):
+        if not self.winfo_exists():
+            return
+        if self._mouse_over_context_menu():
+            return
+        # The menu is an ordinary modeless window.  This callback itself is
+        # queued with view.after(0); clicks inside the menu were filtered on
+        # mouse-down. Outside controls retain their physical click when this
+        # overlay is dismissed.
+        self._hide_context_menu()
         if self._over_terminal():
-            self.focus_input(follow_tail=False)
-            self._hide_context_menu()
-            cell = self._cell_from_mouse()
-            if cell is None:
-                return
-            now = time.monotonic()
-            same_row = self._last_click_row == cell[0]
-            self._click_count = self._click_count + 1 if same_row and now - self._last_click_time <= 0.45 else 1
-            self._last_click_time, self._last_click_row = now, cell[0]
-            if self._click_count >= 3:
-                self._select_line_at(cell)
-                self._click_count = 0
-                self._selection_dragging = False
-            elif self._click_count == 2:
-                self._select_word_at(cell)
-                self._selection_dragging = False
-            else:
-                self._selection_anchor = cell
-                self._selection_focus = cell
-                self._selection_dragging = True
-            self._last_paint = None
+            return
+        setter = getattr(self.view, "_set_console_keyboard_active", None)
+        if callable(setter):
+            setter(False, self)
 
     def _mouse_over_context_menu(self):
-        """Return True while the pointer is inside the visible console menu."""
+        """Hit-test the menu without relying on stale hidden-window geometry."""
         menu = getattr(self, "_context_menu_obj", None)
-        if bool(getattr(menu, "is_open", False)):
-            return True
+        if menu is None or not bool(getattr(menu, "is_open", False)):
+            return False
         tag = getattr(menu, "tag", None)
         if tag is None:
             return False
         try:
             if not dpg.does_item_exist(tag) or not dpg.is_item_shown(tag):
                 return False
+            if dpg.is_item_hovered(tag):
+                return True
+        except Exception:
+            pass
+        try:
             mx, my = map(float, dpg.get_mouse_pos(local=False))
-            x0, y0 = map(float, dpg.get_item_rect_min(tag))
-            width, height = map(float, dpg.get_item_rect_size(tag))
+            x0, y0 = map(float, dpg.get_item_pos(tag))
+            config = dpg.get_item_configuration(tag) or {}
+            try:
+                width, height = map(float, dpg.get_item_rect_size(tag))
+            except Exception:
+                width = height = 0
+            if width <= 1:
+                width = float(config.get("width") or 0)
+            if height <= 1:
+                height = float(config.get("height") or 0)
             return x0 <= mx < x0 + width and y0 <= my < y0 + height
         except Exception:
             return False
@@ -625,6 +994,8 @@ class ConsoleDialog(QtDialog):
             self._edited()
 
     def _select_all(self):
+        if self._context_menu_key_action("select_all"):
+            return
         if not self._render_rows:
             return
         self._selection_anchor = (0, 0)
@@ -675,18 +1046,18 @@ class ConsoleDialog(QtDialog):
         self._scroll_pending = True
 
     def _create_context_menu(self):
-        """Create one shared QMenu-style terminal context menu.
+        """Create one item-scoped, modeless context surface for the terminal.
 
-        ConsoleDialog and the embedded ConsoleDockPanel used to maintain two
-        hand-written popup windows.  Reuse the retained QMenu renderer so row
-        height, separators, keyboard navigation and disabled states match the
-        rest of WinUx.
+        The RMB trigger is native-preempted on Windows with a deferred release
+        fallback.  The menu is neither a Win32 menu nor an ImGui popup,
+        so no nested/native loop or popup stack can retain pointer activation.
         """
-        menu = _NativeConsoleContextMenu(self) if os.name == "nt" else _ConsoleContextMenu(self)
+        menu = _ConsoleContextMenu(self)
         self._context_menu_obj = menu
         self._context_menu = menu.tag
-        if self._context_menu is not None:
-            register_pointer_protected_item(self._context_menu)
+        # Do not register this surface with WinUx's global pointer gate.  It is
+        # intentionally modeless; only its own rectangle receives its clicks,
+        # while an outside click remains available to the destination widget.
 
     def _context_menu_triggered(self, action, _context=None):
         callback = {
@@ -699,56 +1070,17 @@ class ConsoleDialog(QtDialog):
         if callback is not None:
             self._menu_action(callback)
 
-    def _right_click(self, sender=None, app_data=None, user_data=None):
-        """Queue RMB handling until Dear PyGui has completed input/render dispatch.
-
-        This callback is registered in a global handler registry.  Calling any
-        DPG item/query API from here can re-enter the native Dear ImGui/GLFW
-        dispatch path on Windows.  In particular, hover queries and popup
-        creation from this callback have caused process-level crashes that
-        Python ``try/except`` cannot catch.  Keep this callback DPG-free and
-        defer the entire hit-test/menu operation until a future rendered frame.
-        """
-        if self._context_menu_pending:
+    def _prepare_context_menu_state(self):
+        """Synchronize QMenu-like action state after native RMB dispatch."""
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is None:
             return
-        self._context_menu_pending = True
-        try:
-            self.view.after_render(self._show_context_menu_after_render)
-        except Exception:
-            self._context_menu_pending = False
-
-    def _show_context_menu_after_render(self):
-        self._context_menu_pending = False
-        if not self.winfo_exists():
-            return
-        # All DPG queries are intentionally delayed until this future frame.
-        # If the RMB was outside the terminal, do nothing.
-        if not self._over_terminal():
-            return
-        try:
-            mx, my = map(int, dpg.get_mouse_pos(local=False))
-            menu = getattr(self, "_context_menu_obj", None)
-            if menu is None:
-                return
-            self.focus_input(follow_tail=False)
-            menu.setActionEnabled("copy", bool(self._selected_text()))
-            # Do not touch the OS/DPG clipboard while opening the menu.  Paste
-            # remains available and validates/reads the clipboard only if the
-            # user actually chooses Paste, outside the RMB dispatch path.
-            menu.setActionEnabled("paste", True)
-            chosen = menu.popup((mx, my), context=self)
-            if chosen:
-                # The mouse-up that selected a native menu row can be observed
-                # by Dear PyGui after TrackPopupMenuEx returns.  Ignore left
-                # clicks for a very short interval so it cannot alter terminal
-                # selection or focus before the action executes.
-                self._suppress_left_click_until = time.monotonic() + 0.20
-                self.view.after(0, self._context_menu_triggered, chosen, self)
-        except Exception:
-            try:
-                self._hide_context_menu()
-            except Exception:
-                pass
+        has_rows = bool(self._render_rows)
+        menu.setActionEnabled("copy", bool(self._selected_text()))
+        menu.setActionEnabled("paste", _win_clipboard_has_text())
+        menu.setActionEnabled("select_all", has_rows)
+        menu.setActionEnabled("find", has_rows)
+        menu.setActionEnabled("clear", bool(self._last_output or self.buffer.output or self.buffer.draft))
 
     def _hide_context_menu(self):
         try:
@@ -758,16 +1090,37 @@ class ConsoleDialog(QtDialog):
         except Exception:
             pass
 
+    def _context_menu_key_action(self, action):
+        """Route a keyboard accelerator through the visible QMenu surface.
+
+        Returning True means a menu is open and the underlying terminal
+        shortcut must not run, even if that action is currently disabled.
+        """
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is None or not bool(getattr(menu, "is_open", False)):
+            return False
+        menu.trigger(action)
+        return True
+
     def _menu_action(self, callback):
-        # A native Windows menu is already destroyed before this runs.  Do not
-        # touch DPG popup state here; execute only the terminal action.  This
-        # keeps menu selection out of Dear ImGui's callback stack.
-        if os.name != "nt":
-            self._hide_context_menu()
+        # Hide first, then mutate terminal/clipboard state only after the menu
+        # button click has finished.  The short suppression window prevents the
+        # same LMB gesture from becoming a terminal selection if the modeless
+        # menu overlaps the console canvas.
+        self._hide_context_menu()
+        self._suppress_left_click_until = time.monotonic() + 0.12
         callback()
         self._last_paint = None
+        try:
+            self.focus_input(follow_tail=False)
+        except Exception:
+            pass
 
     def invoke_default(self):
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is not None and bool(getattr(menu, "is_open", False)):
+            if menu.activate_current():
+                return
         if self._find_active:
             self.view.after(0, self._find_next, 1)
             return
@@ -848,6 +1201,8 @@ class ConsoleDialog(QtDialog):
 
     def _paste(self):
         if self._ctrl_down():
+            if self._context_menu_key_action("paste"):
+                return
             value = _win_clipboard_text_get().replace("\r", " ").replace("\n", " ")
             if self._find_active:
                 self._find_query += value
@@ -857,6 +1212,8 @@ class ConsoleDialog(QtDialog):
                 self._edited()
 
     def _control_c(self):
+        if self._context_menu_key_action("copy"):
+            return
         selected = self._selected_text()
         if selected:
             _win_clipboard_text_set(selected)
@@ -869,19 +1226,27 @@ class ConsoleDialog(QtDialog):
             self._interrupt()
 
     def _up_key(self):
-        if self._find_active:
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is not None and bool(getattr(menu, "is_open", False)):
+            menu.move_current(-1)
+        elif self._find_active:
             self._find_next(-1)
         else:
             self._recall(-1)
 
     def _down_key(self):
-        if self._find_active:
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is not None and bool(getattr(menu, "is_open", False)):
+            menu.move_current(1)
+        elif self._find_active:
             self._find_next(1)
         else:
             self._recall(1)
 
     def _find_shortcut(self, sender=None, app_data=None, user_data=None):
         if self._ctrl_down():
+            if self._context_menu_key_action("find"):
+                return
             self.view.after(0, self._open_find)
 
     def _find_repeat_shortcut(self, sender=None, app_data=None, user_data=None):
@@ -935,6 +1300,10 @@ class ConsoleDialog(QtDialog):
         self._last_paint = None
 
     def _close_from_escape(self):
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is not None and bool(getattr(menu, "is_open", False)):
+            menu.hide()
+            return
         if self._find_active:
             self._close_find()
             return
@@ -1155,10 +1524,8 @@ class ConsoleDockPanel(ConsoleDialog):
                 callback=self._mouse_drag)
             dpg.add_mouse_release_handler(
                 button=dpg.mvMouseButton_Left, callback=self._mouse_release)
-            dpg.add_mouse_click_handler(
-                button=dpg.mvMouseButton_Right, callback=self._right_click)
-            dpg.add_mouse_click_handler(
-                button=dpg.mvMouseButton_Middle, callback=self._middle_click)
+            dpg.add_mouse_release_handler(
+                button=dpg.mvMouseButton_Right, callback=self._right_release_fallback)
             dpg.add_mouse_click_handler(
                 button=dpg.mvMouseButton_Left, callback=self._mouse_click)
 
@@ -1192,17 +1559,6 @@ class ConsoleDockPanel(ConsoleDialog):
         except Exception:
             pass
 
-    def _mouse_click(self, sender=None, app_data=None, user_data=None):
-        if not self.winfo_exists():
-            return
-        if time.monotonic() < float(getattr(self, "_suppress_left_click_until", 0.0) or 0.0):
-            return
-        if self._over_terminal():
-            return super()._mouse_click(sender, app_data, user_data)
-        setter = getattr(self.view, "_set_console_keyboard_active", None)
-        if callable(setter):
-            setter(False, self)
-
     def _dock_key_callback(self, sender=None, app_data=None, user_data=None):
         if self.keyboard_active() and callable(user_data):
             self.view.after(0, user_data)
@@ -1214,7 +1570,10 @@ class ConsoleDockPanel(ConsoleDialog):
     def _dock_escape_callback(self, sender=None, app_data=None, user_data=None):
         if not self.keyboard_active():
             return
-        if self._find_active:
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is not None and bool(getattr(menu, "is_open", False)):
+            self.view.after(0, menu.hide)
+        elif self._find_active:
             self.view.after(0, self._close_find)
 
     def _dock_ctrl_c_callback(self, sender=None, app_data=None, user_data=None):
@@ -1238,7 +1597,10 @@ class ConsoleDockPanel(ConsoleDialog):
         self.view.after(0, self._find_next, direction)
 
     def _close_from_escape(self):
-        if self._find_active:
+        menu = getattr(self, "_context_menu_obj", None)
+        if menu is not None and bool(getattr(menu, "is_open", False)):
+            menu.hide()
+        elif self._find_active:
             self._close_find()
 
     def destroy(self):

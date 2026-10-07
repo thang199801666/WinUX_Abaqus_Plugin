@@ -16,6 +16,7 @@ from ..platform.floating_viewport import (
 from .floating_forms import create_form, deliver_command, client_layout
 from .theme import DialogMetrics
 from ..services.floating_protocol import read_messages, encode_message
+from ..runtime.dpg_callbacks import run_callback_jobs
 
 
 PUBLISH_HANDSHAKE_TIMEOUT = 20.0
@@ -107,6 +108,29 @@ class PreparedViewport:
         return None
 
 
+
+
+def _normalize_size_pair(value, fallback):
+    """Return a robust (width, height) pair from DPG configuration values.
+
+    Dear PyGui may expose unset vector properties such as ``min_size`` as an
+    empty tuple on some builds/contexts (notably prepared child viewports).
+    Floating dialog startup must never index those values directly.
+    """
+    try:
+        if isinstance(value, (tuple, list)) and len(value) >= 2:
+            width = int(value[0])
+            height = int(value[1])
+            if width > 0 and height > 0:
+                return width, height
+    except (TypeError, ValueError, IndexError, OverflowError):
+        pass
+    try:
+        return max(1, int(fallback[0])), max(1, int(fallback[1]))
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return 320, 180
+
+
 class FloatingDialogRuntime:
     def __init__(self, connection, messages, initial, prepared=None):
         self.connection, self.messages, self.initial = connection, messages, initial
@@ -120,6 +144,7 @@ class FloatingDialogRuntime:
         self._publish_requested = False
         self._commit_requested = False
         self.startup = list(prepared.startup) if prepared else []
+        self.stage = "runtime-init"
 
     def emit(self, event, **values):
         self.connection.sendall(encode_message({"event": event, **values}))
@@ -142,7 +167,7 @@ class FloatingDialogRuntime:
         """Run queued layout callbacks before rendering one invisible frame."""
         callbacks = dpg.get_callback_queue() or []
         if callbacks:
-            dpg.run_callbacks(callbacks)
+            run_callback_jobs(callbacks)
         self.view.drain()
         dpg.render_dearpygui_frame()
 
@@ -249,9 +274,12 @@ class FloatingDialogRuntime:
 
     def _build(self):
         initial = self.initial
+        self.stage = "configure-context"
         if self.prepared is None:
             configure_context(self.view)
+        self.stage = "create-form:{}".format(initial.get("kind") or "unknown")
         self.form = create_form(initial["kind"], initial.get("payload") or {}, self.view, self.emit)
+        self.stage = "configure-form"
         # This form is the sole content of a dedicated native viewport.  Preserve
         # its last rendered pixels until SW_HIDE; deleting the DPG item first
         # exposes the viewport clear colour (black) during close hand-off.
@@ -260,17 +288,22 @@ class FloatingDialogRuntime:
         self.form.modal = True
         dpg.configure_item(self.form.tag, modal=False, no_title_bar=True, no_move=True,
                            no_resize=True, no_collapse=True, pos=(0, 0), show=True)
-        minimum = dpg.get_item_configuration(self.form.tag).get("min_size", [320, 180])
-        preferred = getattr(self.form, "preferred_size", None)
-        if preferred is None:
-            preferred = (int(initial.get("width", 560)), max(int(initial.get("height", 360)), self.form.height))
-        width = max(int(preferred[0]), int(minimum[0]))
-        height = int(preferred[1]) + 40
+        configured_minimum = dpg.get_item_configuration(self.form.tag).get("min_size")
+        minimum = _normalize_size_pair(configured_minimum, (320, 180))
+        default_preferred = (
+            int(initial.get("width", 560)),
+            max(int(initial.get("height", 360)), int(getattr(self.form, "height", 180) or 180)),
+        )
+        preferred = _normalize_size_pair(
+            getattr(self.form, "preferred_size", None), default_preferred)
+        width = max(preferred[0], minimum[0])
+        height = preferred[1] + 40
         owner = int(initial.get("owner_hwnd") or 0)
         x, y = centered_position(window_rect(owner), (width, height), work_area(owner))
         options = dict(title=str(initial.get("title") or "WinUx Dialog"), width=width, height=height,
-            x_pos=x, y_pos=y, min_width=int(minimum[0]), min_height=int(minimum[1])+40,
+            x_pos=x, y_pos=y, min_width=minimum[0], min_height=minimum[1]+40,
             resizable=bool(initial.get("resizable", True)), vsync=False)
+        self.stage = "create-or-configure-viewport"
         if self.prepared:
             dpg.configure_viewport(0, **options)
             dpg.set_primary_window(self.prepared.blank, False)
@@ -297,8 +330,12 @@ class FloatingDialogRuntime:
         self.form.hide = self.hide
         self.form.show = self.form.lift = self.show
         # Theme/chrome, callbacks, initial RPC state and layout settle while
-        # cloaked. No intermediate frame is composed on the desktop.
-        for _ in range(3):
+        # cloaked. No intermediate frame is composed on the desktop. A prewarmed
+        # worker already has a live DPG context/swap-chain, so two settle frames
+        # are sufficient; cold workers retain the conservative three-frame path.
+        self.stage = "settle-layout"
+        settle_frames = 2 if self.prepared is not None else 3
+        for _ in range(settle_frames):
             self._drain_commands(preparing=True)
             if not self.form.winfo_exists():
                 return
@@ -311,12 +348,14 @@ class FloatingDialogRuntime:
                 dpg.set_viewport_height(dpg.get_viewport_height() + int(overflow) + 8)
                 self._render_settled_frame()
                 self._render_settled_frame()
+        self.stage = "center-native-window"
         self.native.center(owner)
         self.startup.append({"stage": "prepared", "cloaked": cloaked(self.native.hwnd),
                              "rect": window_rect(self.native.hwnd)})
         # Keep vsync disabled through the hidden preparation transaction.  The
         # viewport is not visible yet, so paying monitor intervals here only adds
         # latency and increases the window in which stale surfaces can be shown.
+        self.stage = "prepared-handshake"
         self.emit("prepared", hwnd=self.native.hwnd, pid=os.getpid())
         if not self._wait_for_publish():
             if self.form.winfo_exists():
@@ -334,7 +373,12 @@ class FloatingDialogRuntime:
             # ShowWindow happened while cloaked.  Render after mapping so GLFW's
             # swap chain contains the final dialog rather than its old blank frame.
             self._render_settled_frame()
-            self._render_settled_frame()
+            # A prewarmed swap-chain has already been presented while cloaked;
+            # one mapped render is enough before the compositor barrier. Cold
+            # starts keep a second render to avoid exposing an uninitialized
+            # first swap on older GLFW/DPG builds.
+            if self.prepared is None:
+                self._render_settled_frame()
             # Transfer foreground while the WinUx owner is still enabled.  The
             # parent disables the owner only after receiving ``staged`` below, so
             # Windows never needs to activate an unrelated desktop window.
@@ -356,6 +400,7 @@ class FloatingDialogRuntime:
             if not self.native.is_foreground():
                 self.native.activate()
             self._focus_form()
+        self.stage = "ready-layout-diagnostics"
         self.emit(
             "ready",
             hwnd=self.native.hwnd,
@@ -376,7 +421,7 @@ class FloatingDialogRuntime:
                 self._drain_commands()
                 if not self.form.winfo_exists():
                     break
-                dpg.run_callbacks(dpg.get_callback_queue() or [])
+                run_callback_jobs(dpg.get_callback_queue() or [])
                 self.view.drain()
                 dpg.render_dearpygui_frame()
                 if not self.native.visible:

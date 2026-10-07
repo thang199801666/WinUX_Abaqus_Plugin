@@ -29,7 +29,7 @@ class TransferCenterV2Tests(unittest.TestCase):
     def test_each_transfer_row_owns_a_progress_bar(self):
         source = TRANSFER.read_text(encoding="utf-8")
         self.assertIn("self.progress_bar(", source)
-        self.assertIn('overlay="0%"', source)
+        self.assertIn('progress_text = dpg.draw_text(', source)
         self.assertIn('action = self.action(', source)
         self.assertIn('"Cancel",', source)
         self.assertIn('self.row_widgets[row_id]', source)
@@ -52,19 +52,21 @@ class TransferCenterV2Tests(unittest.TestCase):
         self.assertIn("self.process_queued_drop", block)
         self.assertIn("list(paths", block)
 
-    def test_percentage_is_rendered_inside_progress_bar(self):
+    def test_percentage_is_centered_over_progress_bar(self):
         source = TRANSFER.read_text(encoding="utf-8")
-        self.assertIn('overlay="0%"', source)
-        self.assertIn('dpg.configure_item(row["progress"], overlay=', source)
-        self.assertNotIn("progress_text", source)
+        self.assertIn('progress_text = dpg.draw_text(', source)
+        self.assertIn('def _center_progress_text', source)
+        self.assertIn('self._set_progress_text(row_id, values["ratio"])', source)
+        self.assertNotIn('dpg.configure_item(row["progress"], overlay=', source)
 
     def test_cancel_button_shares_progress_row(self):
         source = TRANSFER.read_text(encoding="utf-8")
         self.assertIn("with dpg.table_row(parent=table) as row_parent:", source)
         row = source.split("with dpg.table_row(parent=table) as row_parent:", 1)[1].split("stats =", 1)[0]
         self.assertIn("self.progress_bar(", row)
+        self.assertIn("progress_host = dpg.add_child_window(", row)
         self.assertIn("action = self.action(", row)
-        self.assertIn("parent=row_parent", row)
+        self.assertIn("dpg.add_spacer(parent=row_parent, width=10)", row)
 
     def test_speed_sampler_resets_when_byte_counter_restarts(self):
         source = TRANSFER_LOGIC.read_text(encoding="utf-8")

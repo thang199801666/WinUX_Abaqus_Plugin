@@ -23,6 +23,39 @@ from abaqusGui import (
     showAFXInformationDialog,
 )
 
+
+def _read_bundled_version():
+    try:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "VERSION")
+        with open(path, "r") as handle:
+            return str(handle.read().strip())
+    except Exception:
+        return ""
+
+
+def _release_key(value):
+    """Best-effort Python-2/3-compatible release tuple for bootstrap ordering."""
+    try:
+        text = str(value or "").strip()
+        if text[:1].lower() == "v":
+            text = text[1:]
+        text = text.split("+", 1)[0].split("-", 1)[0]
+        parts = tuple(int(piece) for piece in text.split("."))
+        return parts if parts else None
+    except Exception:
+        return None
+
+
+def _bundled_is_newer_than(active_version):
+    bundled = _release_key(_read_bundled_version())
+    active = _release_key(active_version)
+    if bundled is None or active is None:
+        return False
+    width = max(len(bundled), len(active))
+    bundled = bundled + (0,) * (width - len(bundled))
+    active = active + (0,) * (width - len(active))
+    return bundled > active
+
 def _activate_self_updated_bootstrap():
     """Prefer the per-user immutable bootstrap while keeping this file stable.
 
@@ -44,6 +77,19 @@ def _activate_self_updated_bootstrap():
         return None
     versions = []
     active = str(state.get("active_version") or "").strip()
+    # A manually deployed/newer bundled build must not be shadowed by an older
+    # immutable bootstrap in LocalAppData. This is especially important for
+    # hotfix packages: otherwise child dialogs continue executing the stale
+    # runtime even after the plug-in folder has been replaced.
+    if active and _bundled_is_newer_than(active):
+        os.environ["WINUX_BOOTSTRAP_MODE"] = "bundled"
+        # Runtime selection and install strategy are intentionally independent.
+        # A newer bundled hotfix should win over a stale immutable runtime, but
+        # must NOT force the updater back to the legacy in-place directory swap.
+        # The legacy swap renames the live plug-in directory and is vulnerable
+        # to WinError 32 when any Abaqus/WinUx helper still has a file open.
+        os.environ["WINUX_PREFER_BUNDLED_RUNTIME"] = "1"
+        return None
     if active:
         versions.append(active)
     previous = state.get("previous_versions")

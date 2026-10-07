@@ -9,7 +9,7 @@ import subprocess
 import tempfile
 import threading
 
-from .floating_dialog import floating_dialog_command
+from .floating_dialog import floating_dialog_command, floating_dialog_log_path
 from ..runtime.child_processes import (
     register_child_process, unregister_child_process,
 )
@@ -26,7 +26,7 @@ class PreparedWorker:
         self.listener = None
         self._reap_started = False
         self.token = secrets.token_hex(32)
-        self.log_path = str(Path(tempfile.gettempdir()) / "WinUx" / "logs" / "floating_dialog_prewarm.log")
+        self.log_path = floating_dialog_log_path("prewarm")
 
     def prepare(self):
         try:

@@ -13,6 +13,8 @@ NATIVE_HOST = ROOT / "WinUx" / "platform" / "native_dialog_host.py"
 FLOATING_VIEWPORT = ROOT / "WinUx" / "platform" / "floating_viewport.py"
 FLOATING_DIALOG = ROOT / "WinUx" / "dialogs" / "floating_dialog.py"
 FLOATING_RUNTIME = ROOT / "WinUx" / "dialogs" / "floating_runtime.py"
+VIEW = ROOT / "WinUx" / "view.py"
+PREWARM_POOL = ROOT / "WinUx" / "dialogs" / "prewarm_pool.py"
 
 
 class _QueueView:
@@ -476,7 +478,7 @@ class DialogFlickerSourceTests(unittest.TestCase):
         body = source.split("def handoff_owner_before_close", 1)[1]
         body = body.split("def restore_owner_focus", 1)[0]
         self.assertIn("current != closing_hwnd", body)
-        self.assertIn("_restore_owner_activation(owner_hwnd, raise_z_order=False)", body)
+        self.assertIn("_restore_owner_activation(owner_hwnd, raise_z_order=True)", body)
         self.assertNotIn("SetWindowPos", body)
         self.assertNotIn("ShowWindow", body)
 
@@ -505,6 +507,33 @@ class DialogFlickerSourceTests(unittest.TestCase):
         self.assertIn("owner_generation != _OWNER_FOCUS_GENERATIONS", source)
         self.assertIn("if attempt < 32", source)
 
+
+    def test_modal_input_is_not_acquired_during_floating_child_bootstrap(self):
+        source = FLOATING_DIALOG.read_text(encoding="utf-8")
+        init = source.split("def __init__(self, view, kind, title", 1)[1]
+        init = init.split("def post(self, command", 1)[0]
+        self.assertNotIn("acquire_native_modal_input(self)", init)
+        prepared = source.split('if event == "prepared":', 1)[1]
+        prepared = prepared.split('elif event == "staged":', 1)[0]
+        self.assertIn("acquire_native_modal_input(self)", prepared)
+
+    def test_dialog_prewarm_starts_during_view_construction(self):
+        source = VIEW.read_text(encoding="utf-8")
+        init = source.split("def __init__(self, callbacks):", 1)[1]
+        init = init.split("def _find_main_viewport_hwnd", 1)[0]
+        self.assertIn("start_dialog_prewarm(self)", init)
+        run = source.split("def run(self):", 1)[1]
+        run = run.split("def after(self, delay", 1)[0]
+        self.assertNotIn("self.after(0, start_dialog_prewarm, self)", run)
+
+    def test_default_prewarm_pool_keeps_two_workers_ready_or_preparing(self):
+        source = PREWARM_POOL.read_text(encoding="utf-8")
+        self.assertIn("def __init__(self, capacity=2):", source)
+
+    def test_prewarmed_dialog_uses_shorter_hidden_settle_path(self):
+        source = FLOATING_RUNTIME.read_text(encoding="utf-8")
+        self.assertIn("settle_frames = 2 if self.prepared is not None else 3", source)
+        self.assertIn("if self.prepared is None:\n                self._render_settled_frame()", source)
 
 
 if __name__ == "__main__":

@@ -106,6 +106,13 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
     ODB_SNAPSHOT_RETRIES = 3
     ODB_CHECK_TIMEOUT_SECONDS = 600.0
     ABAQUS_PROBE_TIMEOUT_SECONDS = 45.0
+    # Launcher discovery is intentionally cheap: one login-shell command checks
+    # which configured Abaqus commands actually exist before any heavy
+    # ``odbAccess/openOdb`` interpreter is started.  Keep a short hard timeout
+    # here so a broken profile/login shell cannot make Plots slower than the
+    # compatibility probes it is meant to optimize.
+    ABAQUS_DISCOVERY_TIMEOUT_SECONDS = 5.0
+    ABAQUS_DISCOVERY_CACHE_SECONDS = 300.0
     ABAQUS_FALLBACK_COMMANDS = tuple(
         ["abq{}".format(year) for year in range(2026, 2017, -1)]
         + ["abaqus"]
@@ -169,6 +176,12 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
         # The entry is only a priority hint: every new analysis session probes
         # it again before use so a recreated ODB can safely change release.
         self._odb_abaqus_command_cache = {}
+        # Compatibility discovery state is session-local on purpose.  A cached
+        # release only changes probe priority; it never bypasses opening the
+        # real ODB, so recreated databases remain safe.
+        self._odb_abaqus_directory_hint_cache = {}
+        self._odb_abaqus_host_hint_cache = {}
+        self._abaqus_available_command_cache = {}
         self._odb_abaqus_command_cache_lock = threading.RLock()
 
     def request_shutdown(self):

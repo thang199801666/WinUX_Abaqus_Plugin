@@ -22,6 +22,24 @@ def _project_dir():
         os.path.abspath(__file__)
     )
     configured = os.path.abspath(configured)
+
+    # ``WINUX_APP_DIR`` can be stale when the bootstrap was started by a
+    # long-lived Abaqus/CAE process that still has an older launcher module in
+    # memory.  Before the normal startup update check, rebind to the active
+    # immutable deployment so the already-installed version is the one compared
+    # with GitHub.  Explicit dev/health-check launches remain pinned to the
+    # requested directory.
+    if (os.environ.get("WINUX_SKIP_UPDATE", "").strip() != "1" and
+            os.environ.get("WINUX_HEALTH_CHECK", "").strip() != "1" and
+            "--update-health-check" not in sys.argv):
+        try:
+            from winux_installation_state import resolve_active_installation
+            active = resolve_active_installation(configured, environ=os.environ)
+        except Exception:
+            active = None
+        if active and os.path.isfile(os.path.join(active, "WinUx", "__main__.py")):
+            configured = os.path.abspath(active)
+
     if not os.path.isfile(os.path.join(configured, "WinUx", "__main__.py")):
         raise RuntimeError(
             "WinUx must be beside run_winux.py, or WINUX_APP_DIR must point "

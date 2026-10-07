@@ -20,6 +20,7 @@ from .controllers import validate_callbacks
 from . import dialogs as _dialogs
 from .diagnostics import crash_guard, log_event, log_exception
 from .runtime import UIHangWatchdog, UiDispatcher
+from .runtime.dpg_callbacks import invoke_callback_job
 from .components.qt_style import QtFusionPalette
 from .components.toolbar import (
     file_status_bar_theme, file_status_text_theme, resource_menu_theme,
@@ -120,8 +121,12 @@ class WinUXView(
         self._console_dock_drag_registry = None
         self._console_keyboard_panel = None
         self._console_native_hwnd = None
+        self._main_viewport_hwnd = None
         self._console_native_old_wndproc = None
         self._console_native_wndproc_callback = None
+        # Native RMB ownership for the embedded terminal.  The WNDPROC consumes
+        # both down/up so Dear ImGui never enters a right-button ActiveId state
+        # on the custom console draw-list.
         self._dispatcher = UiDispatcher()
         self._watchdog = None
         # Callbacks that must run only after a rendered frame (most notably
@@ -585,15 +590,102 @@ class WinUXView(
         self._watchdog.add_snapshot_provider(
             "ui_dispatcher", self._dispatcher.snapshot)
 
+        # Start floating-dialog workers as soon as the main DPG context is
+        # ready.  The old path waited until after the viewport had already been
+        # shown and rendered two frames, so an early Settings/Login/etc. click
+        # frequently missed the warm pool and paid a full ``abaqus python``
+        # process launch.  Preparation is asynchronous and never blocks this
+        # constructor or the main UI thread.
+        from .dialogs.prewarm_pool import start_dialog_prewarm
+        start_dialog_prewarm(self)
+
 
     def _find_main_viewport_hwnd(self):
+        """Resolve the Dear PyGui/GLFW main HWND without depending on a child view.
+
+        The old implementation delegated to ``left.listview``.  That made the
+        Console RMB/WM_CHAR hook disappear whenever the Explorer pane had not
+        finished constructing (or its HWND helper temporarily returned 0).
+        Resolve the process top-level window directly as a fallback and cache
+        only handles that Windows still reports as valid.
+        """
         if os.name != "nt":
             return None
+        try:
+            user32 = ctypes.windll.user32
+            cached = int(getattr(self, "_main_viewport_hwnd", 0) or 0)
+            if cached and user32.IsWindow(wintypes.HWND(cached)):
+                return cached
+        except Exception:
+            pass
+
+        # Keep the existing component-specific finder as the first fast path.
         try:
             listview = getattr(getattr(self, "left", None), "listview", None)
             finder = getattr(listview, "_find_own_top_level_hwnd", None)
             if callable(finder):
-                return int(finder() or 0) or None
+                hwnd = int(finder() or 0)
+                if hwnd:
+                    self._main_viewport_hwnd = hwnd
+                    return hwnd
+        except Exception:
+            pass
+
+        # Independent fallback: enumerate visible top-level windows owned by
+        # this process.  Prefer the exact WinUX viewport title, then any
+        # ownerless process window.  This works even before FilePanel/ListView
+        # has reached its first stable layout frame.
+        try:
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            user32.IsWindowVisible.argtypes = [wintypes.HWND]
+            user32.IsWindowVisible.restype = wintypes.BOOL
+            user32.GetWindowThreadProcessId.argtypes = [
+                wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+            user32.GetWindowTextLengthW.restype = ctypes.c_int
+            user32.GetWindowTextW.argtypes = [
+                wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+            user32.GetWindowTextW.restype = ctypes.c_int
+            user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetWindow.restype = wintypes.HWND
+            process_id = int(kernel32.GetCurrentProcessId())
+            candidates = []
+            enum_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+            user32.EnumWindows.argtypes = [enum_type, wintypes.LPARAM]
+            user32.EnumWindows.restype = wintypes.BOOL
+
+            def visit(hwnd, _lparam):
+                try:
+                    pid = wintypes.DWORD()
+                    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                    if int(pid.value) != process_id or not user32.IsWindowVisible(hwnd):
+                        return True
+                    length = int(user32.GetWindowTextLengthW(hwnd) or 0)
+                    buffer = ctypes.create_unicode_buffer(max(1, length + 1))
+                    user32.GetWindowTextW(hwnd, buffer, len(buffer))
+                    title = str(buffer.value or "")
+                    owner = int(user32.GetWindow(hwnd, 4) or 0)  # GW_OWNER
+                    score = 0
+                    if title == "WinUX":
+                        score += 100
+                    elif title.lower().startswith("winux"):
+                        score += 80
+                    if owner == 0:
+                        score += 20
+                    candidates.append((score, int(hwnd), title))
+                except Exception:
+                    pass
+                return True
+
+            callback = enum_type(visit)
+            user32.EnumWindows(callback, 0)
+            if candidates:
+                _score, hwnd, _title = max(candidates, key=lambda item: item[0])
+                if hwnd:
+                    self._main_viewport_hwnd = hwnd
+                    return hwnd
         except Exception:
             pass
         return None
@@ -605,8 +697,9 @@ class WinUXView(
         for a custom drawn terminal.  The old floating console received WM_CHAR
         from its private viewport; the docked console now shares the main GLFW
         HWND, so subclass that window and consume characters only when the
-        terminal explicitly owns keyboard input.  All other controls continue
-        through the previous WNDPROC unchanged.
+        terminal explicitly owns keyboard input.  Pointer/context-menu input is
+        deliberately left to Dear PyGui and all other messages continue through
+        the previous WNDPROC unchanged.
         """
         if os.name != "nt" or self._console_native_wndproc_callback is not None:
             return bool(self._console_native_wndproc_callback)
@@ -638,6 +731,13 @@ class WinUXView(
                             and getattr(panel, "keyboard_active", lambda: False)()):
                         self.after(0, panel.native_character, int(wparam))
                         return 0
+
+                # RMB is intentionally *not* intercepted here.  The console
+                # context menu is driven by a global Dear PyGui release observer
+                # that opens a modeless surface after callback dispatch.  Keeping
+                # WNDPROC limited to WM_CHAR avoids losing RMB to asymmetric
+                # native DOWN/UP consumption or stale native hit-test data.
+
                 return user32.CallWindowProcW(
                     self._console_native_old_wndproc,
                     window, message, wparam, lparam)
@@ -838,10 +938,8 @@ class WinUXView(
                 dpg.render_dearpygui_frame()
 
             log_event("Dear PyGui render loop started")
-            # Warm dialog graphics/interpreters only after the first main-window
-            # frames, and off-thread. User callbacks never wait on preparation.
-            from .dialogs.prewarm_pool import start_dialog_prewarm
-            self.after(0, start_dialog_prewarm, self)
+            # Floating-dialog prewarm starts during view construction, before
+            # the first visible interaction can request a dialog.
             while dpg.is_dearpygui_running() and self._alive:
                 self.update()
 
@@ -1051,9 +1149,10 @@ class WinUXView(
                 break
             job = self._dpg_callbacks.popleft()
             try:
-                dpg.run_callbacks([job])
+                invoke_callback_job(job)
             except Exception:
-                self._handle_ui_callback_error(job[0], sys.exc_info())
+                callback = job[0] if isinstance(job, (tuple, list)) and job else None
+                self._handle_ui_callback_error(callback, sys.exc_info())
 
     def _handle_ui_callback_error(self, callback, exc_info):
         callback_name = getattr(

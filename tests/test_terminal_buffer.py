@@ -161,22 +161,26 @@ class TerminalBufferTests(unittest.TestCase):
         self.assertNotIn('**({"font"', source)
         self.assertIn("dpg.bind_item_font(item, view._font)", source)
 
-    def test_console_click_focus_does_not_bind_clicked_handler_to_child_window(self):
+    def test_console_click_focus_is_scoped_to_canvas_not_child_window(self):
         source = (Path(__file__).resolve().parents[1] / "WinUx" / "dialogs" / "console_form.py").read_text(encoding="utf-8")
         self.assertNotIn("bind_item_handler_registry(self.content", source)
-        self.assertNotIn("add_item_clicked_handler", source)
+        self.assertIn("dpg.bind_item_handler_registry(owner.canvas", source)
+        self.assertIn("button=dpg.mvMouseButton_Left", source)
+        self.assertIn("button=dpg.mvMouseButton_Middle", source)
+        menu = source.split("class _ConsoleContextMenu:", 1)[1].split("def terminal_theme", 1)[0]
+        self.assertNotIn("button=dpg.mvMouseButton_Right", menu)
         self.assertIn("dpg.add_mouse_click_handler", source)
         self.assertIn("dpg.is_item_hovered(self.content)", source)
         self.assertIn("dpg.is_item_hovered(self.canvas)", source)
-        self.assertIn("dpg.focus_item(self.tag)", source)
 
-    def test_console_has_mouse_selection_and_cmd_context_menu(self):
+    def test_console_has_mouse_selection_and_modeless_cmd_context_menu(self):
         source = (Path(__file__).resolve().parents[1] / "WinUx" / "dialogs" / "console_form.py").read_text(encoding="utf-8")
         for token in ("add_mouse_drag_handler", "add_mouse_release_handler", "mvMouseButton_Right", "_selected_text", "_select_all", "_clear_console"):
             self.assertIn(token, source)
-        self.assertIn("QMenu((", source)
-        for label in ("Copy", "Paste", "Select All", "Clear"):
-            self.assertIn('"label": "{}"'.format(label), source)
+        self.assertIn("class _ConsoleContextMenu", source)
+        self.assertNotIn("TrackPopupMenuEx", source)
+        for label in ("Copy", "Paste", "Select All", "Find", "Clear"):
+            self.assertIn('"{}"'.format(label), source)
 
     def test_console_close_cleanup_does_not_reference_removed_click_registry(self):
         source = (Path(__file__).resolve().parents[1] / "WinUx" / "dialogs" / "console_form.py").read_text(encoding="utf-8")

@@ -24,9 +24,16 @@ class QtFusionPalette:
     TEXT_DISABLED = (130, 130, 130, 255)
 
     # Focus/selection roles used by item views and editable controls.
+    # Keep focus/accent blue strong, but make row selection match the light
+    # Windows Explorer selection surface instead of a saturated blue fill.
     FOCUS = (0, 120, 215, 255)
-    SELECTION_INACTIVE = (225, 225, 225, 255)
-    SELECTION_INACTIVE_BORDER = (170, 170, 170, 255)
+    SELECTION_ACTIVE = (204, 232, 255, 255)
+    SELECTION_ACTIVE_HOVER = (191, 225, 250, 255)
+    SELECTION_ACTIVE_PRESSED = (181, 219, 247, 255)
+    SELECTION_TEXT = (32, 32, 32, 255)
+    SELECTION_BORDER = (153, 209, 255, 255)
+    SELECTION_INACTIVE = (225, 233, 240, 255)
+    SELECTION_INACTIVE_BORDER = (185, 197, 210, 255)
 
     BORDER = (171, 171, 171, 255)
     BORDER_LIGHT = (205, 205, 205, 255)

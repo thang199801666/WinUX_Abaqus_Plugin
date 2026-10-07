@@ -40,7 +40,7 @@ class DialogMetrics:
     BUTTON_WIDTH = 82
     BUTTON_HEIGHT = 26
     BUTTON_GAP = 6
-    FOOTER_HEIGHT = 40
+    FOOTER_HEIGHT = 48
     WINDOW_PAD_X = 10
     WINDOW_PAD_Y = 8
     ROW_SPACING = 5
@@ -625,7 +625,7 @@ def footer_theme():
                 # QDialogButtonBox is part of the dialog surface; avoid a
                 # separate gray footer band that makes small forms look split in two.
                 dpg.add_theme_color(dpg.mvThemeCol_ChildBg, QtFusionPalette.WINDOW)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 10, 6)
+                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 12, 8)
                 dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, DialogMetrics.BUTTON_GAP, 0)
             with dpg.theme_component(dpg.mvTable):
                 dpg.add_theme_style(dpg.mvStyleVar_CellPadding, 0, 0)

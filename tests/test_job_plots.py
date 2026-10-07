@@ -149,7 +149,8 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("OUTER_MARGIN = 6", source)
         self.assertIn('dpg.mvPlotCol_PlotBg', source)
         self.assertIn("panel_surface_theme(", source)
-        self.assertIn("checkbox_theme(dpg)", source)
+        self.assertIn("checkbox_theme(dpg, checked=False)", source)
+        self.assertIn("checkbox_theme(dpg, checked=True)", source)
         self.assertIn("self.toolbar = dpg.add_child_window", source)
 
     def test_plot_layout_avoids_unsupported_separator_configure_item(self):
@@ -164,12 +165,14 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("dpg.mvPlotCol_LegendText", source)
         self.assertIn("dpg.mvPlotCol_InlayText", source)
         self.assertIn("dpg.mvPlotCol_PlotBg, (255, 255, 255, 255)", source)
-        self.assertIn("checkbox_theme(dpg)", source)
+        self.assertIn("checkbox_theme(dpg, checked=False)", source)
+        self.assertIn("checkbox_theme(dpg, checked=True)", source)
         style = (ROOT / "WinUx" / "widgets" / "imgui_qt_style.py").read_text(encoding="utf-8")
         self.assertIn("def checkbox_theme", style)
         self.assertIn("mvStyleVar_FrameBorderSize, 1", style)
         rebuild = source[source.index("def _rebuild_history_list"):source.index("def _checkbox_changed")]
-        self.assertIn("dpg.bind_item_theme(checkbox, self._checkbox_theme)", rebuild)
+        self.assertIn("self._checkbox_theme_on if item_id in self.selected_ids", rebuild)
+        self.assertIn("else self._checkbox_theme_off", rebuild)
 
     def test_server_has_persistent_live_monitor_on_shared_transport(self):
         source = REMOTE_ODB.read_text(encoding="utf-8")
@@ -247,7 +250,7 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("self._close_line_a = dpg.draw_line", dock)
         self.assertIn("self.title_bar = dpg.add_child_window", dock)
         self.assertIn("FRAME = 1", dock)
-        self.assertIn("TITLE_HEIGHT = 22", dock)
+        self.assertIn("TITLE_HEIGHT = 20", dock)
         self.assertIn("def set_floating", dock)
 
     def test_floating_titlebar_double_click_restores_previous_dock(self):
@@ -495,8 +498,8 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("RemoteODBMixin", facade)
         self.assertIn("def _resolve_abaqus_for_odb_on", server)
         self.assertIn("__WINUX_ODB_RELEASE_OK__", server)
-        self.assertIn("abq2025", server)
-        self.assertIn("abq2023", server)
+        self.assertIn('range(2026, 2017, -1)', facade)
+        self.assertIn('"abaqus"', facade)
         self.assertIn('"abaqusCommand": executable', server)
         self.assertIn("Finding compatible Abaqus release", controller)
 

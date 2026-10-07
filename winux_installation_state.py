@@ -17,7 +17,7 @@ import re
 import shutil
 import tempfile
 
-from winux_update_manifest import read_version, required_files_present
+from winux_update_manifest import read_version, required_files_present, compare_versions
 
 
 STATE_SCHEMA_VERSION = 1
@@ -431,14 +431,32 @@ def resolve_active_installation(fallback_dir=None, environ=None, recover=True):
             pass
     state = load_state(environ)
     active = _text(state.get("active_version") or "").strip()
+    fallback_valid = valid_deployment(fallback_dir)
+    fallback_version = read_version(fallback_dir) if fallback_valid else None
     if active:
         candidate = version_dir(active, environ)
         if valid_deployment(candidate, expected_version=active):
+            # A newer bundled release (for example a locally deployed hotfix)
+            # must not be hidden behind an older immutable LocalAppData cache.
+            # Older or same-version bundled trees still defer to the managed
+            # active deployment, preserving normal production update behavior.
+            try:
+                if fallback_version and compare_versions(fallback_version, active) > 0:
+                    return os.path.abspath(fallback_dir)
+            except (TypeError, ValueError):
+                pass
             return candidate
         recovered = _recover_from_history(state, environ)
         if recovered:
+            try:
+                recovered_version = read_version(recovered)
+                if (fallback_version and recovered_version and
+                        compare_versions(fallback_version, recovered_version) > 0):
+                    return os.path.abspath(fallback_dir)
+            except (TypeError, ValueError):
+                pass
             return recovered
-    if valid_deployment(fallback_dir):
+    if fallback_valid:
         return os.path.abspath(fallback_dir)
     return None
 

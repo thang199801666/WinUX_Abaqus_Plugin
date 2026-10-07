@@ -50,7 +50,13 @@ def resolve_project_dir(value=None, environ=None):
 
     bundled = _bundled_project_dir()
     install_mode = str(environ.get("WINUX_INSTALL_MODE", "")).strip().lower()
-    if install_mode not in ("legacy", "flat", "in-place", "inplace"):
+    prefer_bundled = str(environ.get("WINUX_PREFER_BUNDLED_RUNTIME", "")).strip().lower() in (
+        "1", "true", "yes", "on", "bundled"
+    )
+    # Runtime precedence must not be coupled to the updater's install strategy.
+    # A bundled hotfix can be preferred for this launch while updates continue
+    # to use the crash-safe immutable/versioned installer.
+    if not prefer_bundled and install_mode not in ("legacy", "flat", "in-place", "inplace"):
         try:
             active = resolve_active_installation(bundled, environ=environ)
         except Exception:

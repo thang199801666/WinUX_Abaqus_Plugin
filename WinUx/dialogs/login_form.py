@@ -56,10 +56,15 @@ class LoginForm(QtDialog):
             parent or self._form, label,
             lambda editor_parent: ImGuiComboBox(
                 items=items, default_value=value, width=-1, callback=callback,
-                parent=editor_parent))
+                parent=editor_parent, editable=True))
         # Emit edits as well as history selection; there is only one field per
         # value, with the arrow beside the editable text like QComboBox.
-        dpg.configure_item(combo.input, on_enter=False)
+        # Host and Username are history-backed *editable* combos.  The value
+        # does not have to exist in the dropdown: users can type a new server
+        # or account name directly and a successful login will persist it via
+        # LoginPreferences.save_success().
+        combo.setEditable(True)
+        dpg.configure_item(combo.input, on_enter=False, readonly=False)
         self._combos.append(combo)
         return combo
 

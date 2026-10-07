@@ -75,7 +75,7 @@ class QtDialogStyleTests(unittest.TestCase):
         source = (DIALOGS / "theme.py").read_text(encoding="utf-8")
         for token in (
             "LABEL_WIDTH = 104", "BUTTON_WIDTH = 82", "BUTTON_HEIGHT = 26",
-            "FOOTER_HEIGHT = 40", "WINDOW_PAD_X = 10", "ROW_SPACING = 5",
+            "FOOTER_HEIGHT = 48", "WINDOW_PAD_X = 10", "ROW_SPACING = 5",
             "NAV_WIDTH = 156",
         ):
             self.assertIn(token, source)
