@@ -1353,7 +1353,7 @@
     },
     {
       "path": "tests/test_compact_dialog_geometry_r111.py",
-      "sha256": "4baf5db837da0612db6300a2fa804bd3e87c21a27972f25824817496bb1f8dfe",
+      "sha256": "92273f6a607ede33b5aee40061014078ddc08e53dc22c52e7289f4e9d14c9091",
       "size": 4945
     },
     {
@@ -8313,7 +8313,7 @@
     }
   ],
   "package_revision": 1,
-  "package_sha256": "898ec83f3bafa8b9712162db4a75e6ae9434461062a3319d66658e65db6aad4f",
+  "package_sha256": "054b8d68946258c61c2c86233c611e5301391a8b44a0563d691eb3a97caaf87a",
   "release_path": ".",
   "released": "2026-10-20",
   "schema_version": 1,

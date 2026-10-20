@@ -105,7 +105,7 @@ def test_delete_preview_does_not_accumulate_excess_footer_gap():
     assert 300 <= height <= 320
 
 
-def test_message_box_table_is_content_sized_not_remaining-space_sized():
+def test_message_box_table_is_content_sized_not_remaining_space_sized():
     source = (ROOT / "DearUIQt" / "dialogs" / "qt_dialog.py").read_text()
     block = source.split("def message_box_body", 1)[1].split("def field", 1)[0]
     assert "header_row=False, width=-1, height=0" in block
