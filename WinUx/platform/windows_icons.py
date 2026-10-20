@@ -12,7 +12,7 @@ import os
 from ctypes import wintypes
 from typing import Optional
 
-import dearpygui.dearpygui as dpg
+from DearUIQt.backends import dpg
 from PIL import Image
 
 

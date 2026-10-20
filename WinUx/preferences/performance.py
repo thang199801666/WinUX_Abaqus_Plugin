@@ -13,6 +13,17 @@ class PerformancePreferences:
         "qstat_max_interval": 30.0,
         "qstat_stable_samples_to_max": 8,
         "qstat_quiet_seconds_to_max": 90.0,
+        # Client-side inactivity backoff is intentionally more aggressive than
+        # scheduler-state backoff.  After 30 minutes without WinUx input qstat
+        # is suspended until interaction resumes; live ODB monitors keep only a
+        # sparse heartbeat so their remote helper remains reusable.
+        "inactivity_idle_seconds": 120.0,
+        "inactivity_away_seconds": 600.0,
+        "inactivity_deep_idle_seconds": 1800.0,
+        "inactivity_idle_qstat_interval": 60.0,
+        "inactivity_away_qstat_interval": 180.0,
+        "inactivity_deep_qstat_interval": 0.0,
+        "inactivity_deep_odb_interval": 600.0,
         "odb_min_interval": 1.0,
         "odb_max_interval": 60.0,
         "odb_stable_samples_to_max": 8,
@@ -53,6 +64,20 @@ class PerformancePreferences:
                 "qstat_stable_samples_to_max", 1, 100),
             "qstat_quiet_seconds_to_max": number(
                 "qstat_quiet_seconds_to_max", 1.0, 3600.0),
+            "inactivity_idle_seconds": number(
+                "inactivity_idle_seconds", 5.0, 86400.0),
+            "inactivity_away_seconds": number(
+                "inactivity_away_seconds", 5.0, 86400.0),
+            "inactivity_deep_idle_seconds": number(
+                "inactivity_deep_idle_seconds", 5.0, 172800.0),
+            "inactivity_idle_qstat_interval": number(
+                "inactivity_idle_qstat_interval", 1.0, 3600.0),
+            "inactivity_away_qstat_interval": number(
+                "inactivity_away_qstat_interval", 1.0, 7200.0),
+            "inactivity_deep_qstat_interval": number(
+                "inactivity_deep_qstat_interval", 0.0, 21600.0),
+            "inactivity_deep_odb_interval": number(
+                "inactivity_deep_odb_interval", 30.0, 21600.0),
             "odb_min_interval": number("odb_min_interval", 0.25, 600.0),
             "odb_max_interval": number("odb_max_interval", 0.25, 600.0),
             "odb_stable_samples_to_max": integer(
@@ -69,6 +94,13 @@ class PerformancePreferences:
         }
         result["qstat_max_interval"] = max(
             result["qstat_min_interval"], result["qstat_max_interval"])
+        result["inactivity_away_seconds"] = max(
+            result["inactivity_idle_seconds"], result["inactivity_away_seconds"])
+        result["inactivity_deep_idle_seconds"] = max(
+            result["inactivity_away_seconds"], result["inactivity_deep_idle_seconds"])
+        result["inactivity_away_qstat_interval"] = max(
+            result["inactivity_idle_qstat_interval"],
+            result["inactivity_away_qstat_interval"])
         result["odb_max_interval"] = max(
             result["odb_min_interval"], result["odb_max_interval"])
         return result

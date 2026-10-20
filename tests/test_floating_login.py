@@ -1,7 +1,17 @@
-"""Regression and Win32 integration tests for truly floating DPG Login."""
+"""Regression and Win32 integration tests for process-isolated DPG dialogs.
+
+Main-window dialogs (including SSH Login) are in-process Qt-like QDialogs by
+default (:mod:`tests.test_native_dialogs` asserts that split).  These tests keep
+the guarantees of the still-supported explicit process-isolated hosting in
+``WinUx.dialogs.floating_adapters`` + ``WinUx/ui/hosting/floating_dialog.py``:
+the child viewport owns a real top-level HWND that can leave the main window's
+rectangle, only the owner is disabled while a modal dialog is open, and closing
+always restores the owner and balances the modal/input gates exactly once.
+"""
+
+from pathlib import Path
 import ctypes
 from ctypes import wintypes
-import io
 import os
 import queue
 import time
@@ -9,9 +19,9 @@ import unittest
 from unittest.mock import patch, Mock
 
 import dearpygui.dearpygui as dpg
-from WinUx.dialogs.login_dialog import LoginDialog
-from WinUx.dialogs.login_form import LoginForm
+from WinUx.dialogs.floating_adapters import BlockingDialog
 from WinUx.dialogs.floating_dialog import FloatingDialogController, floating_dialog_command
+from WinUx.dialogs.login_form import LoginForm
 
 
 class View:
@@ -64,11 +74,16 @@ class FloatingLifecycleTests(unittest.TestCase):
         controller.modal = True
         controller._closed = controller._finalized = controller._ready = False
         controller._owner_acquired = False
+        controller._child_pid = None
+        controller._close_return_focus = False
+        controller._reuse_host = False
         controller._visible = True
         controller._owner_hwnd = 101
         controller._hwnd = None
         controller._startup_timer = None
         controller._connection = None
+        controller._host_lease = None
+        controller._startup_generation = 0
         controller._listener = Mock()
         controller.post = lambda *args, **kwargs: True
         return controller
@@ -97,6 +112,22 @@ class FloatingLifecycleTests(unittest.TestCase):
         controller._deliver_event({"event": "submit", "values": {"host": "late"}})
         self.assertEqual(received, [])
 
+    def test_parent_finish_captures_focus_from_its_owned_child(self):
+        parent = self.controller()
+        parent._hwnd = 202
+        child = self.controller()
+        child._hwnd = 303
+        child.destroy = Mock()
+        parent._owned_dialogs = [child]
+        parent._queue_owner_focus = Mock()
+        with patch("WinUx.dialogs.floating_dialog._foreground_hwnd", return_value=303), \
+             patch("WinUx.dialogs.floating_dialog._owner_has_keyboard_focus", return_value=False), \
+             patch("WinUx.dialogs.floating_dialog.unregister_native_pointer_surface"), \
+             patch("WinUx.dialogs.floating_dialog.release_native_modal_input"):
+            parent._finish()
+        parent._queue_owner_focus.assert_called_once_with(force=True)
+        child.destroy.assert_called_once_with()
+
     def test_child_command_prepares_abaqus_python_and_does_not_launch_smapython_directly(self):
         with patch.dict(os.environ, {"WINUX_ABAQUS_COMMAND": "abaqus"}):
             command = floating_dialog_command("C:/path with spaces/dialog.py")
@@ -108,8 +139,11 @@ class FloatingLifecycleTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Native floating-window integration requires Windows")
 class FloatingViewportIntegrationTests(unittest.TestCase):
-    def test_login_has_owned_top_level_hwnd_and_moves_outside_main_window(self):
+    def test_floating_dialog_has_owned_top_level_hwnd_and_moves_outside_main_window(self):
         # A real test owner, without starting another DPG context or Abaqus/CAE.
+        # Login joined the in-process dialog set; the explicit process-isolated
+        # hosting path is exercised through its BlockingDialog adapter, which
+        # follows the identical controller/runtime/native-host contracts.
         user32 = ctypes.windll.user32
         user32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
             wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -136,10 +170,9 @@ class FloatingViewportIntegrationTests(unittest.TestCase):
         dialog = None
         view = View()
         try:
-            with patch("WinUx.dialogs.floating_dialog.find_process_window", return_value=int(owner)), \
-                 patch("WinUx.dialogs.login_dialog.LoginPreferences") as preferences:
-                preferences.return_value.load.return_value = {"host": "test-host", "username": "test-user", "port": "22"}
-                dialog = LoginDialog(view, lambda *args: None)
+            dialog = BlockingDialog(view, "Floating Test",
+                                    "Owned top-level without process-window lookup.",
+                                    owner_hwnd=int(owner), on_result=lambda *args: None)
             deadline = time.monotonic() + 30
             while time.monotonic() < deadline and not dialog._ready and dialog.winfo_exists():
                 # Owned-window style changes send cross-thread Win32 messages.
@@ -151,24 +184,20 @@ class FloatingViewportIntegrationTests(unittest.TestCase):
             self.assertFalse(view.errors, str(view.errors))
             self.assertTrue(dialog._ready, "Floating viewport never completed the handshake")
             self.assertTrue(dialog._hwnd)
-            width, height = dialog._client_layout["client"]
-            for name, (left, top, right, bottom) in dialog._client_layout["widgets"].items():
-                self.assertGreaterEqual(left, 0, name)
-                self.assertGreaterEqual(top, 0, name)
-                self.assertLessEqual(right, width, name + " is clipped horizontally")
-                self.assertLessEqual(bottom, height, name + " is clipped vertically")
-                self.assertGreater(right-left, 0, name)
-                self.assertGreater(bottom-top, 0, name)
-            widgets = dialog._client_layout["widgets"]
-            self.assertAlmostEqual(widgets["host"][1], widgets["host_arrow"][1], delta=2)
-            self.assertAlmostEqual(widgets["username"][1], widgets["username_arrow"][1], delta=2)
+            # The compact message client must fit its dedicated viewport and
+            # only the pinned footer may reach it.
+            client = dialog._client_layout["client"]
+            self.assertGreater(client[0], 0)
+            self.assertGreater(client[1], 0)
+            footer = dialog._client_layout["footer"]
+            self.assertLessEqual(footer[3], client[1], "Footer is clipped vertically")
             getter = user32.GetWindowLongPtrW
             getter.argtypes = [wintypes.HWND, ctypes.c_int]
             getter.restype = ctypes.c_ssize_t
             self.assertEqual(getter(dialog._hwnd, -8), int(owner), "Must be owned, not parented as WS_CHILD")
             self.assertFalse(getter(dialog._hwnd, -16) & 0x40000000, "Floating dialog must not use WS_CHILD")
-            self.assertFalse(user32.IsWindowEnabled(owner), "Only main owner is disabled during modal Login")
-            self.assertTrue(user32.IsWindowEnabled(dialog._hwnd), "Login must remain interactive")
+            self.assertFalse(user32.IsWindowEnabled(owner), "Only main owner is disabled during a modal dialog")
+            self.assertTrue(user32.IsWindowEnabled(dialog._hwnd), "Dialog must remain interactive")
             user32.SetWindowPos(dialog._hwnd, None, 80, 100, 0, 0, 0x0001 | 0x0004)
             time.sleep(.15)
             rectangle = wintypes.RECT()

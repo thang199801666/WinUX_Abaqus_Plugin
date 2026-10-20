@@ -34,10 +34,12 @@ def build_release(source_dir, output_dir, expected_tag=None):
         stage = os.path.join(temporary, "deployment")
         shutil.copytree(source_dir, stage, ignore=shutil.ignore_patterns(
             ".git", ".github", ".pytest_cache", ".mypy_cache", "__pycache__",
+            ".ruff_cache", "reports", "examples", "htmlcov",
             "*.pyc", "*.pyo", "tests", "tools", "*.zip", "*.partial",
+            "*.tmp", "*.bak", "*.orig", "*.rej", "*~", ".coverage", "coverage.xml",
             "*.log", ".env", ".env.*", "*.pem", "*.key", "*.p12", "*.pfx",
             "id_rsa*", "id_ed25519*", "settings.json", "known_hosts",
-            "OPTIMIZATION_GOAL.md", "REFACTOR_NOTES.md",
+            "*.md", "*.markdown",
         ))
         # Never publish the working tree's potentially stale manifest.
         write_manifest(stage)

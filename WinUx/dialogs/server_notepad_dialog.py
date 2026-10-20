@@ -27,6 +27,11 @@ import threading
 import time
 
 try:
+    from DearUIQt.core import QProcess, QThreadPool
+except ImportError:  # direct-module compatibility tests / legacy embedding
+    from DearUIQt.core import QProcess, QThreadPool
+
+try:
     from ..runtime.child_processes import (
         register_child_process, unregister_child_process,
     )
@@ -41,6 +46,11 @@ except ImportError:  # direct-module compatibility tests / legacy embedding
 
 _SNAPSHOT_IPC_CHARS = 256 * 1024
 _SNAPSHOT_COMPRESS_MIN_CHARS = 32 * 1024
+
+# Server Notepad is a persistent tool rather than a transient QDialog, but its
+# parent-side IPC/stream/reap work still belongs to the shared worker runtime.
+# Do not manufacture reader/stream/timer threads per editor instance.
+_NOTEPAD_IO_POOL = QThreadPool(maxThreadCount=6, maxPending=64, name="notepad-io")
 
 
 def _detect_eol(text):
@@ -92,9 +102,7 @@ class ServerNotepadDialog:
         self._closed = threading.Event()
         self._write_lock = threading.Lock()
         self._process = None
-        self._reader_thread = None
-        self._stream_threads = set()
-        self._stream_threads_lock = threading.Lock()
+        self._reader_future = None
         self._stderr_path = None
         self._native_input_hwnd = None
         # Commands issued immediately after Popen are held until the child has
@@ -105,7 +113,7 @@ class ServerNotepadDialog:
         self._window_shown = threading.Event()
         self._pending_commands = []
         self._pending_commands_lock = threading.Lock()
-        self._startup_watchdog = None
+        self._startup_watchdog_generation = 0
         self._startup_started_at = 0.0
 
         # v1.4.0/v1.4.1 passed a complete snapshot as argument 2.  Newer
@@ -152,15 +160,15 @@ class ServerNotepadDialog:
         log_handle = None
         try:
             log_handle = open(self._stderr_path, "ab", buffering=0)
-            self._process = subprocess.Popen(
-                [sys.executable, "-B", str(script)],
+            self._process = QProcess.launch(
+                sys.executable, ["-B", str(script)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=log_handle,
-                bufsize=0,
                 creationflags=creationflags,
                 cwd=str(script.parent),
                 env=child_env,
+                childLabel="server-notepad",
             )
             register_child_process(self._process, "server-notepad")
         except Exception:
@@ -178,19 +186,18 @@ class ServerNotepadDialog:
                 except Exception:
                     pass
 
-        self._reader_thread = threading.Thread(
-            target=self._reader_loop,
-            name="winux-server-notepad-ipc",
-            daemon=True,
-        )
-        self._reader_thread.start()
+        self._reader_future = _NOTEPAD_IO_POOL.start(self._reader_loop)
         self._startup_started_at = time.monotonic()
         self._arm_startup_watchdog()
 
     def _arm_startup_watchdog(self, timeout=10.0):
-        """Fail a half-started child instead of leaving WinUx on Opening forever."""
+        """Fail a half-started child without allocating a timer thread."""
+        self._startup_watchdog_generation += 1
+        generation = self._startup_watchdog_generation
+
         def check():
-            if self._closed.is_set() or self._ready.is_set():
+            if (generation != self._startup_watchdog_generation or
+                    self._closed.is_set() or self._ready.is_set()):
                 return
             process = self._process
             elapsed = max(0.0, time.monotonic() - self._startup_started_at)
@@ -200,30 +207,23 @@ class ServerNotepadDialog:
                 detail = (
                     "Server Notepad did not finish creating its window after "
                     "{:.1f} seconds.".format(elapsed))
-                try:
-                    process.terminate()
-                except Exception:
-                    pass
+                # A half-started Tk/SMAPython child must be reaped as a tree;
+                # plain terminate() can leave an Abaqus launcher descendant.
+                _NOTEPAD_IO_POOL.start(self._reap_process, process, 0.05)
             self._closed.set()
             try:
-                self.view.after(
-                    0, self.view.show_error, "Server Notepad",
+                self.view.show_error(
+                    "Server Notepad",
                     detail + "\n\nDiagnostic log: {}".format(self._stderr_path))
             except Exception:
                 pass
 
-        timer = threading.Timer(max(1.0, float(timeout)), check)
-        timer.daemon = True
-        self._startup_watchdog = timer
-        timer.start()
+        # ``view.after`` is the existing UI event scheduler, equivalent to the
+        # QTimer backend. A generation invalidates stale callbacks on ready/close.
+        self.view.after(int(max(1.0, float(timeout)) * 1000), check)
 
     def _cancel_startup_watchdog(self):
-        timer, self._startup_watchdog = self._startup_watchdog, None
-        if timer is not None:
-            try:
-                timer.cancel()
-            except Exception:
-                pass
+        self._startup_watchdog_generation += 1
 
     def _flush_pending_commands(self):
         if not self._ready.is_set() or self._closed.is_set():
@@ -292,6 +292,13 @@ class ServerNotepadDialog:
                         break
         finally:
             self._mark_closed(unexpected=not self._closed.is_set())
+            # Normal child exit should release the strong registry reference
+            # immediately instead of waiting for the next global registry scan.
+            try:
+                if process is not None and process.poll() is not None:
+                    unregister_child_process(process)
+            except Exception:
+                pass
 
     def _handle_child_message(self, message):
         event = str(message.get("event") or "")
@@ -306,7 +313,7 @@ class ServerNotepadDialog:
         if event == "window_shown":
             self._window_shown.set()
             if not self._closed.is_set():
-                from ..components.interaction_gate import register_native_pointer_surface
+                from DearUIQt.input_gate import register_native_pointer_surface
                 self._native_input_hwnd = register_native_pointer_surface(message.get("hwnd"))
             return
         if event == "load_request":
@@ -379,7 +386,7 @@ class ServerNotepadDialog:
         hwnd = getattr(self, "_native_input_hwnd", None)
         self._native_input_hwnd = None
         if hwnd:
-            from ..components.interaction_gate import unregister_native_pointer_surface
+            from DearUIQt.input_gate import unregister_native_pointer_surface
             unregister_native_pointer_surface(hwnd)
 
     @staticmethod
@@ -521,26 +528,7 @@ class ServerNotepadDialog:
     def _queue_snapshot_stream(self, operation, snapshot):
         if self._closed.is_set():
             return False
-        holder = {}
-
-        def worker():
-            try:
-                self._send_snapshot_stream(operation, snapshot)
-            finally:
-                thread = holder.get("thread")
-                if thread is not None:
-                    with self._stream_threads_lock:
-                        self._stream_threads.discard(thread)
-
-        thread = threading.Thread(
-            target=worker,
-            name="winux-server-notepad-{}-stream".format(operation),
-            daemon=True,
-        )
-        holder["thread"] = thread
-        with self._stream_threads_lock:
-            self._stream_threads.add(thread)
-        thread.start()
+        _NOTEPAD_IO_POOL.start(self._send_snapshot_stream, operation, snapshot)
         return True
 
     # ------------------------------------------------------------------
@@ -605,6 +593,20 @@ class ServerNotepadDialog:
     def request_close(self, *_args):
         return self._send("close")
 
+    @staticmethod
+    def _reap_process(process, timeout=0.35):
+        """Bounded terminal cleanup for the standalone editor child."""
+        if process is None:
+            return
+        try:
+            process.close(timeout=max(0.0, float(timeout)), force=True)
+        finally:
+            # Only QProcess.close has performed the bounded wait/tree-kill path
+            # by this point, so removing the registry entry cannot hide a live
+            # orphan from application shutdown.
+            if process.poll() is not None:
+                unregister_child_process(process)
+
     def destroy(self, wait=False, timeout=1.0):
         self._cancel_startup_watchdog()
         self._unregister_input_surface()
@@ -619,25 +621,16 @@ class ServerNotepadDialog:
 
             def terminate_later():
                 try:
-                    process.wait(timeout=max(0.15, float(timeout)))
-                except Exception:
-                    try:
-                        process.terminate()
-                    except Exception:
-                        pass
+                    self._reap_process(process, max(0.15, float(timeout)))
                 finally:
-                    unregister_child_process(process)
                     self._closed.set()
 
             if wait:
                 terminate_later()
             else:
-                threading.Thread(
-                    target=terminate_later,
-                    name="winux-server-notepad-close",
-                    daemon=True,
-                ).start()
+                _NOTEPAD_IO_POOL.start(terminate_later)
         else:
+            unregister_child_process(process)
             self._closed.set()
 
     close = destroy

@@ -1,21 +1,25 @@
 from __future__ import annotations
 
 import os
-import threading
 import time
 from datetime import datetime
 from pathlib import Path
+from ..runtime.paths import safe_current_directory
 
-import dearpygui.dearpygui as dpg
-
-from .qt_dialog import QtDialog
-from .folder_browser_address import FolderAddressBar
-from ..widgets import QtListItem, QtListView
-from ..widgets.menu import ImGuiMenu
-from ..widgets.item_views import qt_item_text_theme
-from ..components.qt_style import QtFusionPalette
-from ..components.tooltip import add_styled_tooltip
-from ..components.shared_scroller import dpg_window_rect
+from DearUIQt.dialogs.qt_dialog import QtDialog
+from .folder_browser_address import FolderAddressBar, set_editor_text
+from DearUIQt.modelview import (
+    QtListItem, QtListView, QTreeWidget, QTreeWidgetItem,
+    QTableWidget, QTableWidgetItem,
+)
+from DearUIQt.widgets import QLineEdit, QToolButton, QFrame, QSpacer, QLabel, QSeparator, QApplication, QImageView, QCanvas, QRetainedItem
+from DearUIQt.layouts import QHBoxLayout, QVBoxLayout, QGridLayout
+from DearUIQt.widgets import QMenu
+from DearUIQt.modelview import qt_item_text_theme
+from DearUIQt.gui import QtFusionPalette, QCursor, QKeyboard, QFontMetrics, QPainter
+from DearUIQt.core import Qt, QEvent, QMouseEvent, QItemInputBinding, QGlobalInputBinding
+from DearUIQt import QGuiRuntime
+from DearUIQt.tooltip import add_styled_tooltip
 from ..models.filesystem import FileSystemModel
 from ..platform.windows_icons import WindowsIconRegistry
 from ..platform.folder_browser_places import quick_access_places, drive_stock_id
@@ -24,10 +28,12 @@ from .folder_browser_style import (
     browser_layout_theme, browser_toolbar_theme, browser_workspace_theme,
     browser_field_shell_theme, browser_icon_slot_theme, browser_embedded_editor_theme,
     browser_sidebar_theme, browser_sidebar_row_theme, browser_sidebar_item_text_theme,
-    browser_row_cell_theme,
+    browser_selected_text_theme, browser_name_item_theme,
+    browser_file_editor_theme, browser_action_theme,
+    browser_caption_theme,
+    browser_row_cell_theme, browser_rename_editor_theme,
     browser_sidebar_item_container_theme, browser_sidebar_header_theme,
     browser_list_viewport_theme,
-    create_branch_indicator, paint_branch_indicator,
     browser_details_theme, browser_divider_theme, browser_selection_bar_theme,
     browser_empty_state_theme, browser_status_text_theme, browser_footer_theme,
     browser_sidebar_section_text_theme,
@@ -45,9 +51,17 @@ class FolderListView(QtListView):
 
     def __init__(self, *args, on_sort=None, **kwargs):
         self.details = {}
+        self.entry_types = {}
+        self.entry_sizes = {}
         self.icons = {}
         self.detail_texts = {}
         self._row_index = {}
+        self._row_enabled = {}
+        self._visual_selected_keys = set()
+        self._visual_focus_active = False
+        self._full_visual_sync = True
+        self._qt_selection_themes = {}
+        self._name_row_themes = {}
         self.sort_column, self.sort_ascending = 0, True
         self.empty_text = "This folder is empty."
         self.details_mode = True
@@ -55,7 +69,27 @@ class FolderListView(QtListView):
         self._last_click_key = None
         self._last_click_at = 0.0
         self._double_click_interval = self._system_double_click_interval()
+        self._visual_hit_bindings = []
+        self._visual_hit_registries = self._visual_hit_bindings  # compatibility alias
+        self._row_pointer_binding = None
+        self._row_pointer_registry = None
+        self._row_generation = 0
+        self._details_table = None
+        self._empty_state_frame = None
+        self._last_click_frame = None
+        self._qt_bridge_click = None
         super().__init__(*args, **kwargs)
+        # FolderListView is only a retained host for the real QTableWidget
+        # viewport below.  Leaving the inherited QListView child-window
+        # scrollable creates two nested vertical scroll owners.  Depending on
+        # which native surface receives the wheel, the outer host can move
+        # while the table still reports y-scroll == 0; hit-testing then maps a
+        # visible row back to the first logical row.  QFileDialog/QAbstractItemView
+        # semantics require one viewport/scroll owner, so only the table may
+        # scroll in this specialized view.
+        self._configure_many(no_scrollbar=True, no_scroll_with_mouse=True)
+        self._reset_host_scroll()
+        self._install_row_pointer_router()
 
     @staticmethod
     def _system_double_click_interval():
@@ -68,24 +102,49 @@ class FolderListView(QtListView):
         return 0.50
 
     def _clicked(self, sender, value, key):
+        # A directory/filter refresh can reuse the same key with a new DPG
+        # selectable. A queued callback from the old one must not act on it.
+        if self._deleted or self.items.get(key) != sender:
+            return
+        item = next((item for item in self._values if item.key == key), None)
+        if item is None or not item.enabled:
+            return
+        frame = (QApplication.instance().frameCount() if QApplication.instance() is not None else 0)
+        if self._last_click_frame == (sender, frame):
+            return  # visual-cell + selectable notifications from one press
+        # A modal QApplication press can be dispatched before a DPG Selectable
+        # callback that is drained on the *next* frame. Treat both as one
+        # physical click, never as a second (double-click) activation.
+        bridge = getattr(self, "_qt_bridge_click", None)
+        if bridge is not None:
+            # The Qt press already chose the row for this gesture. Native
+            # Selectable/cell notifications may arrive on release, arbitrarily
+            # many frames later (a held click, slow render, or busy dispatcher).
+            # A short time window can turn that release into a second click and
+            # navigate/reset selection. The next real Qt press clears the bridge
+            # in LocalFolderDialog.event(), so no timing guess is necessary.
+            keyboard_activation = False
+            try:
+                keyboard_activation = any(
+                    self.backend.is_key_down(getattr(self.backend, name))
+                    for name in ("mvKey_Spacebar", "mvKey_Return")
+                    if getattr(self.backend, name, None) is not None)
+            except Exception:
+                pass
+            if not keyboard_activation:
+                return
+            self._qt_bridge_click = None
+        self._last_click_frame = (sender, frame)
         # Dear PyGui's native double-click flag is not reliable on every
         # Windows/DPG build when callbacks are manually pumped by a floating
         # dialog process.  Keep the shared QtListView behavior, then provide a
         # QFileDialog-style second-click fallback for the same folder row.
-        try:
-            native_double = bool(dpg.is_mouse_button_double_clicked(dpg.mvMouseButton_Left))
-        except Exception:
-            native_double = False
         now = time.monotonic()
         repeated = (
             key == self._last_click_key
             and 0.0 <= now - self._last_click_at <= self._double_click_interval
         )
         super()._clicked(sender, value, key)
-        if native_double:
-            self._last_click_key = None
-            self._last_click_at = 0.0
-            return
         if repeated:
             self._last_click_key = None
             self._last_click_at = 0.0
@@ -95,105 +154,566 @@ class FolderListView(QtListView):
         self._last_click_key = key
         self._last_click_at = now
 
+    def _is_double_click(self):
+        # The graphics context survives selector leases. ImGui's double-click
+        # flag can describe a click in the *previous* dialog at the same pixel.
+        # This browser uses the same-row, same-instance history above instead.
+        return False
+
+    def _visual_cell_clicked(self, _sender, _app_data, key):
+        """Route icon/detail-cell clicks through the row's real selection logic.
+
+        The Name-cell Selectable already fills its remaining cell width, but
+        QFileDialog users reasonably expect the folder icon and the Date/Type
+        cells to behave as the same row.  Those cells are separate Dear PyGui
+        items, so explicitly forward their pointer hit to _clicked.
+        """
+        item = self.items.get(key)
+        if item is None:
+            return
+        self._clicked(item, True, key)
+
+    def _bind_visual_cell_hit(self, item, key):
+        try:
+            generation = self._row_generation
+
+            def clicked(sender, app_data=None, *_args):
+                if not self._deleted and generation == self._row_generation:
+                    self._visual_cell_clicked(sender, app_data, key)
+
+            binding = (QItemInputBinding(item, backend=self.backend, parent=self)
+                       .onClick(Qt.LeftButton, clicked)
+                       .activate())
+            self._visual_hit_bindings.append(binding)
+        except Exception:
+            pass
+
+    def _install_row_pointer_router(self):
+        """Make the complete visual table row one deterministic click target.
+
+        A QFileDialog row is conceptually one item, but Dear ImGui renders our
+        Name/icon/date/type cells as independent primitives.  Relying only on
+        per-item callbacks therefore leaves gaps in the visual row and is also
+        sensitive to a handler registry being rebuilt between mouse-down and
+        callback dispatch.  A single context-level left-click handler hit-tests
+        the *current* row geometry and forwards the press to the retained list
+        selection model.
+
+        Native Selectable/cell callbacks are intentionally left in place.
+        ``_last_click_frame`` coalesces those duplicate notifications when both
+        routes observe the same physical press.
+        """
+        try:
+            self._row_pointer_binding = (
+                QGlobalInputBinding(backend=self.backend, parent=self)
+                .onMouseClick(Qt.LeftButton, self._row_pointer_clicked)
+                .activate()
+            )
+        except Exception:
+            self._row_pointer_binding = None
+
+    def _reset_host_scroll(self):
+        """Keep the inherited QListView host fixed at scroll origin.
+
+        The nested QTableWidget is the only scroll viewport in this browser.
+        This is intentionally cheap and idempotent so native pointer recovery
+        can repair a host that received a stray wheel event before the queued
+        ``no_scroll_with_mouse`` configuration reached the renderer.
+        """
+        try:
+            if abs(float(self.backend.get_y_scroll(self.tag))) > 0.01:
+                self.backend.set_y_scroll(self.tag, 0.0)
+        except Exception:
+            pass
+
+    def _arm_native_click_bridge(self, key):
+        """Suppress delayed native callbacks from the same physical click."""
+        application = QApplication.instance()
+        frame = application.frameCount() if application is not None else -1
+        self._qt_bridge_click = (key, frame, time.monotonic())
+
+    def _route_pointer_key(self, key):
+        """Select one hit-tested row and own the complete pointer transaction.
+
+        Row presses can enter through QApplication, the global Dear ImGui
+        binding, or the native HWND recovery hook.  Previously only the first
+        route armed ``_qt_bridge_click``.  If a delayed/stale Selectable
+        callback then arrived through either of the other routes, it could
+        overwrite the correct selection with row 0.  Centralizing the bridge
+        here makes every pointer path deterministic.
+        """
+        selectable = self.items.get(key)
+        native_item = getattr(self, "nativeItem", None)
+        target = native_item(key) if callable(native_item) else selectable
+        if target is None:
+            return False
+        # This routed hit is a new physical press.  Clear the previous bridge
+        # so a rapid genuine second click can still become a double click.
+        self._qt_bridge_click = None
+        self._clicked(target, True, key)
+        # Arm unconditionally for this hit-tested native target.  Even if the
+        # row is disabled or the same-frame duplicate was coalesced by
+        # ``_clicked``, a queued Selectable callback still belongs to this
+        # physical press and must not be allowed to retarget another row.
+        self._arm_native_click_bridge(key)
+        return True
+
+    def verticalScrollValue(self):
+        """Return the scroll position of the actual details table viewport.
+
+        FolderListView owns an outer child-window only as a host.  The visible
+        scrollbar belongs to QTableWidget, so reading the host scroll value
+        returns zero even while the user is far down the directory.
+        """
+        self._reset_host_scroll()
+        table = getattr(self, "_details_table", None)
+        if table is not None and not getattr(table, "_deleted", False):
+            try:
+                return float(self.backend.get_y_scroll(table.tag))
+            except Exception:
+                pass
+        return super().verticalScrollValue()
+
+    def setVerticalScrollValue(self, value):
+        """Set the real table scroll position while pinning the host at zero."""
+        value = max(0.0, float(value))
+        self._reset_host_scroll()
+        table = getattr(self, "_details_table", None)
+        if table is not None and not getattr(table, "_deleted", False):
+            try:
+                self.backend.set_y_scroll(table.tag, value)
+                return self
+            except Exception:
+                pass
+        return self
+
+    def _restore_table_scroll(self, table_tag, value, generation):
+        """Restore table scroll without ever reviving the outer host scroll."""
+        if self._deleted or generation != self._row_generation:
+            return
+        self._reset_host_scroll()
+        table = getattr(self, "_details_table", None)
+        if table is None or getattr(table, "_deleted", False) or table.tag != table_tag:
+            return
+        try:
+            self.backend.set_y_scroll(table_tag, max(0.0, float(value)))
+        except Exception:
+            pass
+
+    def _table_row_key_at(self, x, y):
+        """Return the visible details-row key at a global point.
+
+        The selector uses compact rows that are shorter than DearUIQt's generic
+        table metric.  ``QTableWidget.rowAtGlobal`` therefore becomes a poor
+        estimate deep in a long, scrolled directory.  Resolve the index from
+        the table's *actual native row height* and its own y-scroll instead,
+        then verify only a few neighboring native rows.  This keeps hit-testing
+        O(1) and prevents stale embedded Selectable geometry from mapping a
+        click to row zero after scrolling.
+        """
+        table = getattr(self, "_details_table", None)
+        if table is None or getattr(table, "_deleted", False) or not self._values:
+            return None
+        backend = self.backend
+        try:
+            table_left, table_top = map(float, backend.get_item_rect_min(table.tag))
+            table_width, table_height = map(float, backend.get_item_rect_size(table.tag))
+            if table_width <= 0 or table_height <= 0:
+                return None
+            if not (table_left <= float(x) < table_left + table_width
+                    and table_top <= float(y) < table_top + table_height):
+                return None
+            scroll = max(0.0, float(backend.get_y_scroll(table.tag)))
+            first_row = table.nativeRow(0)
+            row_height = float(backend.get_item_rect_size(first_row)[1])
+            if row_height <= 0:
+                row_height = float(METRICS.row_height)
+            header_height = float(METRICS.header_height if self.details_mode else 0)
+            estimated = int((float(y) - table_top - header_height + scroll) // row_height)
+        except Exception:
+            return None
+
+        if not 0 <= estimated < len(self._values):
+            return None
+
+        # Theme padding can shift the arithmetic estimate by one row. Probe a
+        # tiny fixed neighborhood, never the whole directory.
+        candidates = [estimated]
+        for distance in range(1, 5):
+            candidates.extend((estimated - distance, estimated + distance))
+        for row_index in candidates:
+            if not 0 <= row_index < len(self._values):
+                continue
+            try:
+                row_tag = table.nativeRow(row_index)
+                rect = QRetainedItem(row_tag).globalGeometry(clipped=True)
+                if not rect.isEmpty() and rect.contains((int(x), int(y))):
+                    return self._values[row_index].key
+            except Exception:
+                continue
+        return None
+
+    def _row_pointer_clicked(self, *_args, point=None):
+        if self._deleted or not self.items:
+            return
+        self._reset_host_scroll()
+        # The global DPG click router must not select a row behind a combo,
+        # context menu or another popup. QApplication's modal dialog itself
+        # is not a popup, and is intentionally excluded from this gate.
+        application = QApplication.instance()
+        if application is not None and application.activePopupWidget() is not None:
+            return
+        backend = getattr(self, "backend", None)
+        if backend is not None and QGuiRuntime(backend).hasActivePopupSurface(include_modals=False):
+            return
+        visible = getattr(self, "isVisible", None)
+        if callable(visible) and not visible():
+            return
+        try:
+            if point is None:
+                current = QCursor.pos(backend=getattr(self, "backend", None))
+            else:
+                current = point
+            if hasattr(current, "x"):
+                x, y = float(current.x()), float(current.y())
+            else:
+                x, y = map(float, current)
+
+            geometry = getattr(self, "globalGeometry", None)
+            if callable(geometry):
+                bounds = geometry(clipped=True)
+                if bounds.isEmpty() or not bounds.contains((int(x), int(y))):
+                    return
+            else:
+                # Compatibility for isolated legacy harnesses. Real
+                # FolderListView instances use QWidget.globalGeometry above.
+                table = getattr(self, "table", None)
+                retained = QRetainedItem(table) if table is not None else None
+                if retained is None or not retained.exists() or not retained.isVisible():
+                    return
+                bounds = retained.globalGeometry(clipped=True)
+                if not bounds.contains((int(x), int(y))):
+                    return
+        except Exception:
+            return
+
+        # The QTableWidget owns the actual vertical scrollbar. Resolve the
+        # visible row from the table itself before touching embedded Selectable
+        # geometry; rowAtGlobal() includes the table's current y-scroll offset.
+        details_table = getattr(self, "_details_table", None)
+        table_available = details_table is not None and not getattr(details_table, "_deleted", False)
+        table_key = self._table_row_key_at(x, y) if table_available else None
+        if table_key is not None and self._route_pointer_key(table_key):
+            return True
+        if table_available:
+            # Never fall back to stale embedded Selectable geometry while the
+            # details table exists. If the table has not produced valid row
+            # geometry yet, leave the press to its native cell callbacks.
+            return False
+
+        # Compatibility fallback for list mode / isolated harnesses where the
+        # details table is unavailable. Rows are inserted in visual order.
+        rows = tuple(self.items.items())
+        item_geometry = getattr(self, "itemGeometry", None)
+        if callable(item_geometry) and len(rows) > 8:
+            lo, hi = 0, len(rows) - 1
+            geometry_unavailable = False
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                key, selectable = rows[mid]
+                try:
+                    rect = item_geometry(key, include_check_indicator=False)
+                    if rect.isEmpty():
+                        geometry_unavailable = True
+                        break
+                    top = float(rect.top())
+                    # Unrendered rows can report zero origin even when the
+                    # scrolling viewport is nowhere near (0, 0).
+                    if top == 0 and bounds.top() > 0:
+                        geometry_unavailable = True
+                        break
+                    height = max(float(METRICS.row_height), float(rect.height()))
+                except Exception:
+                    geometry_unavailable = True
+                    break
+                if top <= y < top + height:
+                    return self._route_pointer_key(key)
+                if y < top:
+                    hi = mid - 1
+                else:
+                    lo = mid + 1
+            if not geometry_unavailable:
+                return False
+
+        for key, selectable in rows:
+            try:
+                if callable(item_geometry):
+                    rect = item_geometry(key, include_check_indicator=False)
+                    if rect.isEmpty():
+                        continue
+                    row_top, row_height = float(rect.top()), float(rect.height())
+                else:
+                    retained = QRetainedItem(selectable)
+                    if not retained.exists() or not retained.isVisible():
+                        continue
+                    row_rect = retained.globalGeometry()
+                    row_top, row_height = float(row_rect.y()), float(row_rect.height())
+                row_height = max(float(METRICS.row_height), row_height)
+            except Exception:
+                continue
+            if row_top <= y < row_top + row_height:
+                if self._route_pointer_key(key):
+                    return True
+
+    def delete(self):
+        empty_state = self._empty_state_frame
+        self._empty_state_frame = None
+        if empty_state is not None:
+            try:
+                if empty_state.exists():
+                    empty_state.delete()
+            except Exception:
+                pass
+        details_table = self._details_table
+        self._details_table = None
+        if details_table is not None:
+            try:
+                if details_table.exists():
+                    details_table.delete()
+            except Exception:
+                pass
+        binding, self._row_pointer_binding = self._row_pointer_binding, None
+        if binding is not None:
+            try:
+                binding.delete()
+            except Exception:
+                pass
+        self._row_pointer_registry = None
+        for binding in self._visual_hit_bindings:
+            try:
+                binding.delete()
+            except Exception:
+                pass
+        self._visual_hit_bindings.clear()
+        super().delete()
+
     def setItems(self, items):
+        # Snapshot the *table* scroll before destroying it. The outer
+        # QtListView host does not own the visible scrollbar.
+        previous_table = getattr(self, "_details_table", None)
+        had_details_table = previous_table is not None and not getattr(previous_table, "_deleted", False)
+        preserved_scroll = self.verticalScrollValue() if had_details_table else 0.0
+
+        self._full_visual_sync = True
+        self._row_generation += 1
+        self._last_click_key = self._last_click_frame = None
+        self._last_click_at = 0.0
+        self._qt_bridge_click = None
+        # Dispose any prior transient/empty overlay before rebuilding. Loading
+        # and empty-folder states are mutually exclusive retained surfaces;
+        # keeping the old loading frame alive is what made an empty directory
+        # continue to say "Loading..." after enumeration completed.
+        empty_state = self._empty_state_frame
+        self._empty_state_frame = None
+        if empty_state is not None:
+            try:
+                if empty_state.exists():
+                    empty_state.delete()
+            except Exception:
+                pass
+
+        # Dispose the retained table wrapper before QtListView rebuilds the
+        # viewport children.  This keeps QObject/native ownership in sync across
+        # asynchronous directory refreshes.
+        details_table = self._details_table
+        self._details_table = None
+        if details_table is not None:
+            try:
+                if details_table.exists():
+                    details_table.delete()
+            except Exception:
+                pass
+        for binding in self._visual_hit_bindings:
+            try:
+                binding.delete()
+            except Exception:
+                pass
+        self._visual_hit_bindings.clear()
         self.detail_texts.clear()
         self._row_index.clear()
+        # The embedded Selectables were children of the deleted table. Force
+        # QtListView through its structural rebuild path even when the logical
+        # rows are identical; otherwise its no-op fast path can retain native
+        # ids that were destroyed together with the previous table.
+        if had_details_table:
+            self._values = []
         super().setItems(items)
-        for tag in self.items.values():
-            # Selectable uses zero for fill-available width; unlike a
-            # child window, negative width is a literal invisible extent.
-            dpg.configure_item(tag, width=0, height=METRICS.row_height)
+        self._row_enabled = {item.key: bool(item.enabled) for item in self._values}
+        for key in tuple(self.items):
+            self.setItemSizeHint(key, width=0, height=METRICS.row_height)
         self.icons.clear()
-        self.table = dpg.add_table(
-            parent=self.tag, header_row=self.details_mode, width=-1,
-            policy=dpg.mvTable_SizingStretchProp, sortable=self.details_mode,
-            callback=self._sorted, freeze_rows=1 if self.details_mode else 0,
-            borders_innerH=False, borders_innerV=False,
+
+        column_count = 4 if self.details_mode else 1
+        table = QTableWidget(
+            rows=len(self._values), columns=column_count, parent=self.tag,
+            header_row=self.details_mode, width=-1, height=-1,
+            row_background=True, grid_lines=False, freeze_rows=1 if self.details_mode else 0,
+            sortable=self.details_mode, callback=self._sorted,
             borders_outerH=False, borders_outerV=False, pad_outerX=False,
-            row_background=True)
-        dpg.bind_item_theme(self.table, browser_details_theme())
-        name_column = dpg.add_table_column(parent=self.table, label="Name", width_stretch=True,
-                             init_width_or_weight=1.0, default_sort=self.sort_column == 0,
-                             prefer_sort_ascending=self.sort_ascending,
-                             prefer_sort_descending=not self.sort_ascending)
+        )
+        self._details_table = table
+        self.table = table.tag
+        self._reset_host_scroll()
+        table.setTheme(browser_details_theme())
+        table.setHorizontalHeaderLabels(["Name", "Size", "Type", "Date Modified"][:column_count])
+        table.setColumnStretch(0, 1.0)
+        name_column = table.nativeColumn(0)
+        table.setColumnSortIndicator(0, self.sort_ascending, default=self.sort_column == 0)
         self.detail_columns = ()
         self._column_keys = {name_column: 0}
         if self.details_mode:
-            date_column = dpg.add_table_column(parent=self.table, label="Date modified", width_fixed=True,
-                                 init_width_or_weight=145, default_sort=self.sort_column == 1,
-                                 prefer_sort_ascending=self.sort_ascending,
-                                 prefer_sort_descending=not self.sort_ascending)
-            type_column = dpg.add_table_column(parent=self.table, label="Type", width_fixed=True,
-                                 init_width_or_weight=90, no_sort=True)
+            table.setColumnWidth(1, 74)
+            table.setColumnWidth(2, 96)
+            table.setColumnWidth(3, 145)
+            size_column = table.nativeColumn(1)
+            date_column, type_column = table.nativeColumn(3), table.nativeColumn(2)
+            table.setColumnSortIndicator(1, self.sort_ascending, default=self.sort_column == 2)
+            table.setColumnSortIndicator(3, self.sort_ascending, default=self.sort_column == 1)
+            table.setColumnSortable(2, False)
             self.detail_columns = (date_column, type_column)
             self._column_keys[date_column] = 1
+            self._column_keys[size_column] = 2
+
         for row_index, item in enumerate(self._values):
             tag = self.items[item.key]
-            row = dpg.add_table_row(parent=self.table)
+            row = table.nativeRow(row_index)
             self._row_index[item.key] = row_index
-            # Keep one compact ImGui line for the whole Name cell.  The
-            # selectable supplies selection/current behavior; the Shell icon
-            # sits on the same line so Dear ImGui owns the baseline instead of
-            # nested child windows adding a second padding stack.
-            name = dpg.add_group(parent=row, horizontal=True, horizontal_spacing=4)
-            icon_slot = dpg.add_drawlist(
-                parent=name, width=18, height=METRICS.row_height)
-            texture = folder_item_texture()
-            self.icons[item.key] = dpg.draw_image(
-                texture, parent=icon_slot,
-                pmin=(1, max(0, (METRICS.row_height - 16) // 2)),
-                pmax=(17, max(0, (METRICS.row_height - 16) // 2) + 16),
+            name = QHBoxLayout(parent=row, spacing=4).tag
+            icon_canvas = QCanvas(parent=name, width=18, height=METRICS.row_height)
+            icon_slot = icon_canvas.tag
+            entry_type = self.entry_types.get(item.key, "Folder")
+            texture = folder_item_texture() if entry_type == "Folder" else WindowsIconRegistry.get_icon(Path(item.key).suffix)
+            icon_y = max(0, (METRICS.row_height - 16) // 2)
+            self.icons[item.key] = QPainter(icon_canvas).drawImage(
+                texture,
+                (1, icon_y),
+                (17, icon_y + 16),
                 uv_min=(0, 0), uv_max=(1, 1))
-            dpg.move_item(tag, parent=name)
-            dpg.configure_item(
-                tag, label=item.text, width=0, height=METRICS.row_height,
-                span_columns=True)
+            self._bind_visual_cell_hit(icon_slot, item.key)
+            QRetainedItem(tag).reparent(name)
+            QRetainedItem(tag).configure(label=item.text, width=0, height=METRICS.row_height, span_columns=True)
             if self.details_mode:
                 modified = self.details.get(item.key, 0)
                 date = datetime.fromtimestamp(modified).strftime("%m/%d/%Y %H:%M") if modified else ""
-                date_text = dpg.add_text(date, parent=row)
-                type_text = dpg.add_text("Folder", parent=row)
-                self.detail_texts[item.key] = (date_text, type_text)
-        if not self._values and self.empty_text != "This folder is empty.":
+                date_item = QTableWidgetItem(date)
+                date_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                type_item = QTableWidgetItem(entry_type)
+                type_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                size_text = self._format_size(self.entry_sizes.get(item.key)) if entry_type != "Folder" else ""
+                size_item = QTableWidgetItem(size_text)
+                size_item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
+                table.setItem(row_index, 1, size_item)
+                table.setItem(row_index, 3, date_item)
+                table.setItem(row_index, 2, type_item)
+                date_text = table.nativeItem(row_index, 3)
+                type_text = table.nativeItem(row_index, 2)
+                size_cell = table.nativeItem(row_index, 1)
+                self._bind_visual_cell_hit(size_cell, item.key)
+                self._bind_visual_cell_hit(date_text, item.key)
+                self._bind_visual_cell_hit(type_text, item.key)
+                self.detail_texts[item.key] = (date_text, type_text, size_cell)
+        if not self._values:
             self._add_empty_state()
-        # The first selectable owns the full-row selection background, while
-        # the Date/Type cells are separate mvText items. Keep their display
-        # role synchronized with the QAbstractItemView selection/current state.
+        # Table cells were created after QtListView's model reset; apply their
+        # initial (unselected/selected) palette just once, not per click.
+        self._full_visual_sync = True
         self._sync_selection_visuals()
-        return self
-
-    def _sync_selection_visuals(self):
-        super()._sync_selection_visuals()
-        enabled_by_key = {value.key: bool(value.enabled) for value in self._values}
-        active = bool(getattr(self, "_has_focus", False))
-        # QTreeView/QFileDialog selects the complete visual row, not only the
-        # Name-cell primitive.  DearPyGui exposes a table-row highlight that
-        # lets us mirror that behavior across Name/Date modified/Type.
-        if getattr(self, "table", None):
-            for key, row_index in tuple(self._row_index.items()):
+        if preserved_scroll > 0.0 and self._values:
+            # Set once immediately and once after the renderer has calculated
+            # the new table's scroll maximum. The second write is generation-
+            # guarded so it cannot pull a newly navigated directory backwards.
+            self.setVerticalScrollValue(preserved_scroll)
+            if self._after is not None:
                 try:
-                    if key in self.selected:
-                        color = (
-                            QtFusionPalette.SELECTION_ACTIVE if active
-                            else QtFusionPalette.SELECTION_INACTIVE
-                        )
-                        self.backend.highlight_table_row(self.table, row_index, color)
-                    else:
-                        self.backend.unhighlight_table_row(self.table, row_index)
+                    self._after(1, self._restore_table_scroll,
+                                table.tag, preserved_scroll, self._row_generation)
                 except Exception:
                     pass
-        for key, cells in tuple(self.detail_texts.items()):
-            theme = qt_item_text_theme(
-                self.backend,
-                selected=key in self.selected,
-                disabled=not enabled_by_key.get(key, True),
-                active=active,
-            )
+        return self
+
+    @staticmethod
+    def _format_size(value):
+        if value is None:
+            return ""
+        size = float(value)
+        for unit in ("bytes", "KiB", "MiB", "GiB", "TiB"):
+            if size < 1024 or unit == "TiB":
+                return "{} {}".format(int(size), unit) if unit == "bytes" else "{:.2f} {}".format(size, unit)
+            size /= 1024.0
+
+    def _sync_selection_visuals(self):
+        """Update only changed rows; do not re-theme the entire directory.
+
+        A folder with thousands of files previously sent a renderer call for
+        *every* Name/Date/Type/Size cell on each mouse click. This blocks the
+        UI thread and makes the selector appear to ignore input. A full paint
+        is required only after replacing the directory model. Ordinary
+        SingleSelection clicks touch at most the old and new selected rows.
+        """
+        selected = set(self.selected)
+        active = bool(getattr(self, "_has_focus", False))
+        previous = getattr(self, "_visual_selected_keys", set())
+        full = getattr(self, "_full_visual_sync", True)
+        dirty = set(self.items) if full else (selected ^ previous)
+        if active != getattr(self, "_visual_focus_active", False):
+            dirty.update(selected | previous)
+
+        # The Name column is an embedded Selectable while the detail columns
+        # are table text cells. Bind one browser-specific row theme to every
+        # dirty Name item so its vertical baseline stays aligned with the
+        # table cells in normal, selected and focused states alike.
+        for key in dirty:
+            native = self.items.get(key)
+            if native is None:
+                continue
+            chosen = key in selected
+            disabled = not self._row_enabled.get(key, True)
+            current = (key == self.current)
+            state = (chosen, disabled, current, active)
+            theme = self._name_row_themes.get(state)
+            if theme is None:
+                theme = browser_name_item_theme(
+                    selected=chosen, disabled=disabled,
+                    current=current, active=active)
+                self._name_row_themes[state] = theme
+            try:
+                self.backend.set_value(native, chosen)
+                self.backend.bind_item_theme(native, theme)
+            except Exception:
+                pass
+
+        # The Name Selectable spans all table columns, so it owns both hover
+        # and selected backgrounds.  Do not add a second native table-row
+        # highlight: its row geometry is slightly taller than the Selectable
+        # and makes selection appear larger than hover.
+        if active not in self._qt_selection_themes:
+            self._qt_selection_themes[active] = browser_selected_text_theme(active=active)
+        selected_text_theme = self._qt_selection_themes[active]
+        for key in dirty:
+            cells = self.detail_texts.get(key)
+            if not cells:
+                continue
+            theme = (selected_text_theme if key in selected else qt_item_text_theme(
+                self.backend, selected=False,
+                disabled=not self._row_enabled.get(key, True), active=active))
             for cell in cells:
                 try:
                     self.backend.bind_item_theme(cell, theme)
                 except Exception:
                     pass
+        self._visual_selected_keys = selected
+        self._visual_focus_active = active
+        self._full_visual_sync = False
 
     def _sorted(self, _sender, specs, _user_data):
         # DPG sort specs contain column item IDs, not positional indices.
@@ -202,27 +722,44 @@ class FolderListView(QtListView):
                           for column, direction in specs if column in self._column_keys])
 
     def _add_empty_state(self):
-        """Render a quiet QFileDialog-style message below the details header."""
-        state = dpg.add_child_window(
-            parent=self.tag, width=-1, height=84, border=False,
-            no_scrollbar=True, no_scroll_with_mouse=True)
-        dpg.bind_item_theme(state, browser_empty_state_theme())
-        dpg.add_spacer(parent=state, height=18)
-        with dpg.table(parent=state, header_row=False, width=-1,
-                       policy=dpg.mvTable_SizingStretchProp, pad_outerX=False) as layout:
-            dpg.bind_item_theme(layout, browser_layout_theme(cell_padding=(0, 0)))
-            dpg.add_table_column(width_stretch=True)
-            dpg.add_table_column(width_fixed=True, init_width_or_weight=280)
-            dpg.add_table_column(width_stretch=True)
-            with dpg.table_row():
-                dpg.add_spacer(width=1)
-                with dpg.group(horizontal=False, horizontal_spacing=0):
-                    dpg.add_text(self.empty_text)
-                    if self.empty_text == "Loading...":
-                        dpg.add_text("Reading folders in this location...")
-                    elif self.empty_text.startswith("No folders match"):
-                        dpg.add_text("Try a different search term.")
-                dpg.add_spacer(width=1)
+        """Render transient/empty content inside the details viewport body.
+
+        The frame is positioned absolutely below the table header so it behaves
+        like Explorer's empty-folder message rather than becoming another
+        vertical layout item above the header.  It is retained and explicitly
+        destroyed on every model rebuild.
+        """
+        old_state = self._empty_state_frame
+        self._empty_state_frame = None
+        if old_state is not None:
+            try:
+                if old_state.exists():
+                    old_state.delete()
+            except Exception:
+                pass
+
+        state_frame = QFrame(
+            parent=self.tag, width=-1, height=76, frame_shape=QFrame.NoFrame,
+            no_scrollbar=True, no_scroll_with_mouse=True,
+            pos=(0, METRICS.header_height),
+        )
+        self._empty_state_frame = state_frame
+        state = state_frame.tag
+        state_frame.setTheme(browser_empty_state_theme())
+        QSpacer(parent=state, height=18)
+        empty_layout = QGridLayout(
+            3, column_widths=(None, 280, None), parent=state_frame, height=0)
+        QRetainedItem(empty_layout.tag).setTheme(
+            browser_layout_theme(cell_padding=(0, 0)))
+        QSpacer(width=1, parent=empty_layout.cell(0, 0))
+        message_cell = empty_layout.cell(0, 1)
+        QLabel(self.empty_text, parent=message_cell)
+        if self.empty_text == "Loading...":
+            QLabel("Reading folders in this location...", parent=message_cell)
+        elif self.empty_text.startswith("No folders match"):
+            QLabel("Try a different search term.", parent=message_cell)
+        QSpacer(width=1, parent=empty_layout.cell(0, 2))
+
 
 
 class LocalFolderDialog(QtDialog):
@@ -233,146 +770,285 @@ class LocalFolderDialog(QtDialog):
     widgets and selection state stay on the Dear PyGui UI thread.
     """
 
+    dialog_title = "Open Folder"
+    REUSABLE_HOST = True
+    selection_caption = "Folder:"
+    accept_caption = "Select Folder"
+    context_selection_caption = "Select folder"
+    selection_height = METRICS.selection_height
+
+    def event(self, event):
+        """Deliver Qt mouse presses to the selector's retained item views.
+
+        QApplication gives a modal QDialog first refusal of pointer events.
+        That is correct for focus/ownership, but its generic QDialog handler
+        does not know the browser's ImGui table cells.  Route the press to the
+        visible row (or sidebar) before allowing it to fall through.  Native
+        Selectable and cell callbacks remain as a compatible fallback; the
+        list's per-frame guard coalesces duplicate notifications.
+        """
+        if (event.type() == QEvent.MouseButtonPress
+                and isinstance(event, QMouseEvent)
+                and event.button() == Qt.LeftButton):
+            application = QApplication.instance()
+            if application is not None and application.activeModalWidget() is self:
+                # A new press starts a new transaction, even when two genuine
+                # clicks occur rapidly on the same file/folder row.
+                self.listbox._qt_bridge_click = None
+                if self._selector_pointer_hit(event.globalPosition()):
+                    frame = application.frameCount()
+                    key = self.listbox.current
+                    if key in self.listbox.selected:
+                        self.listbox._qt_bridge_click = (key, frame, time.monotonic())
+                    event.accept()
+                    return True
+        return super().event(event)
+
+    def _selector_pointer_hit(self, point):
+        """Select only browser content, never popup/editor/overlay pixels."""
+        if (not self.winfo_exists() or not self.isVisible()
+                or self._folder_menu_is_open() or self._folder_menu_action_pending
+                or self._rename_path is not None or self._rename_after_load is not None):
+            return False
+        application = QApplication.instance()
+        if application is not None:
+            if application.activePopupWidget() is not None:
+                return False
+            active_modal = application.activeModalWidget()
+            if active_modal is not None and active_modal is not self:
+                return False
+        if QGuiRuntime().hasActivePopupSurface(exclude=self.tag, include_modals=False):
+            return False
+        if self.listbox._row_pointer_clicked(point=point):
+            return True
+        try:
+            x, y = (float(point.x()), float(point.y())) if hasattr(point, 'x') else map(float, point)
+            bounds = QRetainedItem(self.places).globalGeometry(clipped=True)
+            if bounds.isEmpty() or not bounds.contains((int(x), int(y))):
+                return False
+            for path, (item, _is_drive) in tuple(self._place_items.items()):
+                button = self._places_tree.nativeItem(item)
+                if button is None:
+                    continue
+                button_item = QRetainedItem(button)
+                if not button_item.exists() or not button_item.isVisible():
+                    continue
+                row = self._places_tree.nativeRow(item)
+                bounds = QRetainedItem(row).globalGeometry(clipped=True)
+                if not bounds.isEmpty() and bounds.contains((int(x), int(y))):
+                    self._place_clicked(button, True, path)
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def native_pointer_press(self, point):
+        """Recover a foreground native press missed by the ImGui hit target.
+
+        The floating host validates foreground/disabled HWNDs before calling
+        this method. A registered QApplication modal is *our own* selector,
+        not a reason to reject its own item presses.
+        """
+        from DearUIQt.input_gate import native_background_input_blocked, native_modal_input_active
+        application = QApplication.instance()
+        active_modal = application.activeModalWidget() if application is not None else None
+        if (native_modal_input_active() or
+                (active_modal is not None and active_modal is not self)):
+            return False
+        # When this selector itself owns QApplication modality, its native HWND
+        # can appear in the global background-input gate. Only a *different*
+        # modal must block the selector. Standalone recovery still honors the
+        # global native gate unconditionally.
+        if native_background_input_blocked() and active_modal is not self:
+            return False
+        return self._selector_pointer_hit(point)
+
     def __init__(self, view, initial, on_result):
         self.on_result = on_result
         self._finished = False
         self._generation = 0
+        self._initial_location_pending = True
         self._current_path = self._normalize_initial(initial)
         self._entries = {}
         self._back_paths, self._forward_paths = [], []
         self._listing = []
         self._folder_mtimes = {}
+        self._entry_types = {}
+        self._entry_sizes = {}
         self._sort_column, self._sort_ascending = 0, True
         self._place_items, self.place_buttons = {}, {}
         self._pending_place_path = None
         self._place_navigation_scheduled = False
+        self._place_transaction = None
+        self._pending_row_activation = None
+        self._row_activation_scheduled = False
         self._creating_folder = False
         self._select_after_load = None
         self._rename_after_load = None
         self._rename_path = None
         self._rename_editor = None
+        self._rename_editor_control = None
         self._rename_source = None
         self._folder_context_menu = None
         self._folder_menu_action_pending = False
-        super().__init__(view, "Open Folder", 840, 540)
-        dpg.configure_item(self.tag, on_close=lambda *_args: self._close_from_native())
-        self.preferred_size = (840, 540)
-        dpg.configure_item(self.content, no_scrollbar=True, no_scroll_with_mouse=True)
-        dpg.bind_item_theme(self.content, browser_dialog_body_theme())
+        super().__init__(view, self.dialog_title, 680, 420, footer=False)
+        self._font_metrics = QFontMetrics()
+        self._selector_themes = {}
+        self._form_labels = {}
+        self._caption_theme = browser_caption_theme()
+        QRetainedItem(self.tag).configure(on_close=lambda *_args: self._close_from_native())
+        self.preferred_size = (680, 420)
+        self.contentWidget()._configure_many(no_scrollbar=True, no_scroll_with_mouse=True)
+        self.contentWidget().setTheme(browser_dialog_body_theme())
         # Toolbar icons are generated geometry/textures; avoid font-dependent glyph metrics.
         self._navigation_font = None
         self._navigation_theme = navigation_button_theme()
-        self.location_toolbar = dpg.add_child_window(
-            parent=self.content, width=-1, height=METRICS.toolbar_height, border=False,
+        self._location_toolbar_frame = QFrame(
+            parent=self.content, width=-1, height=METRICS.toolbar_height,
+            frame_shape=QFrame.NoFrame, no_scrollbar=True,
+            no_scroll_with_mouse=True)
+        self.location_toolbar = self._location_toolbar_frame.tag
+        self._location_toolbar_frame.setTheme(browser_toolbar_theme())
+        self._location_grid = self.own_widget(QGridLayout(
+            6, column_widths=(METRICS.label_width, None, 3 * METRICS.tool_button_size + 2,
+                              METRICS.tool_button_size, METRICS.tool_button_size, METRICS.tool_button_size),
+            parent=self._location_toolbar_frame, height=0))
+        self._location_grid.setTheme(browser_layout_theme(cell_padding=(METRICS.form_gap // 2, 0)))
+
+        self._form_labels['location'] = self._form_caption("Look in:", self._location_grid.cell(0, 0))
+        nav_cell = self._location_grid.cell(0, 2)
+        self._nav_layout = QHBoxLayout(parent=nav_cell, spacing=1)
+        nav = self._nav_layout.tag
+        self.back_button = self._nav_button(nav, "Back", self._go_back)
+        self.forward_button = self._nav_button(nav, "Forward", self._go_forward)
+        self.up_button = self._nav_button(nav, "Up", self._go_up)
+
+        self._address_grid = self.own_widget(QGridLayout(
+            1, column_widths=(None,), parent=self._location_grid.cell(0, 1),
+            height=0))
+        self._address_grid.setTheme(browser_layout_theme(cell_padding=(0, 0)))
+        address_host = self._address_grid.cell(0, 0)
+        self.address = FolderAddressBar(self, address_host.tag)
+        self.address_icon = self.address.icon
+        self._path_edit_control = self.address._editor_control
+        self.path_edit = self.address.editor
+        self.breadcrumbs = self.address.breadcrumbs
+
+        self._search_shell_frame = QFrame(
+            parent=self.content, width=-1, height=METRICS.location_height, show=False,
+            frame_shape=QFrame.StyledPanel, no_scrollbar=True,
+            no_scroll_with_mouse=True)
+        self.search_shell = self._search_shell_frame.tag
+        self._search_normal_theme = browser_field_shell_theme()
+        self._search_focus_theme = browser_field_shell_theme(focused=True)
+        self._search_clear_theme = browser_inline_icon_button_theme()
+        self._search_shell_frame.setTheme(self._search_normal_theme)
+        self._search_grid = self.own_widget(QGridLayout(
+            3, column_widths=(21, None, 20), parent=self._search_shell_frame, height=0))
+        self._search_grid.setTheme(browser_layout_theme(cell_padding=(1, 0)))
+        search_icon_frame = QFrame(
+            parent=self._search_grid.cell(0, 0), width=21, height=METRICS.location_height - 2,
+            frame_shape=QFrame.NoFrame, no_scrollbar=True,
+            no_scroll_with_mouse=True)
+        search_icon_slot = search_icon_frame.tag
+        search_icon_frame.setTheme(browser_icon_slot_theme())
+        self._search_icon_view = QImageView(
+            navigation_texture("search"), parent=search_icon_frame, width=20, height=20,
+            pos=(2, max(0, (METRICS.location_height - 18) // 2)))
+        self._filter_edit_control = self.line_edit_widget(
+            "", parent=self._search_grid.cell(0, 1), width=-1, hint="Search this folder",
+            callback=lambda *_args: self._search_changed())
+        self._filter_edit_control.setTheme(browser_embedded_editor_theme(self._font_metrics.height()))
+        self.filter_edit = self._filter_edit_control.tag
+        clear_slot_frame = QFrame(
+            parent=self._search_grid.cell(0, 2), width=20, height=METRICS.location_height - 2,
+            frame_shape=QFrame.NoFrame, no_scrollbar=True,
+            no_scroll_with_mouse=True)
+        clear_slot = clear_slot_frame.tag
+        clear_slot_frame.setTheme(browser_icon_slot_theme())
+        self._clear_search_control = QToolButton(
+            "", parent=clear_slot, icon=navigation_texture("clear"),
+            icon_size=(12, 12))
+        self._clear_search_control.clicked.connect(self._clear_search)
+        self._clear_search_control.hide()
+        self.clear_search_button = self._clear_search_control.tag
+        self._clear_search_control.move(2, 5)
+        self._clear_search_control.setTheme(self._search_clear_theme)
+        add_styled_tooltip(self.clear_search_button, "Clear search")
+        self._bind_search_focus()
+
+        self._new_folder_control = QToolButton(
+            "", parent=self._location_grid.cell(0, 3), icon=new_folder_texture(), icon_size=(16, 16),
+            width=METRICS.tool_button_size, height=METRICS.tool_button_size)
+        self._new_folder_control.clicked.connect(self._show_new_folder)
+        self.new_folder_button = self._new_folder_control.tag
+        self._new_folder_control.setTheme(self._navigation_theme)
+        add_styled_tooltip(self.new_folder_button, "New folder (Ctrl+Shift+N)")
+        self._details_view_control = QToolButton(
+            "", parent=self._location_grid.cell(0, 5), icon=view_mode_texture("details"), icon_size=(16, 16),
+            width=METRICS.tool_button_size, height=METRICS.tool_button_size)
+        self._details_view_control.clicked.connect(lambda: self._change_view("Details"))
+        self.details_view_button = self._details_view_control.tag
+        self._list_view_control = QToolButton(
+            "", parent=self._location_grid.cell(0, 4), icon=view_mode_texture("list"), icon_size=(16, 16),
+            width=METRICS.tool_button_size, height=METRICS.tool_button_size)
+        self._list_view_control.clicked.connect(lambda: self._change_view("List"))
+        self.list_view_button = self._list_view_control.tag
+        self._details_tool_theme = browser_tool_button_theme(checked=True)
+        self._list_tool_theme = browser_tool_button_theme(checked=False)
+        self._details_view_control.setTheme(self._details_tool_theme)
+        self._list_view_control.setTheme(self._list_tool_theme)
+        add_styled_tooltip(self.details_view_button, "Details view")
+        add_styled_tooltip(self.list_view_button, "List view")
+        # Compatibility alias for code that treated the old combo as the view control.
+        self.view_mode = self.details_view_button
+        self._toolbar_separator_control = QSeparator(parent=self.content)
+        toolbar_separator = self._toolbar_separator_control.tag
+        self._toolbar_separator_control.setTheme(browser_separator_theme())
+        self._workspace_frame = QFrame(
+            parent=self.content, width=-1, height=-self.selection_height,
+            frame_shape=QFrame.StyledPanel, no_scrollbar=True,
+            no_scroll_with_mouse=True)
+        self.workspace = self._workspace_frame.tag
+        self._workspace_frame.setTheme(browser_workspace_theme())
+        self._workspace_layout = QHBoxLayout(parent=self._workspace_frame, spacing=0)
+        self._places_tree = self.own_widget(QTreeWidget(
+            parent=self._workspace_layout, width=METRICS.sidebar_width, height=-1,
+            row_height=METRICS.sidebar_row_height, indentation=18,
+            icon_size=(16, 16), root_spacing=METRICS.sidebar_section_gap,
+            ))
+        self.places = self._places_tree.tag
+        self._places_tree.setExpandOnItemClick(True)
+        self._places_tree.setIndentation(0)
+        self._places_tree.setRootSectionsVisible(False)
+        self._places_tree.itemClicked.connect(self._place_tree_clicked, receiver=self)
+        self._places_tree.layoutChanged.connect(
+            self._refresh_place_button_aliases, receiver=self)
+        self._places_tree.setTheme(browser_sidebar_theme())
+        # Preserve the 0.0.5 QFileDialog/Fusion presentation: 13 px labels,
+        # native 16 px icons, explicit branch/text alignment (not spaces).
+        self._places_tree.setItemTextOverlay(size=13, color=QtFusionPalette.TEXT)
+        self.quick_group = self._place_section("Quick access")
+        for label, path in quick_access_places():
+            self._add_place(label, path, WindowsIconRegistry.get_icon(is_dir=True),
+                            parent=self.quick_group)
+        self.drive_group = self._place_section(
+            "This PC", WindowsIconRegistry.get_stock_icon(94))
+        for drive in self._drives():
+            self._add_place(drive, drive, WindowsIconRegistry.get_stock_icon(drive_stock_id(drive)),
+                            is_drive=True, parent=self.drive_group)
+        self._refresh_place_button_aliases()
+        divider_frame = QFrame(
+            parent=self._workspace_layout, width=METRICS.divider_width, height=-1,
+            frame_shape=QFrame.NoFrame, no_scrollbar=True,
+            no_scroll_with_mouse=True)
+        divider = divider_frame.tag
+        divider_frame.setTheme(browser_divider_theme())
+        self._folder_region_frame = QFrame(
+            parent=self._workspace_layout, width=-1, height=-1, frame_shape=QFrame.NoFrame,
             no_scrollbar=True, no_scroll_with_mouse=True)
-        dpg.bind_item_theme(self.location_toolbar, browser_toolbar_theme())
-        with dpg.table(parent=self.location_toolbar, header_row=False, width=-1,
-                       policy=dpg.mvTable_SizingStretchProp, pad_outerX=False) as location:
-            dpg.bind_item_theme(location, browser_layout_theme(cell_padding=(2, 0)))
-            dpg.add_table_column(width_fixed=True, init_width_or_weight=90)
-            dpg.add_table_column(width_stretch=True)
-            dpg.add_table_column(width_fixed=True, init_width_or_weight=190)
-            dpg.add_table_column(width_fixed=True, init_width_or_weight=9)
-            dpg.add_table_column(width_fixed=True, init_width_or_weight=30)
-            dpg.add_table_column(width_fixed=True, init_width_or_weight=30)
-            dpg.add_table_column(width_fixed=True, init_width_or_weight=30)
-            with dpg.table_row() as location_row:
-                with dpg.group(parent=location_row, horizontal=True, horizontal_spacing=1) as nav:
-                    self.back_button = self._nav_button(nav, "Back", self._go_back)
-                    self.forward_button = self._nav_button(nav, "Forward", self._go_forward)
-                    self.up_button = self._nav_button(nav, "Up", self._go_up)
-                with dpg.table(parent=location_row, header_row=False, width=-1,
-                               policy=dpg.mvTable_SizingStretchProp, pad_outerX=False) as address_layout:
-                    dpg.bind_item_theme(address_layout, browser_layout_theme(cell_padding=(1, 0)))
-                    dpg.add_table_column(width_stretch=True)
-                    dpg.add_table_column(width_fixed=True, init_width_or_weight=28)
-                    with dpg.table_row() as address_row:
-                        self.address = FolderAddressBar(self, address_row)
-                        self.address_icon = self.address.icon
-                        self.path_edit = self.address.editor
-                        self.breadcrumbs = self.address.breadcrumbs
-                        self._nav_button(address_row, "Refresh", self._refresh)
-                self.search_shell = dpg.add_child_window(
-                    parent=location_row, width=-1, height=METRICS.location_height, border=True,
-                    no_scrollbar=True, no_scroll_with_mouse=True)
-                self._search_normal_theme = browser_field_shell_theme()
-                self._search_focus_theme = browser_field_shell_theme(focused=True)
-                self._search_clear_theme = browser_inline_icon_button_theme()
-                dpg.bind_item_theme(self.search_shell, self._search_normal_theme)
-                with dpg.table(parent=self.search_shell, header_row=False, width=-1,
-                               policy=dpg.mvTable_SizingStretchProp, pad_outerX=False) as search_layout:
-                    dpg.bind_item_theme(search_layout, browser_layout_theme(cell_padding=(1, 0)))
-                    dpg.add_table_column(width_fixed=True, init_width_or_weight=21)
-                    dpg.add_table_column(width_stretch=True)
-                    dpg.add_table_column(width_fixed=True, init_width_or_weight=20)
-                    with dpg.table_row() as search_row:
-                        search_icon_slot = dpg.add_child_window(
-                            parent=search_row, width=21, height=METRICS.location_height - 2,
-                            border=False, no_scrollbar=True, no_scroll_with_mouse=True)
-                        dpg.bind_item_theme(search_icon_slot, browser_icon_slot_theme())
-                        dpg.add_image(
-                            navigation_texture("search"), parent=search_icon_slot, width=20, height=20,
-                            pos=(2, max(0, (METRICS.location_height - 18) // 2)))
-                        self.filter_edit = self.line_edit(
-                            "", parent=search_row, width=-1, hint="Search this folder",
-                            callback=lambda *_args: self._search_changed())
-                        dpg.bind_item_theme(self.filter_edit, browser_embedded_editor_theme())
-                        clear_slot = dpg.add_child_window(
-                            parent=search_row, width=20, height=METRICS.location_height - 2,
-                            border=False, no_scrollbar=True, no_scroll_with_mouse=True)
-                        dpg.bind_item_theme(clear_slot, browser_icon_slot_theme())
-                        self.clear_search_button = dpg.add_image_button(
-                            navigation_texture("clear"), parent=clear_slot, width=12, height=12,
-                            pos=(2, 5), show=False, callback=lambda *_args: self._clear_search())
-                        dpg.bind_item_theme(self.clear_search_button, self._search_clear_theme)
-                        add_styled_tooltip(self.clear_search_button, "Clear search")
-                        self._bind_search_focus()
-                tool_divider = create_toolbar_divider(location_row)
-                self.new_folder_button = dpg.add_image_button(
-                    new_folder_texture(), parent=location_row, width=20, height=20,
-                    callback=lambda *_args: self._show_new_folder())
-                dpg.bind_item_theme(self.new_folder_button, self._navigation_theme)
-                add_styled_tooltip(self.new_folder_button, "New folder (Ctrl+Shift+N)")
-                self.details_view_button = dpg.add_image_button(
-                    view_mode_texture("details"), parent=location_row, width=20, height=20,
-                    callback=lambda *_args: self._change_view("Details"))
-                self.list_view_button = dpg.add_image_button(
-                    view_mode_texture("list"), parent=location_row, width=20, height=20,
-                    callback=lambda *_args: self._change_view("List"))
-                self._details_tool_theme = browser_tool_button_theme(checked=True)
-                self._list_tool_theme = browser_tool_button_theme(checked=False)
-                dpg.bind_item_theme(self.details_view_button, self._details_tool_theme)
-                dpg.bind_item_theme(self.list_view_button, self._list_tool_theme)
-                add_styled_tooltip(self.details_view_button, "Details view")
-                add_styled_tooltip(self.list_view_button, "List view")
-                # Compatibility alias for code that treated the old combo as the view control.
-                self.view_mode = self.details_view_button
-        toolbar_separator = dpg.add_separator(parent=self.content)
-        dpg.bind_item_theme(toolbar_separator, browser_separator_theme())
-        self.workspace = dpg.add_child_window(
-            parent=self.content, width=-1, height=-METRICS.selection_height, border=True,
-            no_scrollbar=True, no_scroll_with_mouse=True)
-        dpg.bind_item_theme(self.workspace, browser_workspace_theme())
-        with dpg.group(parent=self.workspace, horizontal=True, horizontal_spacing=0):
-            self.places = dpg.add_child_window(
-                width=METRICS.sidebar_width, height=-1, border=False, no_scrollbar=False)
-            dpg.bind_item_theme(self.places, browser_sidebar_theme())
-            self.quick_group = self._place_section("Quick access")
-            for label, path in quick_access_places():
-                self._add_place(label, path, WindowsIconRegistry.get_icon(is_dir=True),
-                                parent=self.quick_group)
-            dpg.add_spacer(parent=self.places, height=METRICS.sidebar_section_gap)
-            self.drive_group = self._place_section("This PC", WindowsIconRegistry.get_stock_icon(94))
-            for drive in self._drives():
-                self._add_place(drive, drive, WindowsIconRegistry.get_stock_icon(drive_stock_id(drive)),
-                                is_drive=True, parent=self.drive_group)
-            divider = dpg.add_child_window(
-                width=METRICS.divider_width, height=-1, border=False,
-                no_scrollbar=True, no_scroll_with_mouse=True)
-            dpg.bind_item_theme(divider, browser_divider_theme())
-            self.folder_region = dpg.add_child_window(
-                width=-1, height=-1, border=False, no_scrollbar=True)
-        dpg.bind_item_theme(self.folder_region, browser_surface_theme())
+        self.folder_region = self._folder_region_frame.tag
+        self._folder_region_frame.setTheme(browser_surface_theme())
         self.listbox = self.own_widget(
             FolderListView(
                 self.folder_region,
@@ -381,142 +1057,161 @@ class LocalFolderDialog(QtDialog):
                 height=-1,
                 multiple=False,
                 after=self.view.after,
-                backend=dpg,
                 on_sort=self._sort_entries,
             )
         )
-        dpg.configure_item(self.listbox.tag, border=False)
-        dpg.bind_item_theme(self.listbox.tag, browser_list_viewport_theme())
-        self.listbox.doubleClicked.connect(self._enter_key)
+        self.listbox._configure("border", False)
+        self.listbox.setTheme(browser_list_viewport_theme())
+        self.listbox.doubleClicked.connect(self._queue_row_activation)
         self.listbox.currentChanged.connect(self._selection_changed)
         self.active_table = self.listbox
-        selection_separator = dpg.add_separator(parent=self.content)
-        dpg.bind_item_theme(selection_separator, browser_separator_theme())
-        self.selection_bar = dpg.add_child_window(
-            parent=self.content, width=-1, height=METRICS.selection_height, border=False,
-            no_scrollbar=True, no_scroll_with_mouse=True)
-        dpg.bind_item_theme(self.selection_bar, browser_selection_bar_theme())
-        with dpg.table(parent=self.selection_bar, header_row=False, width=-1,
-                       policy=dpg.mvTable_SizingStretchProp, pad_outerX=False) as selection_layout:
-            dpg.bind_item_theme(selection_layout, browser_layout_theme(cell_padding=(3, 0)))
-            dpg.add_table_column(width_fixed=True, init_width_or_weight=54)
-            dpg.add_table_column(width_stretch=True)
-            with dpg.table_row() as selection_row:
-                dpg.add_text("Folder:", parent=selection_row)
-                self.folder_edit = self.line_edit(
-                    self._current_path, parent=selection_row, width=-1, on_enter=True,
-                    callback=lambda *_args: self._select_folder())
+        self._selection_separator_control = QSeparator(parent=self.content)
+        selection_separator = self._selection_separator_control.tag
+        self._selection_separator_control.setTheme(browser_separator_theme())
+        self._selection_bar_frame = QFrame(
+            parent=self.content, width=-1, height=self.selection_height,
+            frame_shape=QFrame.NoFrame, no_scrollbar=True,
+            no_scroll_with_mouse=True)
+        self.selection_bar = self._selection_bar_frame.tag
+        self._selection_bar_frame.setTheme(browser_selection_bar_theme())
+        self._build_selection_fields()
         self.enter_editors.update((self.path_edit, self.folder_edit, self.filter_edit))
-        self.status = self.status_text("")
+        self.status = self.status_text("", parent=self._selection_grid.cell(2, 1).tag)
+        self.set_control_visible(self.status, False)
         self._status_normal_theme = browser_status_text_theme(error=False)
         self._status_error_theme = browser_status_text_theme(error=True)
-        dpg.bind_item_theme(self.status, self._status_normal_theme)
-        self.button_box([
-            ("Select Folder", self._select_folder, "primary", True),
-            ("Cancel", lambda: self.finish(None), "secondary", False),
-        ], status_item=self.status, status_left_padding=6)
+        self.set_control_theme(self.status, self._status_normal_theme)
+        self._accept_button = self.action(
+            self.accept_caption, self._select_folder, role="primary", default=True,
+            parent=self._selection_grid.cell(0, 2), width=METRICS.action_width, height=METRICS.control_height)
+        cancel_button = self.action("Cancel", lambda: self.finish(None),
+                                  parent=self._selection_grid.cell(1, 2), width=METRICS.action_width,
+                                  height=METRICS.control_height)
+        self.control_wrapper(self._accept_button).setThemeProvider(self._selector_theme_provider('accept'))
+        self.control_wrapper(cancel_button).setThemeProvider(self._selector_theme_provider('cancel'))
+        self.set_control_enabled(self._accept_button, False)
         if self.footer_shell is not None:
-            dpg.bind_item_theme(self.footer_shell, browser_footer_theme())
-        dpg.configure_item(self.tag, min_size=(700, 430))
+            self.set_control_theme(self.footer_shell, browser_footer_theme())
+        self.setMinimumSize(560, 340)
         self._create_folder_context_menu()
         self._update_navigation()
-        self._refresh()
-        self._load_place_icons()
+        self._set_status("Loading...")
+        self.after_first_present(self._load_initial_contents)
         self._install_browser_keys()
         self.view.after(0, self._apply_layout)
+
+    def _build_selection_fields(self):
+        self._selection_grid = self.own_widget(QGridLayout(
+            3, column_widths=(METRICS.label_width, None, METRICS.action_width), parent=self._selection_bar_frame))
+        self._selection_grid.setTheme(browser_layout_theme(
+            cell_padding=(METRICS.form_gap // 2, METRICS.form_gap // 2)))
+        self._form_labels['filename'] = self._form_caption(self.selection_caption, self._selection_grid.cell(0, 0))
+        self._folder_edit_control = self.line_edit_widget(
+            self._current_path, parent=self._selection_grid.cell(0, 1),
+            width=-1, on_enter=True, callback=lambda *_args: self._select_folder())
+        self.folder_edit = self._folder_edit_control.tag
+        self._folder_edit_control.setThemeProvider(self._selector_theme_provider('editor'))
+
+    def _form_caption(self, text, parent):
+        frame = QFrame(parent=parent, width=-1, height=METRICS.control_height,
+                       frame_shape=QFrame.NoFrame, no_scrollbar=True, no_scroll_with_mouse=True)
+        frame.setTheme(self._caption_theme)
+        label = QLabel(text, parent=frame)
+        label.move(0, max(0, (METRICS.control_height - self._font_metrics.height()) // 2))
+        return label
+
+    def _selector_theme_provider(self, kind):
+        def theme(*, focused=False, disabled=False):
+            key = (kind, bool(focused), bool(disabled))
+            if key not in self._selector_themes:
+                if kind in ('accept', 'cancel'):
+                    result = browser_action_theme(default=kind == 'accept', focused=focused, disabled=disabled)
+                else:
+                    result = browser_file_editor_theme(
+                        focused=focused, disabled=disabled, combo=kind == 'combo',
+                        font_height=self._font_metrics.height())
+                self._selector_themes[key] = result
+            return self._selector_themes[key]
+        return theme
 
     def _nav_button(self, parent, name, callback):
         return navigation_button(parent, name, callback,
                                  self._navigation_font, self._navigation_theme)
 
     def _refresh_search_focus(self):
-        if not hasattr(self, "filter_edit") or not dpg.does_item_exist(self.filter_edit):
+        control = getattr(self, "_filter_edit_control", None)
+        if control is None or not control.exists():
             return
         try:
-            focused = bool(dpg.is_item_focused(self.filter_edit) or dpg.is_item_active(self.filter_edit))
-            dpg.bind_item_theme(
-                self.search_shell,
-                self._search_focus_theme if focused else self._search_normal_theme,
-            )
+            focused = bool(control.hasFocus() or control.isActive())
+            self._search_shell_frame.setTheme(
+                self._search_focus_theme if focused else self._search_normal_theme)
         except Exception:
             pass
 
     def _bind_search_focus(self):
-        """Mirror QLineEdit focus-frame behavior without changing input routing."""
+        """Mirror QLineEdit focus-frame behavior without exposing item registries."""
         try:
-            with dpg.item_handler_registry() as registry:
-                if hasattr(dpg, "add_item_focus_handler"):
-                    dpg.add_item_focus_handler(callback=lambda *_args: self._refresh_search_focus())
-                if hasattr(dpg, "add_item_activated_handler"):
-                    dpg.add_item_activated_handler(callback=lambda *_args: self._refresh_search_focus())
-                if hasattr(dpg, "add_item_deactivated_handler"):
-                    dpg.add_item_deactivated_handler(callback=lambda *_args: self._refresh_search_focus())
-            dpg.bind_item_handler_registry(self.filter_edit, registry)
-            self._control_handler_registries.append(registry)
+            callback = lambda *_args: self._refresh_search_focus()
+            self._search_focus_binding = (
+                QItemInputBinding(self._filter_edit_control, parent=self)
+                .onFocus(callback)
+                .onActivated(callback)
+                .onDeactivated(callback)
+                .activate()
+            )
         except Exception:
-            # Older DPG builds can omit one of these item handlers.  The field
-            # remains fully functional with the normal frame theme.
-            pass
+            self._search_focus_binding = None
 
     def _search_changed(self):
-        query = str(dpg.get_value(self.filter_edit) or "")
-        if hasattr(self, "clear_search_button") and dpg.does_item_exist(self.clear_search_button):
-            dpg.configure_item(self.clear_search_button, show=bool(query))
+        query = self._filter_edit_control.text()
+        control = getattr(self, "_clear_search_control", None)
+        if control is not None and not getattr(control, "_deleted", False):
+            control.setVisible(bool(query))
         self._filter_entries()
 
     def _clear_search(self):
-        dpg.set_value(self.filter_edit, "")
-        if hasattr(self, "clear_search_button") and dpg.does_item_exist(self.clear_search_button):
-            dpg.configure_item(self.clear_search_button, show=False)
+        set_editor_text(self._filter_edit_control, "")
+        control = getattr(self, "_clear_search_control", None)
+        if control is not None and not getattr(control, "_deleted", False):
+            control.hide()
         self._filter_entries()
         self.focus_editor(self.filter_edit)
         self.view.after(0, self._refresh_search_focus)
 
     def _place_section(self, title, texture=None):
-        # QTreeView-style branch row. The arrow is geometry, not a font glyph,
-        # so compact rows/DPI changes cannot clip it.
-        header = dpg.add_child_window(
-            parent=self.places, width=-1, height=METRICS.sidebar_row_height,
-            border=False, no_scrollbar=True, no_scroll_with_mouse=True)
-        dpg.bind_item_theme(header, browser_sidebar_item_container_theme())
-        toggle_row = dpg.add_selectable(
-            parent=header, label="", width=0, height=METRICS.sidebar_row_height,
-            default_value=False, pos=(0, 0))
-        dpg.bind_item_theme(toggle_row, browser_sidebar_header_theme())
-        indicator = create_branch_indicator(header, expanded=True, pos=(1, 0))
-        text_x = 24
-        overlay = dpg.add_drawlist(
-            METRICS.sidebar_width, METRICS.sidebar_row_height, parent=header, pos=(0, 0))
+        item = QTreeWidgetItem([str(title)])
         if texture:
-            dpg.draw_image(
-                texture, (22, 4), (38, 20), parent=overlay)
-            text_x = 43
-        section_label = dpg.draw_text(
-            (text_x, self._sidebar_draw_text_y(title)), title, parent=overlay,
-            color=QtFusionPalette.TEXT, size=13)
-        body = dpg.add_group(parent=self.places, indent=18)
+            item.setIcon(0, texture)
+        item.setExpanded(True)
+        item.setContainerTheme(browser_sidebar_item_container_theme())
+        item.setRowTheme(browser_sidebar_header_theme())
+        self._places_tree.addTopLevelItem(item)
+        return item
 
-        def change(_sender=None, _app_data=None, _user_data=None):
-            shown = not dpg.get_item_configuration(body)["show"]
-            dpg.configure_item(body, show=shown)
-            dpg.set_value(toggle_row, False)
-            paint_branch_indicator(indicator, shown)
+    def _refresh_place_button_aliases(self):
+        """Keep historical native-tag aliases synchronized after tree rebuilds."""
+        if not hasattr(self, "_places_tree"):
+            return
+        aliases = {}
+        for path, (item, _is_drive) in tuple(self._place_items.items()):
+            label = item.data(0, Qt.UserRole + 1) or item.text(0)
+            native = self._places_tree.nativeItem(item)
+            if native is not None:
+                aliases[str(label)] = native
+        self.place_buttons = aliases
 
-        dpg.configure_item(toggle_row, callback=change)
-        try:
-            with dpg.item_handler_registry() as registry:
-                dpg.add_item_clicked_handler(
-                    button=dpg.mvMouseButton_Left, callback=change)
-            dpg.bind_item_handler_registry(indicator, registry)
-            self._control_handler_registries.append(registry)
-        except Exception:
-            pass
-        return body
+    def _place_tree_clicked(self, item, _column=0):
+        if item is None or item.childCount():
+            return
+        path = item.data(0, Qt.UserRole)
+        if path:
+            self._place_clicked(self._places_tree.nativeItem(item), True, path)
 
     @staticmethod
     def _text_width(text):
         try:
-            measured = dpg.get_text_size(str(text or ""))
+            measured = (self._font_metrics.horizontalAdvance(str(text or "")), self._font_metrics.height())
             if isinstance(measured, (tuple, list)) and measured:
                 return float(measured[0] or 0.0)
         except Exception:
@@ -526,7 +1221,7 @@ class LocalFolderDialog(QtDialog):
     def _sidebar_draw_text_y(self, sample="Ag"):
         """Pixel-position draw_text so sidebar labels share the icon coordinate system."""
         try:
-            measured = dpg.get_text_size(str(sample or "Ag"))
+            measured = (self._font_metrics.horizontalAdvance(str(sample or "Ag")), self._font_metrics.height())
             if isinstance(measured, (tuple, list)) and len(measured) >= 2:
                 height = float(measured[1] or 0.0)
                 if height > 0:
@@ -538,10 +1233,10 @@ class LocalFolderDialog(QtDialog):
     def _elide_sidebar_label(self, text, max_width=None):
         """QFontMetrics::elidedText-like right elision for the Places tree."""
         text = str(text or "")
-        budget = float(max_width or (METRICS.sidebar_width - 46))
+        budget = float(max_width or (METRICS.sidebar_width - 36))
         if self._text_width(text) <= budget:
             return text
-        ellipsis = "…"
+        ellipsis = "..."
         ellipsis_width = self._text_width(ellipsis)
         if budget <= ellipsis_width:
             return ellipsis
@@ -555,32 +1250,28 @@ class LocalFolderDialog(QtDialog):
                 hi = mid - 1
         return text[:lo] + ellipsis
 
-    def _set_place_label(self, label_item, text):
-        dpg.configure_item(label_item, text=self._elide_sidebar_label(text))
+    def _set_place_label(self, item, text):
+        if isinstance(item, QTreeWidgetItem):
+            item.setText(0, self._elide_sidebar_label(text))
 
     def _add_place(self, label, path, texture, is_drive=False, parent=None):
-        # Full-row background selection/hover, matching QTreeView's visual
-        # behavior instead of starting the highlight after the icon.
-        row = dpg.add_child_window(
-            parent=parent or self.places, width=-1, height=METRICS.sidebar_row_height,
-            border=False, no_scrollbar=True, no_scroll_with_mouse=True)
-        dpg.bind_item_theme(row, browser_sidebar_item_container_theme())
-        button = dpg.add_selectable(
-            parent=row, label="", width=0, height=METRICS.sidebar_row_height,
-            pos=(0, 0), user_data=str(path),
-            callback=self._place_clicked)
-        dpg.bind_item_theme(button, browser_sidebar_row_theme())
-        overlay = dpg.add_drawlist(
-            METRICS.sidebar_width, METRICS.sidebar_row_height, parent=row, pos=(0, 0))
-        image = dpg.draw_image(
-            texture, (5, 4), (21, 20), parent=overlay)
-        display_label = self._elide_sidebar_label(label)
-        label_item = dpg.draw_text(
-            (28, self._sidebar_draw_text_y(display_label)), display_label,
-            parent=overlay, color=QtFusionPalette.TEXT, size=13)
-        add_styled_tooltip(row, str(path))
-        self.place_buttons[label] = button
-        self._place_items[str(path)] = (image, button, label_item, is_drive)
+        item = QTreeWidgetItem([self._elide_sidebar_label(label)])
+        item.setData(0, Qt.UserRole, str(path))
+        # Preserve the original caption independently from drive display-name
+        # refreshes so the historical place_buttons alias remains stable.
+        item.setData(0, Qt.UserRole + 1, str(label))
+        item.setToolTip(0, str(path))
+        if texture:
+            item.setIcon(0, texture)
+        item.setContainerTheme(browser_sidebar_item_container_theme())
+        item.setRowTheme(browser_sidebar_row_theme())
+        if isinstance(parent, QTreeWidgetItem):
+            parent.addChild(item)
+        else:
+            self._places_tree.addTopLevelItem(item)
+        self._place_items[str(path)] = (item, bool(is_drive))
+        self._refresh_place_button_aliases()
+        return item
 
 
     def _place_clicked(self, _sender, _app_data, path):
@@ -594,20 +1285,88 @@ class LocalFolderDialog(QtDialog):
         if not path:
             return
         self._pending_place_path = str(path)
+        self._place_transaction = self._new_pointer_transaction()
         if self._place_navigation_scheduled:
             return
         self._place_navigation_scheduled = True
-        # A small non-zero delay guarantees the current DPG frame is rendered
-        # before navigation mutates selection, address bar and the folder view.
+        # Yield first; the commit additionally verifies a real release/render
+        # boundary, rather than assuming a timer implies a rendered frame.
         self.view.after(1, self._commit_place_navigation)
 
     def _commit_place_navigation(self):
-        self._place_navigation_scheduled = False
         path = self._pending_place_path
-        self._pending_place_path = None
-        if not path or not self.winfo_exists():
+        transaction = self._place_transaction
+        if (not path or not self.winfo_exists() or transaction is None
+                or transaction["generation"] != self._generation):
+            self._place_navigation_scheduled = False
+            self._pending_place_path = self._place_transaction = None
             return
+        if not self._pointer_transaction_finished(transaction):
+            self.view.after(16, self._commit_place_navigation)
+            return
+        self._place_navigation_scheduled = False
+        self._pending_place_path = self._place_transaction = None
         self._navigate(path)
+
+    def _new_pointer_transaction(self):
+        return {"generation": self._generation, "frame": (QApplication.instance().frameCount() if QApplication.instance() is not None else 0), "release_frame": None}
+
+    @staticmethod
+    def _pointer_transaction_finished(transaction):
+        frame = (QApplication.instance().frameCount() if QApplication.instance() is not None else 0)
+        # When an owned native window receives the release, DearPyGui's button
+        # cache may lag the physical state. Use Win32 for the actual release
+        # boundary; keep the portable Qt facade for other renderers/platforms.
+        buttons = QCursor.buttons()
+        if os.name == "nt":
+            try:
+                import ctypes
+                user32 = ctypes.windll.user32
+                user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+                user32.GetAsyncKeyState.restype = ctypes.c_short
+                buttons = (Qt.LeftButton if (user32.GetAsyncKeyState(0x01) & 0x8000) else Qt.NoButton)
+                if user32.GetAsyncKeyState(0x02) & 0x8000:
+                    buttons |= Qt.RightButton
+                if user32.GetAsyncKeyState(0x04) & 0x8000:
+                    buttons |= Qt.MiddleButton
+            except Exception:
+                pass
+        if buttons != Qt.NoButton:
+            transaction["release_frame"] = None
+            return False
+        # A millisecond delay does not imply a rendered frame. Let ImGui see
+        # mouse-up before deleting its active row/sidebar item, even when many
+        # callbacks are drained together or the renderer is temporarily slow.
+        if transaction["release_frame"] is None:
+            transaction["release_frame"] = frame
+        return frame > max(transaction["frame"], transaction["release_frame"])
+
+    def _queue_row_activation(self, key):
+        if not self.winfo_exists() or key not in self.listbox.items:
+            return
+        self._pending_row_activation = (key, self._new_pointer_transaction(), self.listbox._row_generation)
+        if not self._row_activation_scheduled:
+            self._row_activation_scheduled = True
+            self.view.after(1, self._commit_row_activation)
+
+    def _commit_row_activation(self):
+        pending = self._pending_row_activation
+        if pending is None:
+            self._row_activation_scheduled = False
+            return
+        key, transaction, row_generation = pending
+        if (not self.winfo_exists() or transaction["generation"] != self._generation
+                or row_generation != self.listbox._row_generation or key not in self.listbox.items
+                or self.listbox.current != key):
+            self._pending_row_activation = None
+            self._row_activation_scheduled = False
+            return
+        if not self._pointer_transaction_finished(transaction):
+            self.view.after(16, self._commit_row_activation)
+            return
+        self._pending_row_activation = None
+        self._row_activation_scheduled = False
+        self._enter_key(key)
 
     def _change_view(self, value):
         details = value == "Details"
@@ -617,8 +1376,8 @@ class LocalFolderDialog(QtDialog):
         if hasattr(self, "details_view_button"):
             self._details_tool_theme = browser_tool_button_theme(checked=details)
             self._list_tool_theme = browser_tool_button_theme(checked=not details)
-            dpg.bind_item_theme(self.details_view_button, self._details_tool_theme)
-            dpg.bind_item_theme(self.list_view_button, self._list_tool_theme)
+            self._details_view_control.setTheme(self._details_tool_theme)
+            self._list_view_control.setTheme(self._list_tool_theme)
         self._filter_entries()
 
     def _apply_layout(self):
@@ -627,54 +1386,55 @@ class LocalFolderDialog(QtDialog):
             self.address.refresh()
 
     def _install_browser_keys(self):
-        with dpg.handler_registry() as registry:
-            for key in (dpg.mvKey_L, dpg.mvKey_F, dpg.mvKey_F4, dpg.mvKey_F5, dpg.mvKey_N,
-                        dpg.mvKey_Left, dpg.mvKey_Right, dpg.mvKey_Up,
-                        dpg.mvKey_Return, dpg.mvKey_Back, dpg.mvKey_F2):
-                dpg.add_key_press_handler(key=key, callback=self._browser_key)
-            dpg.add_mouse_click_handler(
-                button=dpg.mvMouseButton_Left, callback=self._rename_outside_click)
-            dpg.add_mouse_click_handler(
-                button=dpg.mvMouseButton_Left, callback=self._folder_menu_outside_click)
-            dpg.add_mouse_release_handler(
-                button=dpg.mvMouseButton_Right, callback=self._folder_right_release)
-        self._control_handler_registries.append(registry)
+        binding = QGlobalInputBinding(parent=self)
+        for key in (Qt.Key_L, Qt.Key_F, Qt.Key_F4, Qt.Key_F5, Qt.Key_N,
+                    Qt.Key_Left, Qt.Key_Right, Qt.Key_Up,
+                    Qt.Key_Return, Qt.Key_Backspace, Qt.Key_F2):
+            binding.onKeyPress(key, self._browser_key, user_data=key)
+        binding.onMouseClick(Qt.LeftButton, self._rename_outside_click)
+        binding.onMouseClick(Qt.LeftButton, self._folder_menu_outside_click)
+        binding.onMouseRelease(Qt.RightButton, self._folder_right_release)
+        self._browser_input_binding = binding.activate()
 
-    def _browser_key(self, _sender, key, _user_data=None):
-        if not self.winfo_exists() or not dpg.is_item_shown(self.tag):
+    def _browser_key(self, _sender, _app_data=None, key=None):
+        if key is None:
+            key = QGlobalInputBinding.qtKeyForNative(_app_data)
+        if not self.winfo_exists() or not self.isVisible():
             return
         if self._folder_menu_is_open() or self._folder_menu_action_pending:
             return
         if self._rename_path is not None or self._rename_after_load is not None:
-            if key == dpg.mvKey_Return and self._rename_path is not None:
+            if key == Qt.Key_Return and self._rename_path is not None:
                 self.view.after(1, self._commit_folder_rename, self._rename_path,
-                                dpg.get_value(self._rename_editor))
+                                self._rename_editor_control.text())
             return
-        ctrl = dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl)
-        shift = dpg.is_key_down(dpg.mvKey_LShift) or dpg.is_key_down(dpg.mvKey_RShift)
-        alt = dpg.is_key_down(dpg.mvKey_LAlt) or dpg.is_key_down(dpg.mvKey_RAlt)
-        if (key == dpg.mvKey_L and ctrl) or key == dpg.mvKey_F4:
+        modifiers = QKeyboard.modifiers()
+        ctrl = bool(modifiers & Qt.ControlModifier)
+        shift = bool(modifiers & Qt.ShiftModifier)
+        alt = bool(modifiers & Qt.AltModifier)
+        if (key == Qt.Key_L and ctrl) or key == Qt.Key_F4:
             self.address.begin_edit()
-        elif key == dpg.mvKey_F and ctrl:
+        elif key == Qt.Key_F and ctrl:
+            self._search_shell_frame.show()
             self.focus_editor(self.filter_edit)
             self.view.after(0, self._refresh_search_focus)
-        elif key == dpg.mvKey_F5:
+        elif key == Qt.Key_F5:
             self._refresh()
-        elif key == dpg.mvKey_N and ctrl and shift:
+        elif key == Qt.Key_N and ctrl and shift:
             self._show_new_folder()
-        elif key == dpg.mvKey_F2 and self._list_keyboard_active():
+        elif key == Qt.Key_F2 and self._list_keyboard_active():
             self._request_folder_rename(self.listbox.currentData())
-        elif key == dpg.mvKey_Left and alt:
+        elif key == Qt.Key_Left and alt:
             self._go_back()
-        elif key == dpg.mvKey_Right and alt:
+        elif key == Qt.Key_Right and alt:
             self._go_forward()
-        elif key == dpg.mvKey_Up and alt:
+        elif key == Qt.Key_Up and alt:
             self._go_up()
-        elif key == dpg.mvKey_Return and self._list_keyboard_active():
+        elif key == Qt.Key_Return and self._list_keyboard_active():
             path = self.listbox.currentData()
             if path:
                 self._enter_key(path)
-        elif key == dpg.mvKey_Back and self._list_keyboard_active():
+        elif key == Qt.Key_Backspace and self._list_keyboard_active():
             if self._back_paths:
                 self._go_back()
             else:
@@ -686,21 +1446,27 @@ class LocalFolderDialog(QtDialog):
         # opens it, and Backspace navigates back/up.
         if self._rename_path is not None:
             return False
-        for item in (self.path_edit, self.folder_edit, self.filter_edit):
-            try:
-                if dpg.does_item_exist(item) and (dpg.is_item_focused(item) or dpg.is_item_active(item)):
-                    return False
-            except Exception:
-                pass
+        for control in (getattr(self, "_path_edit_control", None),
+                        getattr(self, "_folder_edit_control", None),
+                        getattr(self, "_filter_edit_control", None)):
+            if control is not None and control.exists() and (control.hasFocus() or control.isActive()):
+                return False
         return bool(self.listbox.hasFocus() and self.listbox.currentData())
 
     def _set_status(self, message, *, error=False):
         """Update footer text with the same information/error hierarchy as Qt."""
-        if not hasattr(self, "status") or not dpg.does_item_exist(self.status):
+        if not hasattr(self, "status"):
             return
-        dpg.set_value(self.status, str(message or ""))
+        self.set_control_value(self.status, str(message or ""))
         theme = self._status_error_theme if error else self._status_normal_theme
-        dpg.bind_item_theme(self.status, theme)
+        self.set_control_theme(self.status, theme)
+        # Qt does not reserve a whole extra footer for an item-count label.
+        # Keep status data available to accessibility/tests, showing only errors.
+        self.set_control_visible(self.status, bool(error))
+        reserve = self.selection_height + (20 if error else 0)
+        if hasattr(self, '_selection_bar_frame'):
+            self._selection_bar_frame._configure('height', reserve)
+            self._workspace_frame._configure('height', -reserve)
 
     def _show_new_folder(self):
         if self._creating_folder:
@@ -714,20 +1480,23 @@ class LocalFolderDialog(QtDialog):
         self._rename_after_load = None
         self._rename_path = None
         editor, self._rename_editor = self._rename_editor, None
+        editor_control, self._rename_editor_control = self._rename_editor_control, None
         source, self._rename_source = self._rename_source, None
         if editor is not None:
             self.enter_editors.discard(editor)
-            if dpg.does_item_exist(editor):
-                dpg.delete_item(editor)
-        if source is not None and dpg.does_item_exist(source):
-            dpg.show_item(source)
+            if editor_control is not None and not getattr(editor_control, "_deleted", False):
+                editor_control.delete()
+            elif QRetainedItem(editor).exists():
+                QRetainedItem(editor).deleteNative()
+        if source is not None and QRetainedItem(source).exists():
+            QRetainedItem(source).show()
 
     def _create_folder(self):
         if self._creating_folder:
             return
         parent = self._current_path
         self._creating_folder = True
-        dpg.configure_item(self.new_folder_button, enabled=False)
+        self._new_folder_control.setEnabled(False)
         self._set_status("Creating folder...")
 
         def worker():
@@ -736,23 +1505,28 @@ class LocalFolderDialog(QtDialog):
                 path = str(FileSystemModel.new_folder(Path(parent)))
             except (OSError, ValueError) as exc:
                 error = str(exc)
-            self.view.after(0, self._folder_created, parent, path, error)
-        threading.Thread(target=worker, name="winux-folder-create", daemon=True).start()
+            return path, error
+        self.runAsync(
+            worker,
+            on_result=lambda outcome: self._folder_created(
+                parent, outcome[0], outcome[1]),
+        )
 
     def _folder_created(self, parent, path, error):
         if not self.winfo_exists():
             return
         self._creating_folder = False
-        dpg.configure_item(self.new_folder_button, enabled=True)
+        self._new_folder_control.setEnabled(True)
         if parent != self._current_path:
             return
         if error:
             self._set_status("Could not create folder: {}".format(error), error=True)
             return
         self._hide_new_folder()
-        dpg.set_value(self.filter_edit, "")
-        if hasattr(self, "clear_search_button") and dpg.does_item_exist(self.clear_search_button):
-            dpg.configure_item(self.clear_search_button, show=False)
+        set_editor_text(self._filter_edit_control, "")
+        control = getattr(self, "_clear_search_control", None)
+        if control is not None and not getattr(control, "_deleted", False):
+            control.hide()
         self._select_after_load = path
         self._rename_after_load = path
         self._refresh()
@@ -762,47 +1536,43 @@ class LocalFolderDialog(QtDialog):
                 or path not in self.listbox.items):
             return
         tag = self.listbox.items[path]
-        _, y = dpg.get_item_rect_min(tag)
-        bounds = dpg_window_rect(dpg, self.listbox.tag, clip=True)
-        if bounds is None:
+        row_rect = QRetainedItem(tag).globalGeometry()
+        y = row_rect.y()
+        bounds = QRetainedItem(self.listbox.tag).globalGeometry(clipped=True)
+        if bounds.isEmpty():
             self.view.after(20, self._begin_folder_rename, path)
             return
-        _, top, right, bottom = bounds
+        top, right, bottom = bounds.top(), bounds.right(), bounds.bottom() + 1
         # Scroll the new row into view before positioning the shared editor.
         header = METRICS.header_height if self.listbox.details_mode else 0
         if y < top + header or y + METRICS.row_height > bottom:
             offset = y - top - header if y < top + header else y + METRICS.row_height - bottom
-            dpg.set_y_scroll(self.listbox.tag, max(0, dpg.get_y_scroll(self.listbox.tag) + offset))
+            self.listbox.scrollBy(dy=offset)
             self.view.after(20, self._begin_folder_rename, path)
             return
         name = os.path.basename(path)
         # A span-columns Selectable reports the full row rect, including the
         # icon. Use the icon slot to place the editor exactly over the label.
-        icon_slot = dpg.get_item_parent(self.listbox.icons[path])
-        x = dpg.get_item_rect_min(icon_slot)[0] + dpg.get_item_rect_size(icon_slot)[0] + 4
+        icon_slot = QRetainedItem(self.listbox.icons[path]).parentItem()
+        icon_rect = QRetainedItem(icon_slot).globalGeometry()
+        x = icon_rect.right() + 1 + 4
         if self.listbox.details_mode:
             date_text = self.listbox.detail_texts[path][0]
-            right = min(right, dpg.get_item_rect_min(date_text)[0] - 6)
+            right = min(right, QRetainedItem(date_text).globalGeometry().left() - 6)
         max_width = max(24, int(right - x - 4))
-        editor_width = min(max_width, max(120, int(dpg.get_text_size(name)[0] + 12)))
-        self._rename_editor = dpg.add_input_text(
-            parent=dpg.get_item_parent(tag), before=tag,
-            default_value=name, width=editor_width, height=METRICS.row_height,
+        editor_width = min(max_width, max(120, int(self._font_metrics.horizontalAdvance(name) + 12)))
+        self._rename_editor_control = QLineEdit(
+            name, parent=QRetainedItem(tag).parentItem(), before=tag,
+            width=editor_width, height=METRICS.row_height,
             auto_select_all=True, on_enter=True,
             callback=lambda _sender, value, _user_data=None: self.view.after(
                 1, self._commit_folder_rename, path, value))
+        self._rename_editor = self._rename_editor_control.tag
         if not hasattr(self, "_rename_editor_theme"):
-            with dpg.theme() as self._rename_editor_theme:
-                with dpg.theme_component(dpg.mvInputText):
-                    dpg.add_theme_color(dpg.mvThemeCol_FrameBg, QtFusionPalette.BASE)
-                    dpg.add_theme_color(dpg.mvThemeCol_Text, QtFusionPalette.TEXT)
-                    dpg.add_theme_color(dpg.mvThemeCol_Border, (72, 72, 72, 255))
-                    dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
-                    dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
-                    dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 2, 1)
-        dpg.bind_item_theme(self._rename_editor, self._rename_editor_theme)
+            self._rename_editor_theme = browser_rename_editor_theme()
+        self._rename_editor_control.setTheme(self._rename_editor_theme)
         self._rename_source = tag
-        dpg.hide_item(tag)
+        QRetainedItem(tag).hide()
         self._rename_after_load = None
         self._rename_path = path
         self.enter_editors.add(self._rename_editor)
@@ -810,28 +1580,28 @@ class LocalFolderDialog(QtDialog):
 
     def _focus_folder_rename(self, path, retries=4):
         if self.winfo_exists() and self._rename_path == path:
-            if dpg.is_item_active(self._rename_editor):
+            if self._rename_editor_control is not None and self._rename_editor_control.isActive():
                 return
             # The toolbar/address field may still own its child window's focus.
             # Focus the list window before requesting its newly rendered input.
-            dpg.focus_item(self.listbox.tag)
-            dpg.focus_item(self._rename_editor)
+            self.listbox.setFocus()
+            self._rename_editor_control.setFocus()
             if retries:
                 self.view.after(16, self._focus_folder_rename, path, retries - 1)
 
     def _rename_outside_click(self, *_args):
         if self._rename_path is None:
             return
-        if not dpg.is_item_hovered(self._rename_editor):
+        if self._rename_editor_control is not None and not self._rename_editor_control.underMouse():
             self.view.after(1, self._commit_folder_rename, self._rename_path,
-                            dpg.get_value(self._rename_editor))
+                            self._rename_editor_control.text())
 
     def _commit_folder_rename(self, path=None, new_name=None):
         current = self._rename_path
         if current is None or (path is not None and current != path):
             return False
         if new_name is None:
-            new_name = dpg.get_value(self._rename_editor)
+            new_name = self._rename_editor_control.text()
         try:
             renamed = str(FileSystemModel().rename(
                 Path(current), str(new_name or "")))
@@ -841,7 +1611,7 @@ class LocalFolderDialog(QtDialog):
             return False
         self._hide_new_folder()
         self._select_after_load = renamed
-        dpg.set_value(self.folder_edit, renamed)
+        set_editor_text(self._folder_edit_control, renamed)
         self._refresh()
         return True
 
@@ -852,16 +1622,16 @@ class LocalFolderDialog(QtDialog):
             super().invoke_default()
 
     def _create_folder_context_menu(self):
-        menu = ImGuiMenu([
+        menu = QMenu([
             {"label": "Open", "action": "open"},
-            {"label": "Select folder", "action": "select"},
+            {"label": self.context_selection_caption, "action": "select"},
             {"label": "Rename", "action": "rename", "shortcut": "F2"},
             {"label": "Copy path", "action": "copy_path"},
             {"label": "Open in File Explorer", "action": "explorer"},
             {"label": "---"},
             {"label": "New folder", "action": "new_folder", "shortcut": "Ctrl+Shift+N"},
             {"label": "Refresh", "action": "refresh", "shortcut": "F5"},
-        ], backend=dpg, after=self.view.after, parent_window=self.tag)
+        ], after=self.view.after, parent_window=self.tag)
         menu.triggered.connect(self._folder_menu_triggered)
         menu.aboutToShow.connect(lambda *_args: setattr(self, "active_table", None))
         menu.aboutToHide.connect(lambda *_args: setattr(self, "active_table", self.listbox))
@@ -869,40 +1639,35 @@ class LocalFolderDialog(QtDialog):
 
     def _folder_menu_is_open(self):
         menu = self._folder_context_menu
-        return bool(menu is not None and dpg.does_item_exist(menu.tag)
-                    and dpg.is_item_shown(menu.tag))
+        return bool(menu is not None and menu.exists() and menu.isVisible())
 
     def _folder_menu_outside_click(self, *_args):
         if not self._folder_menu_is_open():
             return
-        bounds = dpg_window_rect(dpg, self._folder_context_menu.tag, clip=True)
-        if bounds is None:
+        bounds = self._folder_context_menu.globalGeometry()
+        if bounds.isEmpty():
             return
-        x, y = dpg.get_mouse_pos(local=False)
-        left, top, right, bottom = bounds
-        if not (left <= x < right and top <= y < bottom):
+        point = QCursor.pos()
+        if not bounds.contains(point):
             self.view.after(1, self._folder_context_menu.hide)
 
     def _folder_right_release(self, *_args):
-        if not self.winfo_exists() or not dpg.is_item_shown(self.tag):
+        if not self.winfo_exists() or not self.isVisible():
             return
-        position = tuple(dpg.get_mouse_pos(local=False))
-        bounds = dpg_window_rect(dpg, self.listbox.tag, clip=True)
-        if bounds is None:
-            return
-        mx, my = position
-        left, top, right, bottom = bounds
-        if not (left <= mx < right and top <= my < bottom):
+        point = QCursor.pos()
+        position = tuple(point.toTuple())
+        bounds = QRetainedItem(self.listbox.tag).globalGeometry(clipped=True)
+        if bounds.isEmpty() or not bounds.contains(point):
             return
         if self._folder_menu_is_open():
             return
         path = None
         for key, tag in self.listbox.items.items():
-            if not dpg.is_item_shown(tag):
+            retained = QRetainedItem(tag)
+            if not retained.isVisible():
                 continue
-            _, y = dpg.get_item_rect_min(tag)
-            _, height = dpg.get_item_rect_size(tag)
-            if y <= my < y + height:
+            row_rect = retained.globalGeometry()
+            if row_rect.top() <= point.y() < row_rect.bottom() + 1:
                 path = key
                 break
         # Freeze the target while processing this release. Popup mutation and
@@ -951,7 +1716,7 @@ class LocalFolderDialog(QtDialog):
             elif action == "rename":
                 self._request_folder_rename(path)
             elif action == "copy_path":
-                dpg.set_clipboard_text(path)
+                (QApplication.instance().clipboard().setText(path) if QApplication.instance() is not None else False)
             elif action == "explorer":
                 try:
                     os.startfile(path)
@@ -968,31 +1733,37 @@ class LocalFolderDialog(QtDialog):
 
     def _load_place_icons(self):
         def worker():
+            result = []
             for path, items in tuple(self._place_items.items()):
                 if self._finished:
-                    return
+                    break
                 image, name = WindowsIconRegistry.read_path_info(path)
-                self.view.after(0, self._apply_place_icon, path, items, image, name)
-        threading.Thread(target=worker, name="winux-folder-shell-icons", daemon=True).start()
+                result.append((path, items, image, name))
+            return result
+
+        def apply_icons(result):
+            for path, items, image, name in result:
+                if not self.winfo_exists():
+                    break
+                self._apply_place_icon(path, items, image, name)
+
+        self.runAsync(worker, on_result=apply_icons)
 
     def _apply_place_icon(self, path, items, image, name):
         if not self.winfo_exists():
             return
-        image_tag, button, label_item, is_drive = items
+        item, is_drive = items
         if image is not None:
             texture = WindowsIconRegistry.get_path_icon(path, image)
-            if image_tag:
-                dpg.configure_item(image_tag, texture_tag=texture)
+            item.setIcon(0, texture)
             list_icon = self.listbox.icons.get(path)
             if list_icon:
-                dpg.configure_item(list_icon, texture_tag=texture)
+                QRetainedItem(list_icon).setTexture(texture)
             if os.path.normcase(path) == os.path.normcase(self._current_path):
-                dpg.configure_item(
-                    self.address_icon,
-                    texture_tag=address_location_texture(self._current_path, size=18),
-                )
+                QRetainedItem(self.address_icon).setTexture(
+                    address_location_texture(self._current_path, size=18))
         if is_drive and name:
-            self._set_place_label(label_item, name)
+            self._set_place_label(item, name)
 
     def _update_breadcrumbs(self):
         self.address.end_edit()
@@ -1018,30 +1789,19 @@ class LocalFolderDialog(QtDialog):
         back_enabled = bool(self._back_paths)
         forward_enabled = bool(self._forward_paths)
         up_enabled = os.path.dirname(self._current_path) != self._current_path
-        dpg.configure_item(
-            self.back_button, enabled=back_enabled,
-            texture_tag=navigation_texture("Back") if back_enabled else navigation_disabled_texture("Back"))
-        dpg.configure_item(
-            self.forward_button, enabled=forward_enabled,
-            texture_tag=navigation_texture("Forward") if forward_enabled else navigation_disabled_texture("Forward"))
-        dpg.configure_item(
-            self.up_button, enabled=up_enabled,
-            texture_tag=navigation_texture("Up") if up_enabled else navigation_disabled_texture("Up"))
+        QRetainedItem(self.back_button).configure(
+            enabled=back_enabled, texture_tag=navigation_texture("Back") if back_enabled else navigation_disabled_texture("Back"))
+        QRetainedItem(self.forward_button).configure(
+            enabled=forward_enabled, texture_tag=navigation_texture("Forward") if forward_enabled else navigation_disabled_texture("Forward"))
+        QRetainedItem(self.up_button).configure(
+            enabled=up_enabled, texture_tag=navigation_texture("Up") if up_enabled else navigation_disabled_texture("Up"))
         current = os.path.normcase(self._current_path)
         parents = [path for path in self._place_items
                    if current == os.path.normcase(path) or
                    current.startswith(os.path.normcase(path).rstrip("\\/") + os.sep)]
         active = max(parents, key=len) if parents else None
-        for path, (_, button, label_item, _) in self._place_items.items():
-            selected = path == active
-            dpg.set_value(button, selected)
-            try:
-                dpg.configure_item(
-                    label_item,
-                    color=(QtFusionPalette.SELECTION_TEXT if selected else QtFusionPalette.TEXT),
-                )
-            except Exception:
-                pass
+        selected_item = self._place_items.get(active, (None, False))[0] if active else None
+        self._places_tree.setCurrentItem(selected_item)
 
     def _navigate(self, value, remember=True):
         value = os.path.expandvars(os.path.expanduser(str(value).strip()))
@@ -1054,16 +1814,19 @@ class LocalFolderDialog(QtDialog):
             self._back_paths.append(self._current_path)
             self._forward_paths.clear()
         self._current_path = candidate
+        self._initial_location_pending = False
+        self.set_control_enabled(self._accept_button, True)
         self._folder_context_menu.hide()
         self._select_after_load = None
         self._hide_new_folder()
-        dpg.set_value(self.path_edit, candidate)
-        dpg.configure_item(self.address_icon, texture_tag=address_location_texture(candidate, size=18))
+        set_editor_text(self._path_edit_control, candidate)
+        self.address._icon_view.setPixmap(address_location_texture(candidate, size=18))
         self._update_breadcrumbs()
-        dpg.set_value(self.folder_edit, candidate)
-        dpg.set_value(self.filter_edit, "")
-        if hasattr(self, "clear_search_button") and dpg.does_item_exist(self.clear_search_button):
-            dpg.configure_item(self.clear_search_button, show=False)
+        set_editor_text(self._folder_edit_control, candidate)
+        set_editor_text(self._filter_edit_control, "")
+        control = getattr(self, "_clear_search_control", None)
+        if control is not None and not getattr(control, "_deleted", False):
+            control.hide()
         self._entries.clear()
         self._listing = []
         self.listbox.empty_text = "Loading..."
@@ -1090,18 +1853,22 @@ class LocalFolderDialog(QtDialog):
 
     def _selection_changed(self, key):
         if hasattr(self, "folder_edit"):
-            dpg.set_value(self.folder_edit, self._entries.get(key, self._current_path))
+            set_editor_text(self._folder_edit_control, self._entries.get(key, self._current_path))
 
     def _filter_entries(self):
         if self._rename_path is not None:
             self._hide_new_folder()
-        query = str(dpg.get_value(self.filter_edit) or "").casefold().strip()
+        query = self._filter_edit_control.text().casefold().strip()
         entries = [item for item in self._listing if query in item[1].casefold()]
         entries.sort(key=lambda item: (
             (self._folder_mtimes.get(item[2], 0), item[0], item[1])
-            if self._sort_column == 1 else (item[0], item[1])),
+            if self._sort_column == 1 else
+            (self._entry_sizes.get(item[2], 0) or 0, item[0], item[1])
+            if self._sort_column == 2 else (item[0], item[1])),
             reverse=not self._sort_ascending)
         self.listbox.details = self._folder_mtimes
+        self.listbox.entry_types = getattr(self, "_entry_types", {})
+        self.listbox.entry_sizes = self._entry_sizes
         self.listbox.sort_column, self.listbox.sort_ascending = self._sort_column, self._sort_ascending
         self.listbox.empty_text = "No folders match your search." if query else "This folder is empty."
         self.listbox.setItems([QtListItem(path, name, path) for _, name, path in entries])
@@ -1114,17 +1881,49 @@ class LocalFolderDialog(QtDialog):
 
     @staticmethod
     def _normalize_initial(initial):
-        value = str(initial or os.getcwd())
+        # Lexical normalization only: isdir/stat on a disconnected share can
+        # stall for seconds before the user has even seen the selector.
+        value = str(initial or safe_current_directory())
         try:
             value = os.path.abspath(os.path.normpath(value))
         except Exception:
-            value = os.getcwd()
-        if not os.path.isdir(value):
-            value = os.getcwd()
+            value = str(safe_current_directory())
         return value
 
+    def _resolve_initial_location(self, value):
+        return (value if os.path.isdir(value) else str(safe_current_directory())), None
+
+    def _apply_initial_filename(self, filename):
+        set_editor_text(self._folder_edit_control, self._current_path)
+
+    def _load_initial_contents(self):
+        generation, requested = self._generation, self._current_path
+        editor_text = self._folder_edit_control.text()
+
+        def resolved(location):
+            if (not self.winfo_exists() or generation != self._generation
+                    or requested != self._current_path):
+                return
+            directory, filename = location
+            self._current_path = directory
+            self._initial_location_pending = False
+            self.set_control_enabled(self._accept_button, True)
+            # Do not erase something typed while the initial path was resolving.
+            if self._path_edit_control.text() == requested:
+                set_editor_text(self._path_edit_control, directory)
+            if self._folder_edit_control.text() == editor_text:
+                self._apply_initial_filename(filename)
+            if not self.address.editing:
+                self.address.refresh(force=True)
+            self._update_navigation()
+            self._refresh()
+
+        self.runAsync(lambda: self._resolve_initial_location(requested), on_result=resolved,
+                      on_error=lambda error: self._set_status(str(error), error=True))
+        self._load_place_icons()
+
     def _navigate_typed(self):
-        value = str(dpg.get_value(self.path_edit) or "").strip()
+        value = str(self._path_edit_control.text() or "").strip()
         if value:
             self._navigate(value)
 
@@ -1142,15 +1941,21 @@ class LocalFolderDialog(QtDialog):
         self._set_status("Loading...")
 
         def worker():
-            entries, error, modified = [], None, {}
+            entries, error, modified, kinds, sizes = [], None, {}, {}, {}
             try:
                 with os.scandir(path) as iterator:
                     for entry in iterator:
                         try:
-                            if entry.is_dir(follow_symlinks=True):
+                            is_dir = entry.is_dir(follow_symlinks=True)
+                            if self._include_entry(entry, is_dir):
                                 entries.append((entry.name.casefold(), entry.name, entry.path))
+                                kinds[entry.path] = ("Folder" if is_dir else
+                                    "{} File".format(Path(entry.name).suffix[1:].upper())
+                                    if Path(entry.name).suffix else "File")
                                 try:
-                                    modified[entry.path] = entry.stat(follow_symlinks=True).st_mtime
+                                    info = entry.stat(follow_symlinks=True)
+                                    modified[entry.path] = info.st_mtime
+                                    sizes[entry.path] = None if is_dir else info.st_size
                                 except OSError:
                                     modified[entry.path] = 0
                         except OSError:
@@ -1158,15 +1963,18 @@ class LocalFolderDialog(QtDialog):
                 entries.sort(key=lambda item: (item[0], item[1]))
             except (OSError, ValueError) as exc:
                 error = str(exc)
-            self.view.after(0, self._apply_entries, generation, path, entries, error, modified)
+            return entries, error, modified, kinds, sizes
 
-        threading.Thread(
-            target=worker,
-            name="winux-local-folder-list",
-            daemon=True,
-        ).start()
+        self.runAsync(
+            worker,
+            on_result=lambda outcome: self._apply_entries(
+                generation, path, outcome[0], outcome[1], outcome[2], outcome[3], outcome[4]),
+        )
 
-    def _apply_entries(self, generation, path, entries, error, modified=None):
+    def _include_entry(self, entry, is_dir):
+        return is_dir
+
+    def _apply_entries(self, generation, path, entries, error, modified=None, kinds=None, sizes=None):
         if not self.winfo_exists() or generation != self._generation:
             return
         if path != self._current_path:
@@ -1180,6 +1988,8 @@ class LocalFolderDialog(QtDialog):
             return
         self._entries = {full_path: full_path for _, _, full_path in entries}
         self._folder_mtimes = modified or {}
+        self._entry_types = kinds or {}
+        self._entry_sizes = sizes or {}
         self._listing = entries
         self._filter_entries()
         if self._select_after_load in self.listbox.items:
@@ -1196,7 +2006,7 @@ class LocalFolderDialog(QtDialog):
     def _select_folder(self):
         if self._rename_path is not None and not self._commit_folder_rename():
             return
-        value = str(dpg.get_value(self.folder_edit) or "").strip()
+        value = str(self._folder_edit_control.text() or "").strip()
         path = os.path.abspath(os.path.join(
             self._current_path, os.path.expandvars(os.path.expanduser(value))))
         if not os.path.isdir(path):

@@ -7,7 +7,7 @@ import tkinter as tk
 from tkinter import font as font_module
 from tkinter import ttk
 
-from WinUx.components.shared_scroller import make_ttk_scroller
+from DearUIQt.interop import make_ttk_scroller
 from WinUx.dialogs.modern import ask_modern_choice, show_modern_message
 from WinUx.services.server_notepad_types import _Document, _ENCODING_LABELS, _EOL_NAMES
 

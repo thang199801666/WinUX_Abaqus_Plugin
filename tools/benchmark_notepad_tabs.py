@@ -8,7 +8,7 @@ import tkinter as tk
 from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from WinUx.components.server_notepad_tabs import _EditorTabStrip
+from WinUx.ui.components.server_notepad_tabs import _EditorTabStrip
 
 
 def main():

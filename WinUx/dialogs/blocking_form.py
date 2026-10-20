@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-import dearpygui.dearpygui as dpg
-from .qt_dialog import QtDialog
+from DearUIQt.backends import dpg
+from DearUIQt.dialogs.qt_dialog import QtDialog
+from DearUIQt.dialogs.sizing import compact_message_size
+from DearUIQt.widgets import QSpacer
 
 
 class BlockingDialog(QtDialog):
+    REUSABLE_HOST = True
     ASYNC_RESULT_DELAY_MS = 20
 
     def __init__(self, view, title, message, kind="message", initial="", on_result=None,
@@ -13,17 +16,21 @@ class BlockingDialog(QtDialog):
         self.on_result = on_result
         self.result = {"done": False, "value": None}
         self.intent = intent
-        super().__init__(view, title, width=500, height=220)
-        lines = sum(max(1, (len(line) + 64)//65) for line in str(message).splitlines() or [""])
-        self.preferred_size = (480, max(160, min(282, 118 + 17*lines + (36 if kind == "input" else 0))))
         headings = {"Confirm Close App": "Exit WinUx?",
                     "Warning: Permanent Delete": "Delete permanently?",
                     "Overwrite?": "Replace existing item?"}
+        heading = headings.get(title, title)
+        # Calculate the size before creating the native window, so the first
+        # presented frame is already compact (no oversized/visible resize).
+        _, content_height = compact_message_size(
+            message, heading=heading, kind=kind, width=480)
+        super().__init__(view, title, width=480, height=content_height, compact=True)
+        self.preferred_size = (480, content_height)
         role = str(intent or ("question" if kind == "confirm" else "info"))
-        self.message_box_body(headings.get(title, title), str(message), intent=role)
+        self.message_box_body(heading, str(message), intent=role)
         self.entry = None
         if kind == "input":
-            dpg.add_spacer(parent=self.content, height=2)
+            QSpacer(parent=self.content, height=2, backend=dpg)
             self.entry = self.line_edit(str(initial or ""), parent=self.content)
             dpg.focus_item(self.entry)
         actions = [(primary_text or "OK", self.accept,

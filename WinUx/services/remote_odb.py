@@ -18,14 +18,150 @@ from .odb_history_live import build_remote_odb_history_live_script, parse_live_m
 class RemoteODBMixin:
     """Remote Abaqus ODB operations multiplexed over the shared SSH transport."""
 
+    ABAQUS_COMMAND_DIRECTORIES = (
+        "/opt/ohpc/pub/apps/simulia/abaqus/Commands",
+    )
+    # Legacy 2016/2017 releases are intentionally omitted from automatic
+    # Plot adapter detection. Installed releases from 2018 onwards are
+    # considered, including releases newer than the built-in defaults.
+    ABAQUS_MIN_PLOT_RELEASE = 2018
+
+    # SSH multiplexes exec channels over one authenticated transport, so
+    # probing several installed releases concurrently collapses wall-clock
+    # release detection from the sum of every probe to the slowest probe.
+    # The bound keeps pathological candidate lists from flooding a cluster
+    # with simultaneous Abaqus Python interpreters.
+    ABAQUS_PROBE_CONCURRENCY = 4
+
+    # The next candidate starts while the previous probe is still spinning up
+    # its interpreter, but only after this head start. Fast failures (a
+    # launcher missing when discovery failed) settle long before the window
+    # elapses, so cheap probes stay effectively sequential, while slow
+    # release-mismatch interpreters overlap and the wall-clock cost of a
+    # several-release fallback chain collapses to roughly one probe.
+    ABAQUS_PROBE_STAGGER_SECONDS = 2.0
+
+    @classmethod
+    def _race_abaqus_probe_commands(cls, exec_client, client, probes, timeout,
+                                    chunk_size=None, stagger=None,
+                                    probe_success=None):
+        """Run probe shell commands with speculative priority-order racing.
+
+        ``probes`` is a list of ``(candidate, shell_command)`` pairs in
+        candidate priority order.  Outcomes map each candidate to
+        ``(status, output, error)`` on completion, or to the raised
+        exception when the channel itself failed.
+
+        Candidates launch one after the other: the next probe starts as soon
+        as its predecessor has settled, or once
+        ``ABAQUS_PROBE_STAGGER_SECONDS`` elapse while that predecessor is
+        still running its interpreter.  Live probes are bounded by
+        ``ABAQUS_PROBE_CONCURRENCY``, so the common single-release case never
+        spawns extra interpreters while slow failing chains still race.
+        When ``probe_success(outcome)`` matches a completed probe, further
+        candidates are not launched: an earlier (higher-priority or
+        still-running) probe may also succeed, and the caller selects the
+        first success in candidate order.
+        """
+        pair_count = len(probes)
+        chunk_bound = max(1, int(chunk_size or cls.ABAQUS_PROBE_CONCURRENCY))
+        stagger = cls.ABAQUS_PROBE_STAGGER_SECONDS if stagger is None \
+            else max(0.0, float(stagger))
+        outcomes = {}
+        failures = {}
+        settled = [threading.Event() for _ in range(pair_count)]
+        lock = threading.Lock()
+        stop = threading.Event()
+        slots = threading.BoundedSemaphore(chunk_bound)
+
+        def worker(index, candidate, command):
+            try:
+                try:
+                    status, output, error = exec_client(
+                        client, command, timeout=timeout)
+                except Exception as exc:
+                    with lock:
+                        failures[candidate] = exc
+                else:
+                    with lock:
+                        outcomes[candidate] = (status, output, error)
+                    if probe_success is not None and probe_success(
+                            (status, output, error)):
+                        stop.set()
+            finally:
+                settled[index].set()
+                slots.release()
+
+        threads = []
+        launched = 0
+        for index, (candidate, command) in enumerate(probes):
+            if index > 0:
+                # Speculative overlap: proceed when the previous probe
+                # settled, or after the stagger window if it is still slow.
+                settled[index - 1].wait(stagger)
+            if stop.is_set():
+                break
+            slots.acquire()
+            if stop.is_set():  # a winner settled while this launch waited
+                slots.release()
+                break
+            thread = threading.Thread(
+                target=worker, args=(index, candidate, command),
+                name="winux-abq-probe-{}".format(candidate), daemon=True)
+            try:
+                thread.start()
+            except Exception as exc:  # thread exhausted, probe impossible
+                with lock:
+                    failures[candidate] = exc
+                settled[index].set()
+                slots.release()
+                continue
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        return outcomes, failures
+
+    @classmethod
+    def _abaqus_discovery_script(cls, candidates):
+        """Discover executable launchers, not installation targets or qcheck.
+
+        Keep the Commands symlink path: invoking ABQLauncher/SMALauncher
+        directly can lose the release-specific launcher environment.
+        """
+        directories = list(cls.ABAQUS_COMMAND_DIRECTORIES)
+        for candidate in candidates:
+            if str(candidate).startswith("/"):
+                parent = str(PurePosixPath(candidate).parent)
+                if parent not in directories:
+                    directories.append(parent)
+        values = " ".join(cls._shell_quote(value) for value in candidates)
+        roots = " ".join(cls._shell_quote(value) for value in directories)
+        return (
+            "IFS=: read -r -a _winux_path_dirs <<< \"$PATH\"; "
+            "for _winux_cmd in {values}; do "
+            "if command -v \"$_winux_cmd\" >/dev/null 2>&1; then "
+            "printf '__WINUX_ABAQUS_FOUND__%s\\n' \"$_winux_cmd\"; "
+            "else for _winux_dir in {roots}; do "
+            "if [ -f \"$_winux_dir/$_winux_cmd\" ] && "
+            "[ -x \"$_winux_dir/$_winux_cmd\" ]; then "
+            "printf '__WINUX_ABAQUS_FOUND__%s\\n' \"$_winux_dir/$_winux_cmd\"; "
+            "break; fi; done; fi; done; "
+            "for _winux_dir in {roots} \"${{_winux_path_dirs[@]}}\"; do "
+            "for _winux_file in \"$_winux_dir\"/abq20* \"$_winux_dir\"/abaqus; do "
+            "if [ -f \"$_winux_file\" ] && [ -x \"$_winux_file\" ]; then "
+            "printf '__WINUX_ABAQUS_FOUND__%s\\n' \"$_winux_file\"; "
+            "fi; done; done"
+        ).format(values=values, roots=roots)
+
     def _available_abaqus_candidates_on(self, client, candidates):
-        """Return only launchers visible in the remote login environment.
+        """Return launchers from the login PATH and known Commands directories.
 
         Compatibility probing is expensive because every failed candidate can
         start a full Abaqus Python runtime.  Most clusters expose only a small
         subset of WinUx's built-in fallback chain, so first resolve all command
-        names with one cheap ``command -v`` pass.  Discovery failures are
-        deliberately non-fatal and fall back to the original candidate list.
+        names with one cheap ``command -v`` and directory scan. A failed lookup
+        must NOT turn into expensive probes of every configured/nonexistent
+        launcher: the caller may retry discovery when SSH/login recovers.
         """
         candidates = list(candidates or ())
         if not candidates:
@@ -45,20 +181,19 @@ class RemoteODBMixin:
                 return list(available)
 
         marker = "__WINUX_ABAQUS_FOUND__"
-        values = " ".join(self._shell_quote(value) for value in candidates)
-        discovery = (
-            "for _winux_cmd in {}; do "
-            "if command -v \"$_winux_cmd\" >/dev/null 2>&1; then "
-            "printf '{}%s\\n' \"$_winux_cmd\"; fi; done"
-        ).format(values, marker)
+        discovery = self._abaqus_discovery_script(candidates)
         command = self._login_shell_command(discovery)
         try:
             status, output, _error = self._exec_client(
                 client, command, timeout=self.ABAQUS_DISCOVERY_TIMEOUT_SECONDS)
-        except Exception:
-            return candidates
+        except Exception as exc:
+            raise RuntimeError(
+                "Unable to detect installed Abaqus versions on the server; "
+                "will retry discovery: {}".format(exc)) from exc
         if status != 0:
-            return candidates
+            raise RuntimeError(
+                "Abaqus version discovery failed (exit {}): {}".format(
+                    status, str(_error or output or "login shell error")[:200]))
 
         candidate_set = set(candidates)
         available = []
@@ -67,7 +202,23 @@ class RemoteODBMixin:
             if not line.startswith(marker):
                 continue
             value = line[len(marker):].strip()
-            if value in candidate_set and value not in available:
+            launcher = PurePosixPath(value).name
+            discovered = (
+                value.startswith("/")
+                and re.fullmatch(r"[A-Za-z0-9._/+:-]+", value)
+                and (launcher == "abaqus" or re.fullmatch(
+                    r"abq20\d{2}(?:hf\d+)?", launcher, re.IGNORECASE))
+            )
+            # Do not probe obsolete 2016/2017 adapters even if they happen
+            # to be installed or appear in an older saved preference list.
+            match = re.fullmatch(r"(?:abq|abaqus)(20\d{2})(?:hf\d+)?",
+                                 launcher, re.IGNORECASE)
+            if match and int(match.group(1)) < self.ABAQUS_MIN_PLOT_RELEASE:
+                continue
+            # PATH names retain precedence over duplicate directory entries.
+            if value not in candidate_set and launcher in available:
+                continue
+            if (value in candidate_set or discovered) and value not in available:
                 available.append(value)
 
         with self._odb_abaqus_command_cache_lock:
@@ -102,7 +253,7 @@ class RemoteODBMixin:
         return sorted(candidates or (), key=release_key)
 
     def _resolve_abaqus_for_odb_on(self, client, path, abaqus_commands=None,
-                                 *, newest_first=False):
+                                 *, newest_first=True, cancel=None):
         """Return the first installed Abaqus release that can open *path*.
 
         Importing ``odbAccess`` is not enough for ODB compatibility.  A newer
@@ -112,41 +263,29 @@ class RemoteODBMixin:
         every configured/fallback release and select the first one for which
         ``openOdb(..., readOnly=True)`` succeeds.
 
-        On a cold session the configured default (normally ``abq2026``) is
-        preferred.  WinUx first removes launcher names that are not available
-        in the remote login environment, then promotes releases that succeeded
-        for this ODB, directory, or server earlier in the session.  Every hint
-        is still verified against the real ODB; failures continue through the
-        remaining configured/fallback releases and finally ``abaqus``.
-
-        Live Plots requests ``newest_first``: explicit release numbers are
-        always probed descending, even if a default or previous successful
-        ODB/directory/host hint names an older release.
+        All ODB tools discover installed launchers first, then invoke their
+        Abaqus Python runtimes one at a time in descending release order. Neither the default
+        command nor a previous successful ODB/directory/host hint may promote
+        an older release. Unversioned/custom launchers are tried afterwards.
+        ``newest_first`` is retained for caller compatibility; descending order
+        is now mandatory, including when an older caller passes False.
         """
         path = PurePosixPath(str(path))
         all_candidates = self._abaqus_candidate_commands(abaqus_commands)
-        if newest_first:
-            all_candidates = self._newest_first_abaqus_candidates(all_candidates)
+        all_candidates = self._newest_first_abaqus_candidates(all_candidates)
         candidates = self._available_abaqus_candidates_on(client, all_candidates)
         identity = (str(self.host or ""), str(self.username or ""))
         cache_key = identity + (str(path),)
         directory_key = identity + (str(path.parent),)
-        with self._odb_abaqus_command_cache_lock:
-            cached = self._odb_abaqus_command_cache.get(cache_key)
-            directory_hint = self._odb_abaqus_directory_hint_cache.get(directory_key)
-            host_hint = self._odb_abaqus_host_hint_cache.get(identity)
-        if newest_first:
-            # Discovery output/caches must not change the requested order.
-            available = set(candidates)
-            candidates = [value for value in all_candidates if value in available]
-        else:
-            candidates = self._prioritize_abaqus_candidates(
-                candidates, cached, directory_hint, host_hint)
+        # Sort after discovery too: Commands may contain releases newer than
+        # the built-in fallback list. Never promote an older cached success.
+        candidates = self._newest_first_abaqus_candidates(candidates)
 
         if not candidates:
             raise RuntimeError(
                 "None of the configured Abaqus commands are available on the "
-                "server login PATH. Checked: {}. Update Settings > Abaqus "
+                "server login PATH or Abaqus Commands directories. Checked: {}. "
+                "Update Settings > Abaqus "
                 "Versions if the cluster uses a different launcher name."
                 .format(", ".join(all_candidates) or "(none)"))
 
@@ -168,16 +307,22 @@ class RemoteODBMixin:
             "print(%r); odb.close()" % marker
         )
         attempted = []
+        # Only the installed releases enter the expensive Abaqus Python probe.
+        # Probe strictly newest -> oldest and return as soon as one opens the
+        # database. This avoids spinning up several heavy Abaqus interpreters
+        # concurrently for a file that the newest installed release can open.
         for candidate in candidates:
+            if cancel is not None and cancel.is_set():
+                raise RuntimeError("Plot monitor was cancelled")
             probe = "{} python -c {} {}".format(
                 candidate, self._shell_quote(probe_code),
                 self._shell_quote(path))
-            command = self._login_shell_command(probe)
             try:
                 status, output, error = self._exec_client(
-                    client, command, timeout=self.ABAQUS_PROBE_TIMEOUT_SECONDS)
+                    client, self._login_shell_command(probe),
+                    timeout=self.ABAQUS_PROBE_TIMEOUT_SECONDS)
             except Exception as exc:
-                attempted.append("{} ({})".format(candidate, exc))
+                attempted.append("{} ({})".format(candidate, str(exc)[:180]))
                 continue
             if status == 0 and marker in output:
                 with self._odb_abaqus_command_cache_lock:
@@ -188,9 +333,6 @@ class RemoteODBMixin:
 
             detail = (error or output or "exit {}".format(status)).strip()
             if detail:
-                # Abaqus often prints a long banner before the useful release
-                # mismatch message.  Keep only the final non-empty line in the
-                # user-facing retry/error summary.
                 lines = [line.strip() for line in detail.splitlines()
                          if line.strip()]
                 detail = (lines[-1] if lines else detail)[:180]
@@ -469,6 +611,9 @@ class RemoteODBMixin:
                 "prediction_fraction": prediction_fraction,
                 "history_confidence_samples": confidence_samples,
                 "catalog_changed_checks": catalog,
+                # Parent-side scheduling hint only; the remote helper receives
+                # the concrete interval numbers, not this WinUx-specific name.
+                "inactivity_stage": str(values.get("inactivity_stage") or "active"),
             }
 
         adaptive = normalized_adaptive(adaptive_settings)
@@ -487,7 +632,8 @@ class RemoteODBMixin:
                 "message": "Detecting compatible Abaqus release...",
             })
             executable = self._resolve_abaqus_for_odb_on(
-                client, path, abaqus_commands, newest_first=True)
+                client, path, abaqus_commands, newest_first=True,
+                cancel=cancel)
             on_payload({
                 "type": "status", "state": "opening",
                 "message": "Opening ODB with {}...".format(executable),
@@ -530,7 +676,7 @@ class RemoteODBMixin:
                 stop_sent = False
                 last_adaptive_text = json.dumps(
                     adaptive, sort_keys=True, separators=(",", ":"))
-                next_adaptive_check = time.monotonic() + 2.0
+                next_adaptive_check = time.monotonic() + 0.5
 
                 while True:
                     if cancel.is_set() and not stop_sent:
@@ -562,7 +708,7 @@ class RemoteODBMixin:
                         now = time.monotonic()
                         if (callable(adaptive_settings_provider) and
                                 now >= next_adaptive_check):
-                            next_adaptive_check = now + 2.0
+                            next_adaptive_check = now + 0.5
                             try:
                                 latest = normalized_adaptive(
                                     adaptive_settings_provider() or {})
@@ -603,6 +749,10 @@ class RemoteODBMixin:
                             line, text_buffer = text_buffer.split("\n", 1)
                             message = parse_live_message(line)
                             if message is not None:
+                                if message.get("type") == "fatal":
+                                    raise RuntimeError(
+                                        message.get("error") or
+                                        "Remote ODB reader failed; retrying")
                                 on_payload(message)
 
                     while channel.recv_stderr_ready():
@@ -618,6 +768,10 @@ class RemoteODBMixin:
                         if text_buffer.strip():
                             message = parse_live_message(text_buffer.strip())
                             if message is not None:
+                                if message.get("type") == "fatal":
+                                    raise RuntimeError(
+                                        message.get("error") or
+                                        "Remote ODB reader failed; retrying")
                                 on_payload(message)
                         status = channel.recv_exit_status()
                         if cancel.is_set():
@@ -635,7 +789,9 @@ class RemoteODBMixin:
                             continue
                         return
                     if not received:
-                        cancel.wait(0.05)
+                        stage = str(adaptive.get("inactivity_stage") or "active")
+                        local_wait = 0.25 if stage == "deep_idle" else (0.10 if stage == "away" else 0.05)
+                        cancel.wait(local_wait)
             finally:
                 if channel is not None:
                     try:

@@ -9,12 +9,12 @@ from WinUx.platform.dialog_focus import queue_owner_focus
 
 
 ROOT = Path(__file__).resolve().parents[1]
-NATIVE_HOST = ROOT / "WinUx" / "platform" / "native_dialog_host.py"
-FLOATING_VIEWPORT = ROOT / "WinUx" / "platform" / "floating_viewport.py"
-FLOATING_DIALOG = ROOT / "WinUx" / "dialogs" / "floating_dialog.py"
-FLOATING_RUNTIME = ROOT / "WinUx" / "dialogs" / "floating_runtime.py"
+NATIVE_HOST = ROOT / "WinUx/ui/native/native_dialog_host.py"
+FLOATING_VIEWPORT = ROOT / "WinUx/ui/native/floating_viewport.py"
+FLOATING_DIALOG = ROOT / "WinUx/ui/hosting/floating_dialog.py"
+FLOATING_RUNTIME = ROOT / "WinUx/ui/hosting/floating_runtime.py"
 VIEW = ROOT / "WinUx" / "view.py"
-PREWARM_POOL = ROOT / "WinUx" / "dialogs" / "prewarm_pool.py"
+PREWARM_POOL = ROOT / "WinUx/ui/hosting/prewarm_pool.py"
 
 
 class _QueueView:
@@ -300,11 +300,114 @@ class DialogForegroundHandoffTests(unittest.TestCase):
             foreground=lambda: next(foreground_values),
             state=lambda hwnd: (True, False, True) if hwnd == 200 else (True, True, True),
             restore=restore,
-            keyboard=lambda hwnd: False,
+            keyboard=lambda hwnd: True,
         )
         view.tick()
 
         restore.assert_not_called()
+
+    def test_foreground_owner_without_keyboard_focus_gets_nonraising_repair(self):
+        view = _QueueView()
+        closing = _Dialog(view, 200)
+        focused = {"value": False}
+        restore = Mock()
+        repair = Mock(side_effect=lambda hwnd: focused.update(value=True))
+        queue_owner_focus(
+            closing, force=True, foreground=lambda: 100,
+            state=lambda hwnd: (True, hwnd == 100, True),
+            restore=restore, keyboard=lambda hwnd: focused["value"],
+            repair_keyboard=repair,
+        )
+        view.tick()
+        repair.assert_called_once_with(100)
+        restore.assert_not_called()
+        self.assertFalse(view.pending)
+
+    def test_keyboard_repair_retries_but_is_cancelled_by_a_new_modal(self):
+        view = _QueueView()
+        closing = _Dialog(view, 200)
+        repair = Mock()
+        queue_owner_focus(
+            closing, force=True, foreground=lambda: 100,
+            state=lambda hwnd: (True, hwnd == 100, True),
+            restore=Mock(), keyboard=lambda hwnd: False,
+            repair_keyboard=repair,
+        )
+        view.tick()
+        self.assertEqual(repair.call_count, 1)
+        _Dialog(view, 300, modal=True)
+        view.tick()
+        self.assertEqual(repair.call_count, 1)
+        self.assertFalse(view.pending)
+
+    def test_foreground_restore_still_verifies_keyboard_before_finishing(self):
+        view = _QueueView()
+        closing = _Dialog(view, 200)
+        current = {"hwnd": 200, "focused": False}
+        restore = Mock(side_effect=lambda hwnd: current.update(hwnd=hwnd))
+        repair = Mock(side_effect=lambda hwnd: current.update(focused=True))
+        queue_owner_focus(
+            closing, foreground=lambda: current["hwnd"],
+            state=lambda hwnd: (True, hwnd == 100, True),
+            restore=restore, keyboard=lambda hwnd: current["focused"],
+            repair_keyboard=repair,
+        )
+        view.tick()
+        restore.assert_called_once_with(100)
+        self.assertEqual(len(view.pending), 1)
+        view.tick()
+        repair.assert_called_once_with(100)
+        self.assertFalse(view.pending)
+
+    def test_parent_close_waits_for_foreground_descendant_then_restores_main_owner(self):
+        view = _QueueView()
+        parent = _Dialog(view, 200)
+        child = _Dialog(view, 300, owner=200, modal=True)
+        parent._owned_dialogs.append(child)
+        visible = {"child": True}
+        restore = Mock()
+        queue_owner_focus(
+            parent, foreground=lambda: 300,
+            state=lambda hwnd: (True, hwnd == 100 or
+                                (hwnd == 300 and visible["child"]), True),
+            restore=restore, keyboard=lambda hwnd: True,
+        )
+        parent._closed = True
+        view.tick()
+        restore.assert_not_called()
+        self.assertEqual(len(view.pending), 1)
+        child._closed = True
+        visible["child"] = False
+        view.tick()
+        restore.assert_called_once_with(100)
+
+    def test_owned_subtree_snapshot_handles_unpublished_children_and_cycles(self):
+        from WinUx.platform.dialog_focus import closing_dialog_hwnds
+        view = _QueueView()
+        parent = _Dialog(view, 200)
+        unpublished = _Dialog(view, None)
+        grandchild = _Dialog(view, 300)
+        parent._owned_dialogs.append(unpublished)
+        unpublished._owned_dialogs.extend([grandchild, parent])
+        self.assertEqual(closing_dialog_hwnds(parent), (200, 300))
+
+    def test_failed_close_handoff_does_not_repeat_activation_after_alt_tab(self):
+        view = _QueueView()
+        closing = _Dialog(view, 200)
+        current = {"hwnd": 200}
+        restore = Mock()
+        queue_owner_focus(
+            closing, force=True, foreground=lambda: current["hwnd"],
+            state=lambda hwnd: (True, hwnd == 100, True),
+            restore=restore, keyboard=lambda hwnd: False,
+        )
+        view.tick()
+        restore.assert_called_once_with(100)
+        self.assertTrue(view.pending)
+        current["hwnd"] = 999
+        view.tick()
+        self.assertEqual(restore.call_count, 1)
+        self.assertFalse(view.pending)
 
 
 class DialogFlickerSourceTests(unittest.TestCase):
@@ -358,7 +461,7 @@ class DialogFlickerSourceTests(unittest.TestCase):
         staged_body = staged_body.split('elif event == "ready":', 1)[0]
         self.assertLess(staged_body.index("_acquire_modal_owner"),
                         staged_body.index('self.post("publish_commit")'))
-        self.assertIn('self.emit("prepared", hwnd=self.native.hwnd, pid=os.getpid())', runtime)
+        self.assertIn('self.emit("prepared", hwnd=self.native.hwnd, pid=os.getpid(),', runtime)
         self.assertIn("if not self._wait_for_publish():", runtime)
         self.assertLess(runtime.index("if not self._wait_for_publish():"),
                         runtime.index("self.native.stage_publish(self.desired_visible)"))
@@ -384,7 +487,7 @@ class DialogFlickerSourceTests(unittest.TestCase):
 
     def test_floating_form_pixels_survive_until_native_hide(self):
         runtime = FLOATING_RUNTIME.read_text(encoding="utf-8")
-        base = (ROOT / "WinUx" / "dialogs" / "base.py").read_text(encoding="utf-8")
+        base = (ROOT / "DearUIQt/dialogs/base.py").read_text(encoding="utf-8")
         self.assertIn("self.form._defer_visual_destroy = True", runtime)
         close = runtime.split("return_focus = bool(self.native and self.native.is_foreground())", 1)[1]
         close = close.split('self.emit("closed", return_focus=return_focus)', 1)[0]
@@ -453,7 +556,7 @@ class DialogFlickerSourceTests(unittest.TestCase):
 
     def test_child_transfers_foreground_before_swhide(self):
         runtime = FLOATING_RUNTIME.read_text(encoding="utf-8")
-        hide_body = runtime.split("def hide(self):", 1)[1].split("def _drain_commands", 1)[0]
+        hide_body = runtime.split("def hide(self,", 1)[1].split("def _resident_close", 1)[0]
         self.assertLess(hide_body.index("handoff_to_owner"),
                         hide_body.index("self.native.set_visible(False)"))
         close_body = runtime.split('self.emit("closing", return_focus=True)', 1)[1]
@@ -502,20 +605,25 @@ class DialogFlickerSourceTests(unittest.TestCase):
         self.assertIn("cancel_owner_focus_return(self._owner_hwnd)", source)
 
     def test_focus_retries_are_bounded_and_coalesced_per_owner(self):
-        source = (ROOT / "WinUx" / "platform" / "dialog_focus.py").read_text(encoding="utf-8")
+        source = (ROOT / "WinUx/ui/native/dialog_focus.py").read_text(encoding="utf-8")
         self.assertIn("_OWNER_FOCUS_GENERATIONS", source)
         self.assertIn("owner_generation != _OWNER_FOCUS_GENERATIONS", source)
         self.assertIn("if attempt < 32", source)
 
 
-    def test_modal_input_is_not_acquired_during_floating_child_bootstrap(self):
+    def test_logical_modal_input_starts_early_but_native_disable_waits_for_staging(self):
         source = FLOATING_DIALOG.read_text(encoding="utf-8")
         init = source.split("def __init__(self, view, kind, title", 1)[1]
         init = init.split("def post(self, command", 1)[0]
-        self.assertNotIn("acquire_native_modal_input(self)", init)
+        self.assertIn("acquire_native_modal_input(self)", init)
+        self.assertNotIn("_acquire_modal_owner(", init)
         prepared = source.split('if event == "prepared":', 1)[1]
         prepared = prepared.split('elif event == "staged":', 1)[0]
         self.assertIn("acquire_native_modal_input(self)", prepared)
+        self.assertNotIn("_acquire_modal_owner(", prepared)
+        staged = source.split('elif event == "staged":', 1)[1]
+        staged = staged.split('elif event == "ready":', 1)[0]
+        self.assertIn("_acquire_modal_owner(self._owner_hwnd)", staged)
 
     def test_dialog_prewarm_starts_during_view_construction(self):
         source = VIEW.read_text(encoding="utf-8")
@@ -526,13 +634,20 @@ class DialogFlickerSourceTests(unittest.TestCase):
         run = run.split("def after(self, delay", 1)[0]
         self.assertNotIn("self.after(0, start_dialog_prewarm, self)", run)
 
-    def test_default_prewarm_pool_keeps_two_workers_ready_or_preparing(self):
-        source = PREWARM_POOL.read_text(encoding="utf-8")
-        self.assertIn("def __init__(self, capacity=2):", source)
+    def test_default_prewarm_pool_keeps_three_workers_ready_or_preparing(self):
+        import inspect
+        from WinUx.dialogs.prewarm_pool import DialogPrewarmPool
+        self.assertEqual(inspect.signature(DialogPrewarmPool).parameters["capacity"].default, 3)
 
     def test_prewarmed_dialog_uses_shorter_hidden_settle_path(self):
         source = FLOATING_RUNTIME.read_text(encoding="utf-8")
-        self.assertIn("settle_frames = 2 if self.prepared is not None else 3", source)
+        from types import SimpleNamespace
+        from WinUx.dialogs.floating_runtime import _settle_frame_count
+        spec = ("confirm", 400, 300, 96, False, False, False)
+        host = SimpleNamespace(last_layout_spec=spec)
+        self.assertEqual(_settle_frame_count(None, spec, True), 3)
+        self.assertEqual(_settle_frame_count(host, spec, False), 2)
+        self.assertEqual(_settle_frame_count(host, spec, True), 1)
         self.assertIn("if self.prepared is None:\n                self._render_settled_frame()", source)
 
 

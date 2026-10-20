@@ -3,12 +3,13 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPONENTS = ROOT / "WinUx" / "components"
+COMPONENTS = ROOT / "WinUx" / "ui" / "components"
+FRAMEWORK_QT = ROOT / "DearUIQt" / "qt"
 
 
 class QtWidgetBehaviorTests(unittest.TestCase):
     def test_qt_palette_exposes_focus_header_menu_and_inactive_selection_roles(self):
-        source = (COMPONENTS / "qt_style.py").read_text(encoding="utf-8")
+        source = (FRAMEWORK_QT / "palette.py").read_text(encoding="utf-8")
         for token in (
             "FOCUS =",
             "SELECTION_INACTIVE =",
@@ -68,7 +69,7 @@ class QtWidgetBehaviorTests(unittest.TestCase):
             self.assertIn(token, source)
 
     def test_qcombobox_has_keyboard_index_and_disabled_behavior(self):
-        source = (COMPONENTS / "qt_combo_box.py").read_text(encoding="utf-8")
+        source = (FRAMEWORK_QT / "combo_box.py").read_text(encoding="utf-8")
         for token in (
             "def set_enabled",
             "def current_index",
@@ -82,29 +83,29 @@ class QtWidgetBehaviorTests(unittest.TestCase):
             self.assertIn(token, source)
 
     def test_qcombobox_uses_native_imgui_combo_popup_for_modal_safe_selection(self):
-        source = (COMPONENTS / "qt_combo_box.py").read_text(encoding="utf-8")
+        source = (FRAMEWORK_QT / "combo_box.py").read_text(encoding="utf-8")
         self.assertIn("self.button = dpg.add_combo(", source)
-        self.assertIn("no_preview=True", source)
+        self.assertIn("no_preview=False", source)
         self.assertIn("callback=self._native_selected", source)
         self.assertNotIn("self._popup = dpg.add_child_window(", source)
         self.assertNotIn("dpg.add_selectable(", source)
         self.assertNotIn("add_mouse_release_handler", source)
 
     def test_qcombobox_native_arrow_shares_qt_fusion_shell_theme(self):
-        source = (COMPONENTS / "qt_combo_box.py").read_text(encoding="utf-8")
-        self.assertIn("with dpg.theme_component(dpg.mvCombo):", source)
+        source = (FRAMEWORK_QT / "combo_box.py").read_text(encoding="utf-8")
+        self.assertIn("with dpg.theme_component(dpg.mvCombo, enabled_state=not disabled):", source)
         self.assertIn("self.container = dpg.add_child_window(", source)
         self.assertIn("dpg.mvStyleVar_ChildBorderSize, 1", source)
         self.assertIn("dpg.mvStyleVar_CellPadding, 0, 0", source)
-        self.assertIn("no_preview=True", source)
+        self.assertIn("no_preview=False", source)
         self.assertNotIn('label="v"', source)
         self.assertNotIn('▾', source)
         self.assertIn("self.search = None", source)
 
 
     def test_dialog_line_edit_and_combo_helpers_use_qt_focus_themes(self):
-        theme = (ROOT / "WinUx" / "dialogs" / "theme.py").read_text(encoding="utf-8")
-        dialog = (ROOT / "WinUx" / "dialogs" / "qt_dialog.py").read_text(encoding="utf-8")
+        theme = (ROOT / "DearUIQt/dialogs/theme.py").read_text(encoding="utf-8")
+        dialog = (ROOT / "DearUIQt/dialogs/qt_dialog.py").read_text(encoding="utf-8")
         for token in (
             "def line_edit_theme",
             "def combo_theme",
@@ -124,7 +125,7 @@ class QtWidgetBehaviorTests(unittest.TestCase):
             self.assertIn(token, dialog)
 
     def test_editable_qcombobox_is_dpg_only_and_leaves_input_clicks_to_imgui(self):
-        source = (COMPONENTS / "qt_combo_box.py").read_text(encoding="utf-8")
+        source = (FRAMEWORK_QT / "combo_box.py").read_text(encoding="utf-8")
         self.assertIn("qt_combo.shell.focus", source)
         self.assertIn("qt_combo.editor.disabled", source)
         self.assertIn("qt_combo.arrow.disabled", source)
@@ -133,7 +134,7 @@ class QtWidgetBehaviorTests(unittest.TestCase):
         self.assertIn("auto_select_all=False", source)
         self.assertIn("FrameBorderSize, 0", source)
         self.assertIn("self.button = dpg.add_combo(", source)
-        self.assertIn("no_preview=True", source)
+        self.assertIn("no_preview=False", source)
         self.assertIn("callback=self._native_selected", source)
         self.assertNotIn("dpg.draw_triangle(", source)
         self.assertNotIn("self._popup = dpg.add_child_window(", source)
@@ -143,10 +144,10 @@ class QtWidgetBehaviorTests(unittest.TestCase):
         self.assertNotIn("focus_item(self.input)", input_handlers)
 
     def test_qcombobox_dropdown_uses_native_begincombo_inside_modal(self):
-        source = (COMPONENTS / "qt_combo_box.py").read_text(encoding="utf-8")
+        source = (FRAMEWORK_QT / "combo_box.py").read_text(encoding="utf-8")
         self.assertIn("Dear PyGui only", source)
         self.assertIn("self.button = dpg.add_combo(", source)
-        self.assertIn("no_preview=True", source)
+        self.assertIn("no_preview=False", source)
         self.assertNotIn("self._find_popup_parent()", source)
         self.assertNotIn("self._popup = dpg.add_child_window(", source)
         self.assertNotIn("tkinter", source)
@@ -245,7 +246,7 @@ class QtWidgetBehaviorTests(unittest.TestCase):
             self.assertIn("self.button_box(", source)
 
     def test_native_chrome_matches_fixed_vs_resizable_qdialog_flags(self):
-        source = (ROOT / "WinUx" / "platform" / "native_dialog_host.py").read_text(
+        source = (ROOT / "WinUx/ui/native/native_dialog_host.py").read_text(
             encoding="utf-8")
         for token in (
             "WS_THICKFRAME",
@@ -257,9 +258,13 @@ class QtWidgetBehaviorTests(unittest.TestCase):
             self.assertIn(token, source)
 
     def test_modified_components_are_syntax_valid(self):
-        for name in ("qt_style.py", "explorer_list_view.py", "qt_combo_box.py"):
-            source = (COMPONENTS / name).read_text(encoding="utf-8")
-            compile(source, str(COMPONENTS / name), "exec")
+        for path in (
+            ROOT / "DearUIQt" / "qt" / "style.py",
+            COMPONENTS / "explorer_list_view.py",
+            ROOT / "DearUIQt" / "qt" / "combo_box.py",
+        ):
+            source = path.read_text(encoding="utf-8")
+            compile(source, str(path), "exec")
         dialogs = ROOT / "WinUx" / "dialogs"
         for name in (
             "modern.py", "bookmarks_dialog.py", "odb_extract_dialog.py",
@@ -269,8 +274,8 @@ class QtWidgetBehaviorTests(unittest.TestCase):
             compile(source, str(dialogs / name), "exec")
 
     def test_explorer_list_view_imports_shared_scroller_metrics_before_class_scope_use(self):
-        source = (ROOT / "WinUx" / "components" / "explorer_list_view.py").read_text(encoding="utf-8")
-        import_line = "from .shared_scroller import SharedScrollerMetrics"
+        source = (ROOT / "WinUx" / "ui" / "components" / "explorer_list_view.py").read_text(encoding="utf-8")
+        import_line = "from DearUIQt.backends.dearpygui import SharedScrollerMetrics"
         use_line = "SCROLLBAR_HIT_SIZE = float(SharedScrollerMetrics.HIT_THICKNESS)"
         self.assertIn(import_line, source)
         self.assertIn(use_line, source)

@@ -34,4 +34,5 @@ def test_folder_browser_qt_polish_keeps_sidebar_and_details_themes_scoped():
     assert "browser_sidebar_row_theme()" in source
     assert "browser_details_theme()" in source
     assert "browser_divider_theme()" in source
-    assert 'dpg.add_text("Folder:", parent=selection_row)' in source
+    assert 'selection_caption = "Folder:"' in source
+    assert 'dpg.add_text(self.selection_caption, parent=selection_row)' in source

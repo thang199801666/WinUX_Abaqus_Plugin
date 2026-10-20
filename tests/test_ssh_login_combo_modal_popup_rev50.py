@@ -5,7 +5,7 @@ WINUX = ROOT / "WinUx"
 
 
 def _source():
-    return (WINUX / "components" / "qt_combo_box.py").read_text(encoding="utf-8")
+    return (WINUX / "ui" / "framework" / "qt" / "combo_box.py").read_text(encoding="utf-8")
 
 
 def _constructor():

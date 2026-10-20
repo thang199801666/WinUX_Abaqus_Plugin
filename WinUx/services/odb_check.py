@@ -15,12 +15,108 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from pathlib import Path
 
 
 JSON_BEGIN = "__WINUX_ODB_JSON_BEGIN__"
 JSON_END = "__WINUX_ODB_JSON_END__"
+
+# Every configured launcher is probed with speculative priority racing.
+# Failed candidates once summed their interpreter start-up times; a small
+# stagger overlaps only genuinely slow probes while fast command-not-found
+# misses stay sequential, bounding a chain of misses to a few attempts.
+LOCAL_ODB_CHECK_CONCURRENCY = 4
+LOCAL_ODB_CHECK_STAGGER_SECONDS = 1.5
+
+
+def _race_local_odb_checks(pairs, timeout, creationflags, stagger=None,
+                           concurrency=None, payload_marker=None):
+    """Run local ``abaqus python`` probes with priority-order racing.
+
+    ``pairs`` is a list of ``(candidate, process_command)`` in candidate
+    priority order.  Outcomes map candidate to the ``CompletedProcess``
+    result, and failures map candidate to a short reason string
+    (launch error or per-candidate timeout).  The next candidate launches
+    as soon as the previous one settled, or after the stagger window when
+    it is still starting its interpreter, bounded by ``concurrency`` live
+    child processes.  When a completed result carries the WinUx JSON payload
+    marker, further candidates are not launched.
+    """
+    pair_count = len(pairs)
+    concurrency = max(1, int(concurrency or LOCAL_ODB_CHECK_CONCURRENCY))
+    stagger = LOCAL_ODB_CHECK_STAGGER_SECONDS if stagger is None \
+        else max(0.0, float(stagger))
+    outcomes = {}
+    failures = {}
+    settled = [threading.Event() for _ in range(pair_count)]
+    lock = threading.Lock()
+    stop = threading.Event()
+    slots = threading.BoundedSemaphore(concurrency)
+
+    def emitted_payload(completed):
+        if payload_marker is None:
+            return False
+        combined = "{}\n{}".format(
+            str(completed.stdout or ""), str(completed.stderr or ""))
+        return payload_marker in combined
+
+    def worker(index, candidate, process_command):
+        try:
+            try:
+                completed = subprocess.run(
+                    process_command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=timeout,
+                    creationflags=creationflags,
+                )
+            except subprocess.TimeoutExpired:
+                with lock:
+                    failures[candidate] = (
+                        "timed out after {:.0f}s".format(float(timeout)))
+            except (OSError, ValueError) as exc:
+                with lock:
+                    failures[candidate] = str(exc)
+            else:
+                with lock:
+                    outcomes[candidate] = completed
+                if emitted_payload(completed):
+                    stop.set()
+        finally:
+            settled[index].set()
+            slots.release()
+
+    threads = []
+    for index, (candidate, process_command) in enumerate(pairs):
+        if index > 0:
+            settled[index - 1].wait(stagger)
+        if stop.is_set():
+            break
+        slots.acquire()
+        if stop.is_set():  # a payload settled while this launch waited
+            slots.release()
+            break
+        thread = threading.Thread(
+            target=worker, args=(index, candidate, process_command),
+            name="winux-local-odb-{}".format(candidate), daemon=True)
+        try:
+            thread.start()
+        except Exception as exc:  # thread exhausted, probe impossible
+            with lock:
+                failures[candidate] = str(exc)
+            settled[index].set()
+            slots.release()
+            continue
+        threads.append(thread)
+    for thread in threads:
+        thread.join()
+    return outcomes, failures
 
 
 ODB_CHECK_SCRIPT = r'''from __future__ import print_function
@@ -262,10 +358,13 @@ def _local_process_command(abaqus_command, script_path, odb_path):
 def check_local_odb(path, abaqus_commands=None, timeout=600.0):
     """Inspect one local ODB in an isolated Abaqus Python child process.
 
-    The local path never passes through SSH.  Each configured Abaqus launcher
-    is tried until one actually starts the checker and emits the WinUx JSON
-    payload.  Once a payload is emitted, its ODB error (if any) is authoritative
-    and is surfaced rather than silently retrying another Abaqus version.
+    The local path never passes through SSH.  Configured Abaqus launchers are
+    probed with speculative priority racing (``_race_local_odb_checks``): the
+    candidate order is preserved, so the preferred release still wins when
+    several launchers can emit a payload, while slow interpreter start-ups
+    overlap instead of summing.  Once a payload is emitted, its ODB error
+    (if any) is authoritative and is surfaced rather than silently retrying
+    another Abaqus version.
     """
     path = Path(path).expanduser()
     if path.suffix.casefold() != ".odb":
@@ -282,6 +381,10 @@ def check_local_odb(path, abaqus_commands=None, timeout=600.0):
     script_path = None
     started = time.monotonic()
     attempts = []
+    creationflags = (
+        getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if os.name == "nt" else 0
+    )
     try:
         fd, script_name = tempfile.mkstemp(
             prefix="winux-check-odb-", suffix=".py")
@@ -289,33 +392,20 @@ def check_local_odb(path, abaqus_commands=None, timeout=600.0):
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
             stream.write(build_remote_odb_check_script())
 
-        for command in commands:
-            process_command = _local_process_command(
-                command, script_path, path)
-            creationflags = (
-                getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                if os.name == "nt" else 0
-            )
-            try:
-                completed = subprocess.run(
-                    process_command,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    timeout=max(1.0, float(timeout)),
-                    creationflags=creationflags,
-                )
-            except subprocess.TimeoutExpired:
-                raise RuntimeError(
-                    "Local Abaqus ODB check timed out after {:.0f}s".format(
-                        max(1.0, float(timeout))))
-            except (OSError, ValueError) as exc:
-                attempts.append("{} ({})".format(command, exc))
+        pairs = [
+            (command, _local_process_command(command, script_path, path))
+            for command in commands
+        ]
+        outcomes, failures = _race_local_odb_checks(
+            pairs, max(1.0, float(timeout)), creationflags,
+            payload_marker=JSON_BEGIN)
+
+        for command, _process_command in pairs:
+            if command in failures:
+                attempts.append("{} ({})".format(command, failures[command]))
                 continue
 
+            completed = outcomes[command]
             output = str(completed.stdout or "")
             error = str(completed.stderr or "")
             combined = "{}\n{}".format(output, error).strip()

@@ -10,7 +10,7 @@ from WinUx.runtime.rename_result import RenameResult
 
 
 def methods(path, names, namespace):
-    namespace.update(__name__='WinUx.components._rename_test', __package__='WinUx.components')
+    namespace.update(__name__='WinUx.ui.components._rename_test', __package__='WinUx.ui.components')
     tree = ast.parse(path.read_text(encoding='utf-8'))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef)
                and any(isinstance(member, ast.FunctionDef) and member.name in names for member in node.body))
@@ -22,7 +22,7 @@ def methods(path, names, namespace):
 class AsyncEditorTests(unittest.TestCase):
     def fixture(self):
         root = Path(__file__).resolve().parents[1]
-        cls = methods(root / 'WinUx/components/explorer_rename.py',
+        cls = methods(root / 'WinUx/ui/components/explorer_rename.py',
             {'commit_inline_rename', '_finish_inline_rename_ui', '_rename_completed', 'cancel_inline_rename'},
             {'os': os, 'RenameResult': RenameResult})
         editor = cls()
@@ -83,7 +83,7 @@ class AsyncEditorTests(unittest.TestCase):
 
     def test_panel_pending_callback_survives_failure_and_cannot_clear_new_callback(self):
         root = Path(__file__).resolve().parents[1]
-        cls = methods(root / 'WinUx/components/file_panel.py',
+        cls = methods(root / 'WinUx/ui/components/file_panel.py',
             {'_rename_commit', '_rename_callback_completed'},
             {'ListViewItem': object, 'Any': object})
         panel = cls.__new__(cls)
@@ -104,7 +104,7 @@ class AsyncEditorTests(unittest.TestCase):
 
     def test_panel_success_releases_original_callback(self):
         root = Path(__file__).resolve().parents[1]
-        cls = methods(root / 'WinUx/components/file_panel.py',
+        cls = methods(root / 'WinUx/ui/components/file_panel.py',
             {'_rename_commit', '_rename_callback_completed'},
             {'ListViewItem': object, 'Any': object})
         panel = cls.__new__(cls)

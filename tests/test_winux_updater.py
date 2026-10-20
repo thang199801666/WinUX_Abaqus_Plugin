@@ -22,6 +22,9 @@ def _deployment(root, version, marker=None):
     (root / "winux_update_installer.py").write_text("# installer\n")
     (root / "run_winux.py").write_text("# runner\n")
     (root / "WinUx" / "__main__.py").write_text("# app\n")
+    dear_u_i_qt = root / "DearUIQt"
+    dear_u_i_qt.mkdir(exist_ok=True)
+    (dear_u_i_qt / "__init__.py").write_text("# toolkit\n")
     if marker:
         (root / marker).write_text(marker + "\n")
     winux_update_manifest.write_manifest(str(root))

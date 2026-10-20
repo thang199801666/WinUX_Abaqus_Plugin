@@ -5,9 +5,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 SERVICE = ROOT / "WinUx" / "services" / "windows_shell_dragdrop.py"
-LIST_VIEW = ROOT / "WinUx" / "components" / "explorer_list_view.py"
-DRAG_DROP = ROOT / "WinUx" / "components" / "explorer_drag_drop.py"
-FILE_PANEL = ROOT / "WinUx" / "components" / "file_panel.py"
+LIST_VIEW = ROOT / "WinUx" / "ui" / "components" / "explorer_list_view.py"
+DRAG_DROP = ROOT / "WinUx" / "ui" / "components" / "explorer_drag_drop.py"
+FILE_PANEL = ROOT / "WinUx" / "ui" / "components" / "file_panel.py"
 CONTROLLER = ROOT / "WinUx" / "controller.py"
 INTERACTION = ROOT / "WinUx" / "controllers" / "explorer_transfer_interaction.py"
 

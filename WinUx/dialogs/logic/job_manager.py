@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import re
 
-from ...job_manager_preferences import JobManagerPreferences
+from ...preferences.job_manager import JobManagerPreferences
 
 
 class JobManagerLogic:
@@ -12,6 +12,7 @@ class JobManagerLogic:
 
     SCHEDULE_OPTIONS = ("Now", "Run After", "Run At")
     RUN_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
+    JOB_VIEW_WAIT_SECONDS = 30
 
     @staticmethod
     def _input_file_sort_key(path):
@@ -64,6 +65,14 @@ class JobManagerLogic:
     def _submit_from_native(self, jobs):
         if not self.winfo_exists() or not jobs:
             return
+        # A new Run click starts a new visibility-wait batch. Future scheduled
+        # jobs are persisted by JobScheduleController and must not keep this
+        # dialog alive until their eventual execution time.
+        self._pending_queue_job_names.clear()
+        self._submission_finished = False
+        self._close_requested = False
+        self._job_view_error = None
+        self._queue_wait_generation = getattr(self, "_queue_wait_generation", 0) + 1
         first = jobs[0]
         JobManagerPreferences().save(
             first["version"], first["cpus"],
@@ -94,14 +103,19 @@ class JobManagerLogic:
 
     def submission_job_complete(self, path, output):
         del output
-        self._successful_job_names.add(str(path.stem).casefold())
+        # Only immediate submissions need to become visible in qstat/Job Viewer
+        # before the manager can close. Scheduled jobs never enter this set.
+        self._pending_queue_job_names.add(str(path.stem).casefold())
         self.post("status", "Submitted {}".format(path.name))
 
     def submission_job_failed(self, path, error):
         self.post("status", "{} failed: {}".format(path.name, error))
 
     def submission_scheduled(self, path, run_at):
-        self._successful_job_names.add(str(path.stem).casefold())
+        # Registration in the scheduler is the terminal state for this dialog.
+        # Do not wait for a future Run After/Run At job to appear in Job Viewer.
+        if not self.winfo_exists():
+            return
         self.post(
             "status",
             "{} scheduled for {}".format(
@@ -110,12 +124,50 @@ class JobManagerLogic:
     def submission_finished(self, attempted, failed):
         if failed == 0:
             self._submission_finished = True
-            self.post("status", "Waiting for submitted jobs in Job Viewer...")
+            if self._pending_queue_job_names:
+                self.post("status", "Waiting for submitted jobs in Job Viewer...")
+                generation = getattr(self, "_queue_wait_generation", 0) + 1
+                self._queue_wait_generation = generation
+                schedule = getattr(self.view, "after", None)
+                if callable(schedule):
+                    schedule(self.JOB_VIEW_WAIT_SECONDS * 1000,
+                             self._queue_visibility_timeout, generation)
+                error = getattr(self, "_job_view_error", None)
+                if error:
+                    self.job_view_failed(error)
+            else:
+                # The batch contained only future schedules (or otherwise no
+                # immediate submissions). Scheduling is already durable, so
+                # there is nothing left for this dialog to wait for.
+                self._close_requested = True
+                self.view.after_render(self.destroy)
         else:
             self.post(
                 "status",
                 "Finished: {} attempted, {} failed".format(attempted, failed))
             self.post("run_enabled", True)
+
+    def job_view_failed(self, error):
+        """Distinguish a failed PBS query from failure to send the submit command."""
+        self._job_view_error = str(error)
+        if (not self._submission_finished or self._close_requested
+                or not self.winfo_exists() or not self._pending_queue_job_names):
+            return
+        detail = next((line.strip() for line in self._job_view_error.splitlines() if line.strip()), "Unknown PBS error")
+        self.post("status", "Sent; PBS verification failed: {}. Check SSH/PBS before retrying.".format(detail[:100]))
+        # Keep Run disabled: a successful shell launch followed by a failed
+        # qstat is NOT evidence that it is safe to submit a duplicate job.
+
+    def _queue_visibility_timeout(self, generation):
+        if (generation != getattr(self, "_queue_wait_generation", None)
+                or not self.winfo_exists() or self._close_requested
+                or not self._submission_finished or not self._pending_queue_job_names):
+            return
+        if getattr(self, "_job_view_error", None):
+            self.job_view_failed(self._job_view_error)
+            return
+        self.post("status", "Submit command sent; not confirmed in Job Viewer after {}s. Check PBS/job logs before retrying.".format(
+            self.JOB_VIEW_WAIT_SECONDS))
 
     def job_view_updated(self, jobs):
         if (not self._submission_finished or self._close_requested
@@ -124,6 +176,6 @@ class JobManagerLogic:
         visible_names = {
             str(getattr(job, "name", "")).casefold() for job in jobs
         }
-        if self._successful_job_names <= visible_names:
+        if self._pending_queue_job_names <= visible_names:
             self._close_requested = True
             self.view.after_render(self.destroy)

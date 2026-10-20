@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import time
-import dearpygui.dearpygui as dpg
-from .qt_dialog import QtDialog
+from DearUIQt.dialogs.qt_dialog import QtDialog
 from .logic.formatting import format_size, format_time
-from .theme import error_text_theme, muted_text_theme
-from ..widgets import QLabel, QProgressBar
+from DearUIQt.themes import error_text_theme, muted_text_theme
+from DearUIQt.widgets import QLabel, QProgressBar, QSpacer
+from DearUIQt.layouts import QVBoxLayout
 
 
 class ProgressDialog(QtDialog):
+    REUSABLE_HOST = True
     def __init__(self, view, operation, cancel_event, items=None):
         self.operation = str(operation)
         self.cancel_event = cancel_event
@@ -18,12 +19,14 @@ class ProgressDialog(QtDialog):
         self._cancelling = False
         super().__init__(view, self.operation, 510, 210, modal=False)
         self.preferred_size = (500, 192)
-        self.header(self.operation, "Transfer progress")
-        self._current_label = self.own_widget(QLabel("Preparing transfer...", parent=self.content, after=view.after))
-        self._current_progress = self.own_widget(QProgressBar(parent=self.content, after=view.after))
-        dpg.add_spacer(parent=self.content, height=2)
-        self._overall_label = self.own_widget(QLabel("Overall: 0.0%", parent=self.content, after=view.after))
-        self._overall_progress = self.own_widget(QProgressBar(parent=self.content, after=view.after))
+        self.content_layout = QVBoxLayout(parent=self.content, after=view.after, spacing=6)
+        self.setLayout(self.content_layout)
+        self.header(self.operation, "Transfer progress", parent=self.content_layout.tag)
+        self._current_label = QLabel("Preparing transfer...", parent=self.content_layout, after=view.after)
+        self._current_progress = QProgressBar(parent=self.content_layout, after=view.after)
+        spacer = QSpacer(parent=self.content_layout, height=2)
+        self._overall_label = QLabel("Overall: 0.0%", parent=self.content_layout, after=view.after)
+        self._overall_progress = QProgressBar(parent=self.content_layout, after=view.after)
         self.current, self.current_bar = self._current_label.tag, self._current_progress.tag
         self.overall, self.overall_bar = self._overall_label.tag, self._overall_progress.tag
         self.stats = self.status_text("Speed: --   Estimated time: --")
@@ -49,27 +52,28 @@ class ProgressDialog(QtDialog):
             self._current_progress.setFormat("{:.1f}%".format(current*100))
             self._overall_progress.setFormat("{:.1f}%".format(overall*100))
             self._overall_label.setText("Overall: {:.1f}%".format(overall*100))
-            dpg.set_value(self.stats, stats)
+            self.set_control_value(self.stats, stats)
         elif command == "fail":
             self._failed = True
-            dpg.set_value(self.current, "{} failed".format(self.operation))
-            dpg.set_value(self.stats, args[0])
+            self.set_control_value(self.current, "{} failed".format(self.operation))
+            self.set_control_value(self.stats, args[0])
             self._current_progress.setState("error")
             self._overall_progress.setState("error")
             self._current_progress.setFormat("Failed")
             self._overall_progress.setFormat("Failed")
-            dpg.bind_item_theme(self.current, error_text_theme())
-            dpg.bind_item_theme(self.stats, error_text_theme())
-            dpg.configure_item(self.action_button, label="Close", enabled=True, callback=lambda: self.destroy())
+            self.set_control_theme(self.current, error_text_theme())
+            self.set_control_theme(self.stats, error_text_theme())
+            self.set_control_value(self.action_button, "Close")
+            self.set_control_enabled(self.action_button, True)
         elif command == "cancelling":
             self._cancelling = True
-            dpg.set_value(self.current, "Cancelling...")
-            dpg.set_value(self.stats, "Waiting for the current transfer operation to stop...")
+            self.set_control_value(self.current, "Cancelling...")
+            self.set_control_value(self.stats, "Waiting for the current transfer operation to stop...")
             self._current_progress.setState("paused")
             self._overall_progress.setState("paused")
-            dpg.bind_item_theme(self.current, muted_text_theme())
-            dpg.bind_item_theme(self.stats, muted_text_theme())
-            dpg.configure_item(self.action_button, enabled=False)
+            self.set_control_theme(self.current, muted_text_theme())
+            self.set_control_theme(self.stats, muted_text_theme())
+            self.set_control_enabled(self.action_button, False)
 
     def complete(self):
         self.view.after(0, self.destroy)

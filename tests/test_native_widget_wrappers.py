@@ -1,5 +1,6 @@
 """Actual DPG item behavior, independent of a viewport or SSH session."""
 import threading
+from functools import partial
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -9,15 +10,15 @@ try:
 except (ImportError, OSError) as exc:
     raise unittest.SkipTest("native DPG unavailable; use tools/run_native_tests.py: {}".format(exc)) from exc
 
-from WinUx.widgets import QLabel, QLineEdit, QPushButton, QProgressBar, QVBoxLayout, QSignalBlocker, QCheckBox, QGridLayout
+from WinUx.ui import QLabel, QLineEdit, QPushButton, QProgressBar, QVBoxLayout, QSignalBlocker, QCheckBox, QGridLayout
 from WinUx.dialogs.qt_dialog import QtDialog
 from WinUx.dialogs.login_form import LoginForm
-from WinUx.components import qt_combo_box
+from WinUx.ui.components import qt_combo_box
 from tests.test_console_renderer import fixture as console_renderer_fixture
 from WinUx.dialogs.job_schedule_form import JobScheduleDialog
 from WinUx.dialogs.progress_form import ProgressDialog
-from WinUx.components.explorer_drag_preview import DragPreviewHelper
-from WinUx.components.explorer_list_model import ListViewItem
+from WinUx.ui.components.explorer_drag_preview import DragPreviewHelper
+from WinUx.ui.components.explorer_list_model import ListViewItem
 
 
 class NativeWrapperTests(unittest.TestCase):
@@ -68,7 +69,7 @@ class NativeWrapperTests(unittest.TestCase):
         dialog = QtDialog(SimpleNamespace(after=self.after), 'Grid form')
         try:
             field = dialog.field('Name', 'value')
-            grid = dialog._widget_owner._children[-1]
+            grid = dialog._widget_owner.findChild(QGridLayout)
             self.assertIsInstance(grid, QGridLayout)
             self.assertEqual(dpg.get_item_parent(field), grid.cell(0, 1).tag)
             self.assertEqual(dpg.get_value(field), 'value')
@@ -173,8 +174,8 @@ class NativeWrapperTests(unittest.TestCase):
         self.assertFalse(dpg.does_item_exist(checkbox.tag))
 
     def test_combo_theme_cache_uses_context_safe_aliases(self):
-        for factory in (qt_combo_box._input_theme, qt_combo_box._disabled_input_theme,
-                        qt_combo_box._combo_theme, qt_combo_box._disabled_combo_theme):
+        for factory in (qt_combo_box._input_theme, partial(qt_combo_box._input_theme, disabled=True),
+                        qt_combo_box._arrow_theme, partial(qt_combo_box._arrow_theme, disabled=True)):
             tag = factory()
             self.assertIsInstance(tag, str)
             self.assertEqual(dpg.get_item_info(tag)["type"], "mvAppItemType::mvTheme")
@@ -190,12 +191,12 @@ class NativeWrapperTests(unittest.TestCase):
         view._current_line_fill = dpg.draw_rectangle((0, 0), (10, 10), parent=view.canvas)
         view._caret = dpg.draw_rectangle((0, 0), (10, 2), parent=view.canvas)
         with patch.object(dpg, 'get_item_state', return_value={'rect_size': (640, 240)}), \
-             patch('WinUx.components.console_renderer.time.monotonic', return_value=0):
+             patch('WinUx.ui.components.console_renderer.time.monotonic', return_value=0):
             renderer.paint()
         items = tuple(view._line_items)
         self.assertTrue(items)
         with patch.object(dpg, 'get_item_state', return_value={'rect_size': (640, 240)}), \
-             patch('WinUx.components.console_renderer.time.monotonic', return_value=.51), \
+             patch('WinUx.ui.components.console_renderer.time.monotonic', return_value=.51), \
              patch.object(dpg, 'draw_text', wraps=dpg.draw_text) as draws, \
              patch.object(dpg, 'delete_item', wraps=dpg.delete_item) as deletes:
             renderer.paint()

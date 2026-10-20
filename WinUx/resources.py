@@ -19,7 +19,23 @@ except Exception:  # pragma: no cover - Tk may be unavailable in headless CI
     tk = None
 
 
-PACKAGE_DIR = Path(__file__).resolve().parent
+def _absolute_path(value) -> Path:
+    """Normalize to an absolute path without needing a valid working directory.
+
+    ``Path.resolve()`` on Python 3.10 calls ``ntpath.realpath``, which reads the
+    process CWD unconditionally.  Abaqus sessions can outlive a deleted folder
+    or disconnected drive, so every path normalization in this module must fall
+    back to ``os.path.abspath`` for already-absolute paths.
+    """
+    raw = os.fspath(value)
+    try:
+        absolute = os.path.abspath(raw)
+    except (OSError, RuntimeError, ValueError):
+        absolute = raw
+    return Path(absolute)
+
+
+PACKAGE_DIR = _absolute_path(__file__).parent
 
 
 def _candidate_resource_dirs() -> Iterable[Path]:
@@ -39,18 +55,25 @@ def _candidate_resource_dirs() -> Iterable[Path]:
     except Exception:
         pass
 
-    # Last-resort compatibility for legacy launch scripts.
-    yield Path.cwd() / "Resources"
+    # Last-resort compatibility for legacy launch scripts.  The inherited
+    # CWD can disappear (deleted folder/disconnected mapped drive) while Abaqus
+    # remains alive, so resource import must not depend on Path.cwd() succeeding.
+    try:
+        current = Path.cwd()
+    except (OSError, RuntimeError, ValueError):
+        current = None
+    if current is not None:
+        yield current / "Resources"
 
 
 def _resolve_resource_dir() -> Path:
     candidates = list(_candidate_resource_dirs())
     for candidate in candidates:
         if candidate.is_dir():
-            return candidate.resolve()
+            return _absolute_path(candidate)
     # Preserve a deterministic path even when the folder was accidentally
     # omitted, so error messages identify the expected package location.
-    return (PACKAGE_DIR / "Resources").resolve()
+    return _absolute_path(PACKAGE_DIR / "Resources")
 
 
 RESOURCE_DIR = _resolve_resource_dir()
@@ -66,7 +89,7 @@ def resource_path(name: str | os.PathLike[str], *, required: bool = False) -> Pa
     path = relative if relative.is_absolute() else RESOURCE_DIR / relative
 
     if path.exists():
-        return path.resolve()
+        return _absolute_path(path)
 
     if not relative.is_absolute() and RESOURCE_DIR.is_dir():
         wanted = relative.name.casefold()
@@ -79,11 +102,11 @@ def resource_path(name: str | os.PathLike[str], *, required: bool = False) -> Pa
         except OSError:
             match = None
         if match is not None:
-            return match.resolve()
+            return _absolute_path(match)
 
     if required:
         raise FileNotFoundError("WinUX resource was not found: {}".format(path))
-    return path.resolve()
+    return _absolute_path(path)
 
 
 def apply_tk_app_icon(window) -> bool:

@@ -36,6 +36,8 @@ class FileSystemModel:
                     is_dir,
                     stat.st_size,
                     stat.st_mtime,
+                    is_hidden=(entry.name.startswith(".") or bool(
+                        getattr(stat, "st_file_attributes", 0) & 0x02)),
                 ))
         return sorted(
             result,

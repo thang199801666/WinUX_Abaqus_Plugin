@@ -1,11 +1,13 @@
 from __future__ import annotations
 
-import dearpygui.dearpygui as dpg
-from .qt_dialog import QtDialog, QtTable
+from DearUIQt.backends import dpg
+from DearUIQt.dialogs.qt_dialog import QtDialog, QtTable
 from .blocking_form import BlockingDialog
 
 
 class BookmarksDialog(QtDialog):
+    REUSABLE_HOST = True
+
     def __init__(self, view, entries, on_open, on_remove, on_rename, rename_prompt=None):
         self._rename_prompt = rename_prompt
         self._entries = []
@@ -32,6 +34,15 @@ class BookmarksDialog(QtDialog):
     def _entry_key(entry):
         return (str(entry.get("panel_id") or ""), str(entry.get("path") or ""))
 
+    def _focus_initial(self):
+        if not self.winfo_exists():
+            return False
+        table = getattr(self, "table", None)
+        if table is not None and table.current is not None:
+            table.setFocus()
+            return True
+        return super()._focus_initial()
+
     def refresh(self, entries):
         self._entries = [dict(entry) for entry in entries or []]
         self.table.set_rows([(self._entry_key(entry), (
@@ -39,8 +50,7 @@ class BookmarksDialog(QtDialog):
             entry.get("label") or "", entry.get("path") or "")) for entry in self._entries])
         if not self.table.selected and self._entries:
             key = self._entry_key(self._entries[0])
-            self.table.selected.add(key)
-            dpg.set_value(self.table.items[key], True)
+            self.table.setCurrentKey(key, select=True)
         dpg.set_value(self.status, "{} bookmark(s)".format(len(self._entries)))
 
     def _selected_entry(self):

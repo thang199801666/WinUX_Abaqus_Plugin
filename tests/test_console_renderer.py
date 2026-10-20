@@ -2,7 +2,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from WinUx.components.console_renderer import ConsoleRenderer
+from WinUx.ui.components.console_renderer import ConsoleRenderer
 from WinUx.runtime.terminal_buffer import TerminalBuffer
 
 
@@ -30,7 +30,7 @@ def fixture():
 
 class ConsoleRendererTests(unittest.TestCase):
     def paint_at(self, renderer, now):
-        with patch('WinUx.components.console_renderer.time.monotonic', return_value=now):
+        with patch('WinUx.ui.components.console_renderer.time.monotonic', return_value=now):
             renderer.paint()
 
     def test_blink_changes_only_caret_without_recreating_text(self):
@@ -94,6 +94,41 @@ class ConsoleRendererTests(unittest.TestCase):
         backend.draw_rectangle.assert_called()
         self.assertEqual(len(view._selection_items), 1)
 
+    def test_caret_is_hidden_when_keyboard_focus_leaves_console(self):
+        view, backend, renderer = fixture()
+        view.keyboard_active = Mock(return_value=True)
+        self.paint_at(renderer, 0)
+        backend.reset_mock()
+        view.keyboard_active.return_value = False
+        self.paint_at(renderer, 0)
+        backend.draw_text.assert_not_called()
+        self.assertEqual(backend.configure_item.call_args.args, (view._caret,))
+        self.assertFalse(backend.configure_item.call_args.kwargs['show'])
+
+    def test_selection_suppresses_caret_and_tail_following(self):
+        view, backend, renderer = fixture()
+        view._follow_tail = False
+        view._selection_bounds.return_value = ((0, 0), (0, 3))
+        self.paint_at(renderer, 0)
+        caret = [call for call in backend.configure_item.call_args_list if call.args == (view._caret,)][-1]
+        self.assertFalse(caret.kwargs['show'])
+        self.assertFalse(view._follow_tail)
+
+    def test_caret_is_visible_immediately_after_focus_even_during_old_off_phase(self):
+        view, backend, renderer = fixture()
+        view._caret_blink_started = .6
+        self.paint_at(renderer, .61)
+        caret = [call for call in backend.configure_item.call_args_list if call.args == (view._caret,)][-1]
+        self.assertTrue(caret.kwargs['show'])
+
+    def test_mouse_down_without_drag_keeps_caret_visible(self):
+        view, backend, renderer = fixture()
+        view._selection_dragging = True
+        view._selection_bounds.return_value = ((2, 2), (2, 2))
+        self.paint_at(renderer, 0)
+        caret = [call for call in backend.configure_item.call_args_list if call.args == (view._caret,)][-1]
+        self.assertTrue(caret.kwargs['show'])
+
     def test_resize_reconfigures_canvas_and_repaints(self):
         view, backend, renderer = fixture()
         self.paint_at(renderer, 0)
@@ -102,6 +137,21 @@ class ConsoleRendererTests(unittest.TestCase):
         self.paint_at(renderer, 0)
         self.assertIn(view.canvas, [call.args[0] for call in backend.configure_item.call_args_list])
         backend.draw_text.assert_called()
+
+    def test_home_in_long_wrapped_command_reveals_caret_instead_of_tail(self):
+        view, backend, renderer = fixture()
+        view.buffer.type_text('a' * 2000)
+        view.buffer.move_home()
+        view._cursor_scroll_pending = True
+        backend.get_y_scroll.return_value = 300
+        self.paint_at(renderer, 0)
+        backend.set_y_scroll.assert_called_once_with(view.content, 2 * view._line_height)
+
+    def test_edit_in_visible_command_does_not_scroll(self):
+        view, backend, renderer = fixture()
+        view._cursor_scroll_pending = True
+        self.paint_at(renderer, 0)
+        backend.set_y_scroll.assert_not_called()
 
 
 if __name__ == '__main__':

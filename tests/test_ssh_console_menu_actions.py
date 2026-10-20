@@ -37,6 +37,7 @@ class ConsoleMenuActionsTests(unittest.TestCase):
         self.panel = SimpleNamespace(
             _context_menu_obj=SimpleNamespace(tag="menu", is_open=True),
             winfo_exists=lambda: True, view=SimpleNamespace(after=Mock()),
+            _terminal_rect_contains=Mock(return_value=False),
             _deactivate_keyboard_if_pointer_outside=Mock())
         self.panel._mouse_over_context_menu = lambda: self.methods[
             "_mouse_over_context_menu"](self.panel)
@@ -59,7 +60,7 @@ class ConsoleMenuActionsTests(unittest.TestCase):
         self.dpg.get_mouse_pos.return_value = (700, 500)
         self.methods["_mouse_click"](self.panel)
         self.panel.view.after.assert_called_once_with(
-            0, self.panel._deactivate_keyboard_if_pointer_outside)
+            0, self.panel._deactivate_keyboard_if_pointer_outside, False)
 
     def test_each_enabled_button_dispatches_its_action_after_release(self):
         methods = load_methods("_ConsoleContextMenu", ["_clicked"])

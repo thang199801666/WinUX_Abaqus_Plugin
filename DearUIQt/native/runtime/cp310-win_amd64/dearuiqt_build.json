@@ -1,0 +1,8 @@
+{
+  "upstream_revision": "719d068967ace64eb9ff4171f2052a0799fd6c35",
+  "native_abi": 1,
+  "python": "3.10.5 (main, Aug  9 2025, 05:05:40) [MSC v.1934 64 bit (AMD64)]",
+  "python_cache_tag": "cpython-310",
+  "extension_sha256": "48aadfafc8b3707bece12a5a5434565edb00eefc230eeff64e91010fe4f7b835",
+  "runtime_patch": "owner-sync-caption-only-drag-r121"
+}

@@ -45,6 +45,12 @@ def test_built_package_is_consumable_by_github_provider(tmp_path):
     (source / "update_manifest.json").write_text('{"stale": true}')
     (source / "tests").mkdir()
     (source / "tests" / "test_dev.py").write_text("# not runtime\n")
+    (source / "README.md").write_text("# development notes\n")
+    (source / "notes.markdown").write_text("temporary documentation\n")
+    for directory in ("reports", "examples", ".ruff_cache", "htmlcov"):
+        (source / directory).mkdir()
+        (source / directory / "local-output.txt").write_text("not runtime\n")
+    (source / "private.tmp").write_text("temporary data\n")
     package, metadata_path, checksum_path = build_release(str(source), str(tmp_path / "output"), "v1.1.0")
     metadata = json.loads(open(metadata_path).read())
     digest = hashlib.sha256(open(package, "rb").read()).hexdigest()
@@ -54,6 +60,10 @@ def test_built_package_is_consumable_by_github_provider(tmp_path):
     with zipfile.ZipFile(package) as archive:
         assert "vendor/dependency.py" in archive.namelist()
         assert "tests/test_dev.py" not in archive.namelist()
+        assert "private.tmp" not in archive.namelist()
+        assert not any(name.startswith(("reports/", "examples/", ".ruff_cache/", "htmlcov/"))
+                       for name in archive.namelist())
+        assert not any(name.lower().endswith((".md", ".markdown")) for name in archive.namelist())
     extracted = tmp_path / "extracted"
     safe_extract_zip(package, str(extracted))
     assert source_descriptor(str(extracted), verify_hashes=True)["version"] == "1.1.0"

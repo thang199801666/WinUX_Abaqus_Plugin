@@ -5,7 +5,7 @@ import shutil
 import stat
 from pathlib import PurePosixPath
 
-from ..model import FileItem, FileSystemModel
+from ..models import FileItem, FileSystemModel
 from .ssh_serialization import _serialized_wire_call
 
 
@@ -21,7 +21,8 @@ class RemoteFilesystemMixin:
         for attr in self.sftp.listdir_attr(str(folder)):
             is_dir = stat.S_ISDIR(attr.st_mode)
             items.append(FileItem(attr.filename, folder / attr.filename, is_dir,
-                                  attr.st_size or 0, attr.st_mtime or 0))
+                                  attr.st_size or 0, attr.st_mtime or 0,
+                                  is_hidden=attr.filename.startswith(".")))
         return sorted(items, key=lambda item: (not item.is_dir, item.name.casefold()))
 
     @_serialized_wire_call

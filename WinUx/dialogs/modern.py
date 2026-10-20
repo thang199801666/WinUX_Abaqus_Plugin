@@ -12,9 +12,9 @@ import tkinter.font as tkfont
 from tkinter import ttk
 
 from ..resources import apply_tk_app_icon
-from ..components.qt_style import QtFusionPalette, QtFusionMetrics, color_hex
-from ..components.shared_scroller import (
-    SharedScrollerMetrics, configure_ttk_scroller_styles, make_ttk_scroller,
+from DearUIQt.gui import QtFusionPalette, QtFusionMetrics, color_hex
+from DearUIQt.interop import (
+    QNativeScrollerMetrics, configure_ttk_scroller_styles, make_ttk_scroller,
 )
 from ..platform.native_dialog_host import apply_native_qt_chrome
 
@@ -78,7 +78,7 @@ class ModernDialogMetrics:
     ITEM_VIEW_HEADER_PAD_X = 7
     ITEM_VIEW_HEADER_PAD_Y = 5
     ITEM_VIEW_BORDER = 1
-    ITEM_VIEW_SCROLLBAR = SharedScrollerMetrics.THICKNESS
+    ITEM_VIEW_SCROLLBAR = QNativeScrollerMetrics.THICKNESS
     ITEM_VIEW_MIN_COLUMN = 60
     ITEM_VIEW_MAX_COLUMN = 520
     TAB_PAD_X = 11

@@ -17,12 +17,17 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def load_callback_pump(dpg):
     # Exercise the real view method without importing/starting its GUI stack.
+    # The live method no longer talks to dpg directly: the queue comes from
+    # ``self._gui_runtime.callbackQueue()`` and job execution uses the bounded
+    # ``invoke_callback_job`` runtime (falling back to the backend runner, per
+    # the in-code comment, for isolated pump tests).
     tree = ast.parse((ROOT / "WinUx/view.py").read_bytes())
     view = next(n for n in tree.body if isinstance(n, ast.ClassDef)
                 and n.name == "WinUXView")
     method = next(n for n in view.body if isinstance(n, ast.FunctionDef)
                   and n.name == "_drain_dpg_callbacks")
-    namespace = {"dpg": dpg, "sys": sys}
+    namespace = {"dpg": dpg, "sys": sys,
+                 "log_exception": lambda *args, **kwargs: None}
     exec(compile(ast.Module(body=[method], type_ignores=[]),
                  "WinUx/view.py", "exec"), namespace)
     return namespace[method.name]
@@ -45,6 +50,9 @@ class CallbackPumpTests(unittest.TestCase):
         self.view = SimpleNamespace(
             _dpg_callbacks=deque(), _alive=True,
             _handle_ui_callback_error=lambda cb, exc: self.errors.append(exc[1]),
+            _gui_runtime=SimpleNamespace(
+                callbackQueue=fetch,
+                backend=SimpleNamespace(run_callbacks=lambda jobs: jobs[0][0]())),
         )
 
     def test_nested_modal_pump_preserves_order_and_ui_thread(self):

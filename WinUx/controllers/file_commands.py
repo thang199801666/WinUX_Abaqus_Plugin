@@ -324,11 +324,11 @@ class FileCommandController:
     def _begin_created_rename(self, panel, created):
         """Refresh, select a newly created item, and immediately edit its name."""
         self.app.open_path(panel, panel.current_path, False)
-        row = panel.row_for_path(created)
-        if row is not None:
-            context = OperationContext(self.app, remote=panel.panel_id == "server")
-            panel.select_row(row)
-            panel.begin_inline_rename(
-                row, lambda name: self._finish_inline_rename(
-                    panel, created, name) if context.current() else False)
+        context = OperationContext(self.app, remote=panel.panel_id == "server")
+        commit = lambda name: self._finish_inline_rename(
+            panel, created, name) if context.current() else False
+        # Fresh listings arrive off the render thread, so the row may not be
+        # populated yet; focus_created_item queues the request for the next
+        # display() of this same folder when that happens.
+        panel.focus_created_item(created, commit)
 

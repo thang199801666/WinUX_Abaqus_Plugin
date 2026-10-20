@@ -1,6 +1,10 @@
-from WinUx.widgets.item_views import (
+from DearUIQt.qt.item_views import (
     QtItemViewState, QtGridColumn, QtGridRow, QtListItem,
 )
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import pytest
 
 
 def test_selection_model_single_selection_is_qt_like():
@@ -54,3 +58,44 @@ def test_item_view_value_objects_are_backend_independent():
     assert row.key == "job-1"
     assert row.data == {"owner": "user"}
     assert row.background == (205, 244, 213, 255)
+
+
+@pytest.mark.parametrize("current,enabled,row_enabled,expected", [
+    ("b", True, True, True), (None, True, True, False),
+    ("b", False, True, False), ("b", True, False, False),
+])
+def test_keyboard_activation_respects_current_and_disabled_state(current, enabled, row_enabled, expected):
+    from DearUIQt.qt.item_view_base import _QtAbstractItemView
+    view = object.__new__(_QtAbstractItemView)
+    view._state = QtItemViewState().replace(["a", "b"])
+    view._state.current = current
+    view.isEnabled = lambda: enabled
+    view.items = {"a": 1, "b": 2}
+    view.backend = SimpleNamespace(get_item_configuration=lambda tag: {"enabled": row_enabled})
+    view.activated = SimpleNamespace(emit=Mock())
+    assert view.activateCurrent() is expected
+    if expected:
+        view.activated.emit.assert_called_once_with("b")
+    else:
+        view.activated.emit.assert_not_called()
+
+
+def test_focused_button_wins_over_a_retained_table_focus_flag():
+    from WinUx.dialogs.qt_dialog import QtDialog
+
+    class Button:
+        def isEnabled(self):
+            return True
+
+        click = Mock()
+
+    dialog = object.__new__(QtDialog)
+    dialog.enter_editors = set()
+    dialog.active_table = SimpleNamespace(hasFocus=lambda: True, activateCurrent=Mock())
+    button = Button()
+    dialog._control_wrappers = {42: button}
+    with patch("WinUx.dialogs.qt_dialog.QPushButton", Button), \
+            patch("WinUx.dialogs.qt_dialog.dpg.get_focused_item", return_value=42):
+        dialog.invoke_default()
+    button.click.assert_called_once()
+    dialog.active_table.activateCurrent.assert_not_called()

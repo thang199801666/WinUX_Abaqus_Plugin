@@ -3,7 +3,7 @@ import tkinter as tk
 import unittest
 from unittest.mock import Mock, patch
 
-from WinUx.components.server_notepad_tabs import _EditorTabStrip, _ToolTip
+from WinUx.ui.components.server_notepad_tabs import _EditorTabStrip, _ToolTip
 
 
 def document(path):

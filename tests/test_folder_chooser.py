@@ -13,9 +13,11 @@ def test_local_folder_chooser_is_dear_imgui_only():
     form = FORM.read_text(encoding="utf-8")
     assert "FolderChooser" not in view
     assert "LocalFolderDialog" in view
-    assert "dearpygui.dearpygui" in form
+    assert "DearUIQt" in form
+    assert "dearpygui.dearpygui" not in form
     assert "tkinter" not in form
     assert "filedialog" not in form
+    assert not (SERVICES / "folder_chooser.py").exists()
     assert not (SERVICES / "folder_chooser_process.py").exists()
 
 
@@ -23,8 +25,8 @@ def test_local_folder_form_uses_shared_item_view_and_async_directory_listing():
     source = FORM.read_text(encoding="utf-8")
     assert "QtListView" in source
     assert "os.scandir" in source
-    assert "threading.Thread" in source
-    assert "self.view.after(0, self._apply_entries" in source
+    assert "self.runAsync(" in source
+    assert "threading.Thread" not in source
     assert "Select Folder" in source
 
 

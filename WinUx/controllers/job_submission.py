@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from ..inp_preferences import INPPreferences
+from ..preferences.inp import INPPreferences
 from ..inp_reader import INPReader
 from ..runtime.operation_context import OperationContext
 
@@ -82,6 +82,9 @@ class JobSubmissionController:
                 else:
                     context.post(
                         0, dialog.submission_job_complete, path, result)
+                    # Large batches may take a while; already submitted jobs
+                    # should appear before the last submission returns.
+                    context.post(0, self.app._refresh_jobs_now)
             context.post(0, dialog.submission_finished, len(jobs), failed)
             # Ask qstat immediately after all submit commands have returned.
             # The Job Manager closes only from the resulting Job Viewer update.

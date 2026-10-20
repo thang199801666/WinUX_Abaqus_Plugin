@@ -52,7 +52,10 @@ _WM_PROGRESS_UPDATE = _WM_APP + 101
 _WM_PROGRESS_CLOSE = _WM_APP + 102
 _PBM_SETPOS = _WM_USER + 2
 _PBM_SETRANGE32 = _WM_USER + 6
+_PBM_SETMARQUEE = _WM_USER + 10
+_PBS_MARQUEE = 0x00000008
 _PM_REMOVE = 0x0001
+_SW_SHOWNOACTIVATE = 4
 _SW_SHOW = 5
 _DEFAULT_GUI_FONT = 17
 _COLOR_BTNFACE = 15
@@ -922,6 +925,7 @@ class UpdateProgressDialog(object):
                 self._thread.join(0.2)
             except Exception:
                 pass
+
 
 def create_progress_dialog(local_version, server_version):
     return UpdateProgressDialog(local_version, server_version)

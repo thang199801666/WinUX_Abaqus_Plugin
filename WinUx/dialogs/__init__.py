@@ -8,7 +8,9 @@ native ``dearpygui._dearpygui`` extension) into that child process before its
 window could be created.
 
 Keep the historical ``from WinUx.dialogs import LoginDialog`` API intact while
-loading each dialog only when that attribute is actually requested.
+loading each dialog only when that attribute is actually requested. Application
+QDialogs resolve to the shared-process DearUIQt implementations; explicit legacy
+process isolation lives under ``WinUx.dialogs.floating_adapters``.
 """
 
 from __future__ import annotations
@@ -19,28 +21,32 @@ from importlib import import_module
 _LAZY_DIALOGS = {
     "FloatingDialogController": (".floating_dialog", "FloatingDialogController"),
     "QtDialog": (".qt_dialog", "QtDialog"),
+    "QDialog": (".qt_dialog", "QDialog"),
     "QtTable": (".qt_dialog", "QtTable"),
     "DialogBase": (".base", "DialogBase"),
-    "SyncPreviewDialog": (".sync_preview_dialog", "SyncPreviewDialog"),
-    "SiteManagerDialog": (".site_manager_dialog", "SiteManagerDialog"),
-    "BookmarksDialog": (".bookmarks_dialog", "BookmarksDialog"),
-    "DiagnosticsDialog": (".diagnostics_dialog", "DiagnosticsDialog"),
-    "BlockingDialog": (".blocking_dialog", "BlockingDialog"),
-    "JobEditDialog": (".job_edit_dialog", "JobEditDialog"),
-    "LoginDialog": (".login_dialog", "LoginDialog"),
-    "ODBCheckDialog": (".odb_check_dialog", "ODBCheckDialog"),
-    "ODBExtractDialog": (".odb_extract_dialog", "ODBExtractDialog"),
-    "ODBXYResultDialog": (".odb_extract_dialog", "ODBXYResultDialog"),
-    "JobManagerDialog": (".job_manager_dialog", "JobManagerDialog"),
-    "JobScheduleDialog": (".job_schedule_dialog", "JobScheduleDialog"),
-    "ProgressDialog": (".progress_dialog", "ProgressDialog"),
-    "ServerPathDialog": (".server_path_dialog", "ServerPathDialog"),
-    "LocalFolderDialog": (".local_folder_dialog", "LocalFolderDialog"),
+    "SyncPreviewDialog": (".inprocess_adapters", "SyncPreviewDialog"),
+    "SiteManagerDialog": (".inprocess_adapters", "SiteManagerDialog"),
+    "BookmarksDialog": (".inprocess_adapters", "BookmarksDialog"),
+    "DiagnosticsDialog": (".inprocess_adapters", "DiagnosticsDialog"),
+    "BlockingDialog": (".inprocess_adapters", "BlockingDialog"),
+    "JobEditDialog": (".inprocess_adapters", "JobEditDialog"),
+    "LoginDialog": (".inprocess_adapters", "LoginDialog"),
+    "ODBCheckDialog": (".inprocess_adapters", "ODBCheckDialog"),
+    "ODBExtractDialog": (".inprocess_adapters", "ODBExtractDialog"),
+    "ReferenceChartDialog": (".native_reference_tools", "ReferenceChartDialog"),
+    "PlotDigitizerDialog": (".native_reference_tools", "PlotDigitizerDialog"),
+    "ODBXYResultDialog": (".inprocess_adapters", "ODBXYResultDialog"),
+    "JobManagerDialog": (".inprocess_adapters", "JobManagerDialog"),
+    "JobScheduleDialog": (".inprocess_adapters", "JobScheduleDialog"),
+    "ProgressDialog": (".inprocess_adapters", "ProgressDialog"),
+    "ServerPathDialog": (".inprocess_adapters", "ServerPathDialog"),
+    "LocalFolderDialog": (".inprocess_adapters", "LocalFolderDialog"),
+    "LocalFileDialog": (".inprocess_adapters", "LocalFileDialog"),
     "ServerNotepadDialog": (".server_notepad_dialog", "ServerNotepadDialog"),
-    "SettingsDialog": (".settings_dialog", "SettingsDialog"),
+    "SettingsDialog": (".inprocess_adapters", "SettingsDialog"),
     "ConsoleDialog": (".tk_console_dialog", "ConsoleDialog"),
-    "TransferCenterDialog": (".transfer_center_dialog", "TransferCenterDialog"),
-    "TransferTaskHandle": (".transfer_center_dialog", "TransferTaskHandle"),
+    "TransferCenterDialog": (".inprocess_adapters", "TransferCenterDialog"),
+    "TransferTaskHandle": (".inprocess_adapters", "TransferTaskHandle"),
 }
 
 __all__ = list(_LAZY_DIALOGS)

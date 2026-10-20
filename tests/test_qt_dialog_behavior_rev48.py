@@ -2,15 +2,15 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DIALOG = (ROOT / "WinUx" / "dialogs" / "qt_dialog.py").read_text(encoding="utf-8")
-CONTROLS = (ROOT / "WinUx" / "widgets" / "controls.py").read_text(encoding="utf-8")
+DIALOG = (ROOT / "DearUIQt/dialogs/qt_dialog.py").read_text(encoding="utf-8")
+CONTROLS = (ROOT / "DearUIQt" / "qt" / "buttons.py").read_text(encoding="utf-8")
 
 
 def test_qdialog_has_qt_accept_reject_and_numpad_enter_contract():
     assert "def accept(self):" in DIALOG
     assert "def reject(self):" in DIALOG
     assert 'getattr(dpg, "mvKey_NumPadEnter", None)' in DIALOG
-    assert "register_escape_target(self.tag, self.reject)" in DIALOG
+    assert "register_escape_target(self.tag, self.reject, self._accepts_dialog_keys)" in DIALOG
     assert "on_close=lambda: self.reject()" in DIALOG
 
 
@@ -27,7 +27,7 @@ def test_return_matches_qpushbutton_autodefault_and_editor_ownership():
     assert "QPushButton::autoDefault semantics" in DIALOG
     assert "isinstance(wrapper, QPushButton)" in DIALOG
     assert "wrapper.click()" in DIALOG
-    assert "self.enter_editors.add(item)" in DIALOG
+    assert "self.enter_editors.add(widget.tag)" in DIALOG
     assert "if table.hasFocus():" in DIALOG
 
 

@@ -186,6 +186,12 @@ class TerminalBuffer:
         self.history = []
         self.history_index = 0
         self._saved_draft = ""
+        self._history_prefix = None
+        self._history_prefix_index = None
+        self._history_contains = None
+        self._history_contains_index = None
+        self._kill_buffer = ""
+        self.overwrite_mode = False
         self._layout_key = None
         self._prefix_rows = []
         self._prefix_style_rows = []
@@ -257,6 +263,18 @@ class TerminalBuffer:
         self.output_styles = []
         self._layout_key = None
 
+    def _reset_history_prefix_search(self):
+        self._history_prefix = None
+        self._history_prefix_index = None
+
+    def _reset_history_contains_search(self):
+        self._history_contains = None
+        self._history_contains_index = None
+
+    def _reset_history_searches(self):
+        self._reset_history_prefix_search()
+        self._reset_history_contains_search()
+
     def _replace_selectionless(self, start, end, text=""):
         if self.pending is not None:
             return False
@@ -267,18 +285,30 @@ class TerminalBuffer:
         self.draft = self.draft[:start] + text + self.draft[end:]
         self.cursor = start + len(text)
         self.history_index = len(self.history)
+        self._reset_history_searches()
         return True
 
     def type_text(self, text):
         text = "".join(char for char in str(text) if char == "\t" or char.isprintable())
-        if not text:
+        if not text or self.pending is not None:
             return
-        self._replace_selectionless(self.cursor, self.cursor, text)
+        if not self.overwrite_mode or self.cursor >= len(self.draft):
+            self._replace_selectionless(self.cursor, self.cursor, text)
+            return
+        # cmd.exe-style Insert/Overwrite editing.  Only characters underneath
+        # the newly typed text are replaced; text beyond the end is appended.
+        end = min(len(self.draft), self.cursor + len(text))
+        self._replace_selectionless(self.cursor, end, text)
 
     def paste(self, text):
         # One Enter submits one SSH command. Multi-line clipboard text therefore
         # stays on the current command line instead of firing commands silently.
-        self.type_text(str(text).replace("\r\n", " ").replace("\n", " ").replace("\r", " "))
+        text = str(text).replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+        text = "".join(char for char in text if char == "\t" or char.isprintable())
+        if text:
+            # Paste remains insertional even while overwrite typing is enabled,
+            # matching modern Windows terminal behavior and avoiding data loss.
+            self._replace_selectionless(self.cursor, self.cursor, text)
 
     def backspace(self):
         if self.pending is None and self.cursor > 0:
@@ -287,6 +317,128 @@ class TerminalBuffer:
     def delete(self):
         if self.pending is None and self.cursor < len(self.draft):
             self._replace_selectionless(self.cursor, self.cursor + 1)
+
+    def _word_left_range(self):
+        end = self.cursor
+        start = end
+        while start > 0 and self.draft[start - 1].isspace():
+            start -= 1
+        while start > 0 and not self.draft[start - 1].isspace():
+            start -= 1
+        return start, end
+
+    def _word_right_range(self):
+        start = self.cursor
+        end = start
+        while end < len(self.draft) and self.draft[end].isspace():
+            end += 1
+        while end < len(self.draft) and not self.draft[end].isspace():
+            end += 1
+        while end < len(self.draft) and self.draft[end].isspace():
+            end += 1
+        return start, end
+
+    def delete_word_left(self):
+        if self.pending is not None or self.cursor <= 0:
+            return
+        start, end = self._word_left_range()
+        self._replace_selectionless(start, end)
+
+    def delete_word_right(self):
+        if self.pending is not None or self.cursor >= len(self.draft):
+            return
+        start, end = self._word_right_range()
+        self._replace_selectionless(start, end)
+
+    def _kill_range(self, start, end):
+        if self.pending is not None:
+            return False
+        start = max(0, min(len(self.draft), int(start)))
+        end = max(start, min(len(self.draft), int(end)))
+        if start == end:
+            return False
+        self._kill_buffer = self.draft[start:end]
+        return self._replace_selectionless(start, end)
+
+    def kill_word_left(self):
+        if self.pending is not None or self.cursor <= 0:
+            return False
+        return self._kill_range(*self._word_left_range())
+
+    def kill_word_right(self):
+        if self.pending is not None or self.cursor >= len(self.draft):
+            return False
+        return self._kill_range(*self._word_right_range())
+
+    def delete_to_start(self):
+        if self.pending is None and self.cursor > 0:
+            self._replace_selectionless(0, self.cursor)
+
+    def delete_to_end(self):
+        if self.pending is None and self.cursor < len(self.draft):
+            self._replace_selectionless(self.cursor, len(self.draft))
+
+    def kill_to_start(self):
+        return self._kill_range(0, self.cursor)
+
+    def kill_to_end(self):
+        return self._kill_range(self.cursor, len(self.draft))
+
+    def yank(self):
+        if self.pending is not None or not self._kill_buffer:
+            return False
+        return self._replace_selectionless(
+            self.cursor, self.cursor, self._kill_buffer)
+
+    def clear_draft(self):
+        if self.pending is None and self.draft:
+            self._replace_selectionless(0, len(self.draft))
+
+    def _template_command(self):
+        """Return the DOSKEY-style template (the most recent command)."""
+        return self.history[-1] if self.history else ""
+
+    def copy_template_char(self):
+        """F1: copy one character from the previous command at this column."""
+        if self.pending is not None:
+            return False
+        template = self._template_command()
+        if self.cursor >= len(template):
+            return False
+        return self._replace_selectionless(
+            self.cursor, self.cursor, template[self.cursor])
+
+    def copy_template_remainder(self):
+        """F3: copy the previous command from the current caret column onward."""
+        if self.pending is not None:
+            return False
+        template = self._template_command()
+        if self.cursor >= len(template):
+            return False
+        # DOSKEY treats the last submitted command as a column-aligned
+        # template. Replacing the editable suffix avoids duplicated text when
+        # F3 is pressed in the middle of an already populated command line.
+        return self._replace_selectionless(
+            self.cursor, len(self.draft), template[self.cursor:])
+
+    def copy_template(self):
+        """F5: replace the current line with the previous command template."""
+        if self.pending is not None:
+            return False
+        template = self._template_command()
+        if not template:
+            return False
+        self.draft = template[:self.COMMAND_LIMIT]
+        self.cursor = len(self.draft)
+        self.history_index = max(0, len(self.history) - 1)
+        self._saved_draft = ""
+        self._reset_history_searches()
+        return True
+
+    def toggle_overwrite(self):
+        if self.pending is None:
+            self.overwrite_mode = not self.overwrite_mode
+        return self.overwrite_mode
 
     def move_cursor(self, delta, by_word=False):
         if self.pending is not None:
@@ -309,6 +461,35 @@ class TerminalBuffer:
                 pos += 1
             self.cursor = pos
 
+    def move_cursor_to_cell(self, columns, row, column):
+        """Place the caret in the editable draft, never in scrollback/prompt.
+
+        Use the same wrapping and tab stops as layout(), including commands
+        spanning multiple rows. A click in old output leaves the caret alone.
+        """
+        if self.pending is not None:
+            return False
+        columns = self._ensure_layout_cache(columns)
+        start = len(self._tail.expandtabs(8))
+        end = len((self._tail + self.draft).expandtabs(8))
+        relative_row = int(row) - len(self._prefix_rows)
+        if not start // columns <= relative_row <= end // columns:
+            return False
+        target = relative_row * columns + max(0, min(columns, int(column)))
+        if target < start:
+            return False
+        target = min(end, target)
+        visual = start
+        offset = 0
+        for char in self.draft:
+            next_visual = visual + (8 - visual % 8 if char == "\t" else 1)
+            if target < next_visual:
+                break
+            visual = next_visual
+            offset += 1
+        self.cursor = offset
+        return True
+
     def move_home(self):
         if self.pending is None:
             self.cursor = 0
@@ -320,11 +501,78 @@ class TerminalBuffer:
     def recall(self, direction):
         if self.pending is not None or not self.history:
             return
+        self._reset_history_searches()
         if self.history_index == len(self.history):
             self._saved_draft = self.draft
         self.history_index = max(0, min(len(self.history), self.history_index + direction))
         self.draft = self.history[self.history_index] if self.history_index < len(self.history) else self._saved_draft
         self.cursor = len(self.draft)
+
+    def recall_prefix(self, direction=-1):
+        """Recall history entries beginning with the current CMD-style prefix.
+
+        F8 in cmd.exe searches history using the characters already typed. The
+        prefix is captured on the first search and kept stable while F8 is
+        pressed repeatedly, so replacing the draft with a match does not alter
+        the search key.
+        """
+        if self.pending is not None or not self.history:
+            return False
+        self._reset_history_contains_search()
+        step = -1 if int(direction or -1) < 0 else 1
+        if self._history_prefix is None:
+            self._history_prefix = self.draft[:self.cursor]
+            self._history_prefix_index = len(self.history) if step < 0 else -1
+            self._saved_draft = self.draft
+        prefix = self._history_prefix
+        start = int(self._history_prefix_index)
+        indexes = (
+            range(start - 1, -1, -1) if step < 0
+            else range(start + 1, len(self.history))
+        )
+        for index in indexes:
+            candidate = self.history[index]
+            if candidate.startswith(prefix):
+                self._history_prefix_index = index
+                self.history_index = index
+                self.draft = candidate
+                self.cursor = len(candidate)
+                return True
+        return False
+
+    def recall_contains(self, direction=-1):
+        """Recall history entries containing the current search text.
+
+        This is a compact reverse-search companion to :meth:`recall_prefix`.
+        The query is captured from the draft up to the caret on the first call
+        and remains stable while Ctrl+R is repeated.  Ordinary editing resets
+        the search, matching readline's expectation that new text starts a new
+        lookup rather than continuing a stale cycle.
+        """
+        if self.pending is not None or not self.history:
+            return False
+        self._reset_history_prefix_search()
+        step = -1 if int(direction or -1) < 0 else 1
+        if self._history_contains is None:
+            self._history_contains = self.draft[:self.cursor]
+            self._history_contains_index = (
+                len(self.history) if step < 0 else -1)
+            self._saved_draft = self.draft
+        needle = self._history_contains
+        start = int(self._history_contains_index)
+        indexes = (
+            range(start - 1, -1, -1) if step < 0
+            else range(start + 1, len(self.history))
+        )
+        for index in indexes:
+            candidate = self.history[index]
+            if needle in candidate:
+                self._history_contains_index = index
+                self.history_index = index
+                self.draft = candidate
+                self.cursor = len(candidate)
+                return True
+        return False
 
     def begin_submit(self):
         command = self.draft
@@ -340,6 +588,7 @@ class TerminalBuffer:
             self.history = self.updated_history(self.history, command)
             self.history_index = len(self.history)
             self._saved_draft = ""
+            self._reset_history_searches()
             self.draft = ""
             self.cursor = 0
         self.pending = None
@@ -351,6 +600,7 @@ class TerminalBuffer:
             self.cursor = 0
             self.history_index = len(self.history)
             self._saved_draft = ""
+            self._reset_history_searches()
 
     def _style_for_output_row(self, row):
         lowered = row.lower()
@@ -387,19 +637,29 @@ class TerminalBuffer:
         self._layout_key = self.output, columns
         return columns
 
-    def layout(self, columns):
-        columns = self._ensure_layout_cache(columns)
+    def _tail_layout(self, columns):
+        """Return the mutable prompt/draft rows and cursor geometry.
+
+        Prefix rows are cached by :meth:`_ensure_layout_cache`; only the last
+        prompt/command row can change while the user is typing.  Keeping this
+        calculation separate lets renderers request only the styled viewport
+        instead of cloning the complete scrollback on every paint tick.
+        """
         prompt = self._tail
         tail = (prompt + self.draft).expandtabs(8)
         before_cursor = (prompt + self.draft[:self.cursor]).expandtabs(8)
         tail_rows = [tail[i:i + columns] for i in range(0, len(tail), columns)] or [""]
-        rows = self._prefix_rows + tail_rows
         cursor_offset = len(before_cursor)
         cursor_row = len(self._prefix_rows) + cursor_offset // columns
         cursor_column = cursor_offset % columns
-        if cursor_row == len(rows):
-            rows.append("")
-        return rows, cursor_row, cursor_column
+        if cursor_row == len(self._prefix_rows) + len(tail_rows):
+            tail_rows.append("")
+        return prompt, tail_rows, cursor_row, cursor_column
+
+    def layout(self, columns):
+        columns = self._ensure_layout_cache(columns)
+        _prompt, tail_rows, cursor_row, cursor_column = self._tail_layout(columns)
+        return self._prefix_rows + tail_rows, cursor_row, cursor_column
 
     @staticmethod
     def _segments(text, styles, fallback):
@@ -419,34 +679,55 @@ class TerminalBuffer:
             segments.append((current_style, "".join(current)))
         return segments
 
-    def styled_layout(self, columns):
-        columns = self._ensure_layout_cache(columns)
-        _rows, cursor_row, cursor_column = self.layout(columns)
+    def _ensure_styled_prefix_cache(self):
         if self._styled_prefix_rows is None:
             self._styled_prefix_rows = [
                 self._segments(row, ansi_styles, self._style_for_output_row(row))
                 for row, ansi_styles in zip(self._prefix_rows, self._prefix_style_rows)
             ]
-        # Callers receive their own lists; edits must not corrupt cached rows.
-        styled_rows = [list(segments) for segments in self._styled_prefix_rows]
 
-        prompt = self._tail
-        tail = (prompt + self.draft).expandtabs(8)
-        command = tail[len(prompt):]
-        command_style = "command_pending" if self.pending is not None else "command"
-        prompt_styles = list(self._tail_styles)
-        visual_styles = prompt_styles + [command_style] * len(command)
-        tail_rows = [tail[i:i + columns] for i in range(0, len(tail), columns)] or [""]
-        for offset, row in enumerate(tail_rows):
-            start = offset * columns
-            row_styles = visual_styles[start:start + len(row)]
-            # ANSI prompt colors win; otherwise the prompt is gray and the
-            # editable command uses the dedicated command color.
-            normalized = []
-            for absolute, style in enumerate(row_styles, start=start):
-                if absolute < len(prompt):
-                    normalized.append(style if isinstance(style, tuple) else "prompt")
-                else:
-                    normalized.append(command_style)
-            styled_rows.append(self._segments(row, normalized, "prompt"))
+    def styled_layout_slice(self, columns, start=0, end=None):
+        """Return styled rows for ``[start:end]`` without cloning scrollback.
+
+        The legacy :meth:`styled_layout` API still returns every row.  The
+        console renderer uses this viewport API so idle/scroll paints scale
+        with visible rows rather than total terminal history.
+        """
+        columns = self._ensure_layout_cache(columns)
+        prompt, tail_rows, cursor_row, cursor_column = self._tail_layout(columns)
+        total_rows = len(self._prefix_rows) + len(tail_rows)
+        start = max(0, min(total_rows, int(start or 0)))
+        if end is None:
+            end = total_rows
+        end = max(start, min(total_rows, int(end)))
+
+        self._ensure_styled_prefix_cache()
+        styled_rows = []
+        prefix_end = min(end, len(self._prefix_rows))
+        if start < prefix_end:
+            styled_rows.extend(
+                list(segments) for segments in self._styled_prefix_rows[start:prefix_end]
+            )
+
+        tail_start = max(0, start - len(self._prefix_rows))
+        tail_end = max(0, end - len(self._prefix_rows))
+        if tail_start < tail_end:
+            tail = (prompt + self.draft).expandtabs(8)
+            command = tail[len(prompt):]
+            command_style = "command_pending" if self.pending is not None else "command"
+            visual_styles = list(self._tail_styles) + [command_style] * len(command)
+            for offset in range(tail_start, tail_end):
+                row = tail_rows[offset]
+                row_start = offset * columns
+                row_styles = visual_styles[row_start:row_start + len(row)]
+                normalized = []
+                for absolute, style in enumerate(row_styles, start=row_start):
+                    if absolute < len(prompt):
+                        normalized.append(style if isinstance(style, tuple) else "prompt")
+                    else:
+                        normalized.append(command_style)
+                styled_rows.append(self._segments(row, normalized, "prompt"))
         return styled_rows, cursor_row, cursor_column
+
+    def styled_layout(self, columns):
+        return self.styled_layout_slice(columns, 0, None)

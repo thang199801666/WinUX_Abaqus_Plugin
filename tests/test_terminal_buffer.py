@@ -142,7 +142,7 @@ class TerminalBufferTests(unittest.TestCase):
 
     def test_console_source_has_find_navigation_and_multiclick_selection(self):
         source = (Path(__file__).resolve().parents[1] / "WinUx" / "dialogs" / "console_form.py").read_text(encoding="utf-8")
-        for token in ("mvKey_F3", "_open_find", "_find_next", "_select_word_at", "_select_line_at", "mvMouseButton_Middle"):
+        for token in ("Qt.Key_F3", "_open_find", "_find_next", "_select_word_at", "_select_line_at", "Qt.MiddleButton"):
             self.assertIn(token, source)
         self.assertIn("self.focus_input(follow_tail=False)", source)
 
@@ -150,32 +150,46 @@ class TerminalBufferTests(unittest.TestCase):
         source = (Path(__file__).resolve().parents[1] / "WinUx" / "dialogs" / "console_form.py").read_text(encoding="utf-8")
         self.assertNotIn("add_input_text", source)
         self.assertIn("self.output = self.input = self.canvas", source)
-        for token in ("mvKey_Left", "mvKey_Right", "mvKey_Home", "mvKey_End", "mvKey_Delete"):
+        for token in ("Qt.Key_Left", "Qt.Key_Right", "Qt.Key_Home", "Qt.Key_End", "Qt.Key_Delete"):
             self.assertIn(token, source)
 
     def test_console_draw_text_uses_supported_font_binding_path(self):
-        source = (Path(__file__).resolve().parents[1] / "WinUx" / "components" / "console_renderer.py").read_text(encoding="utf-8")
-        draw_lines = [line for line in source.splitlines() if "dpg.draw_text(" in line]
+        source = (Path(__file__).resolve().parents[1] / "WinUx" / "ui" / "components" / "console_renderer.py").read_text(encoding="utf-8")
+        # Terminal rows go through the DearUIQt painting facade; raw Dear PyGui
+        # draw_text calls (with their unsupported font binding quirks) must not
+        # appear in WinUx rendering code.
+        self.assertNotIn("dpg.draw_text(", source)
+        draw_lines = [line for line in source.splitlines() if "drawText(" in line]
         self.assertTrue(draw_lines)
-        self.assertFalse(any("font=" in line for line in draw_lines))
-        self.assertNotIn('**({"font"', source)
-        self.assertIn("dpg.bind_item_font(item, view._font)", source)
+        # Every terminal drawText call binds the terminal font explicitly; the
+        # facade then binds it natively via bind_item_font.
+        self.assertEqual(source.count("drawText("), source.count("font=view._font"))
+        # DearUIQt binds fonts after creating draw_text via bind_item_font.
+        painting = (Path(__file__).resolve().parents[1] / "DearUIQt" / "gui" / "painting.py").read_text(encoding="utf-8")
+        self.assertIn("self._backend.bind_item_font(tag, native_font)", painting)
 
     def test_console_click_focus_is_scoped_to_canvas_not_child_window(self):
         source = (Path(__file__).resolve().parents[1] / "WinUx" / "dialogs" / "console_form.py").read_text(encoding="utf-8")
+        # Click focus is item-scoped to the terminal canvas widget through a
+        # DearUIQt input binding, never registered on the whole console child
+        # window (no raw DPG handler registries in WinUx console code).
         self.assertNotIn("bind_item_handler_registry(self.content", source)
-        self.assertIn("dpg.bind_item_handler_registry(owner.canvas", source)
-        self.assertIn("button=dpg.mvMouseButton_Left", source)
-        self.assertIn("button=dpg.mvMouseButton_Middle", source)
-        menu = source.split("class _ConsoleContextMenu:", 1)[1].split("def terminal_theme", 1)[0]
-        self.assertNotIn("button=dpg.mvMouseButton_Right", menu)
-        self.assertIn("dpg.add_mouse_click_handler", source)
+        self.assertNotIn("dpg.bind_item_handler_registry(", source)
+        self.assertIn("QItemInputBinding(\n            owner._canvas_widget", source)
+        self.assertIn("self._canvas_input.onClick(Qt.LeftButton, owner._canvas_left_click)", source)
+        self.assertIn("self._canvas_input.onClick(Qt.MiddleButton, owner._middle_click)", source)
+        menu = source.split("class _ConsoleContextMenu(", 1)[1].split("def terminal_theme", 1)[0]
+        self.assertNotIn("TrackPopupMenuEx", menu)
+        self.assertIn("self._canvas_input.onClick(Qt.RightButton, owner._canvas_right_click)", menu)
+        # The console keeps one lightweight global LMB observer for WM_CHAR
+        # ownership routing, while hover gating prefers the widget facade.
+        self.assertIn("onMouseClick(Qt.LeftButton, self._mouse_click)", source)
         self.assertIn("dpg.is_item_hovered(self.content)", source)
-        self.assertIn("dpg.is_item_hovered(self.canvas)", source)
+        self.assertIn("self._canvas_widget.underMouse()", source)
 
     def test_console_has_mouse_selection_and_modeless_cmd_context_menu(self):
         source = (Path(__file__).resolve().parents[1] / "WinUx" / "dialogs" / "console_form.py").read_text(encoding="utf-8")
-        for token in ("add_mouse_drag_handler", "add_mouse_release_handler", "mvMouseButton_Right", "_selected_text", "_select_all", "_clear_console"):
+        for token in ("onMouseDrag(", "onMouseRelease(", "Qt.RightButton", "_selected_text", "_select_all", "_clear_console"):
             self.assertIn(token, source)
         self.assertIn("class _ConsoleContextMenu", source)
         self.assertNotIn("TrackPopupMenuEx", source)
@@ -185,15 +199,21 @@ class TerminalBufferTests(unittest.TestCase):
     def test_console_close_cleanup_does_not_reference_removed_click_registry(self):
         source = (Path(__file__).resolve().parents[1] / "WinUx" / "dialogs" / "console_form.py").read_text(encoding="utf-8")
         self.assertIn('getattr(self, "_terminal_handlers", None)', source)
-        self.assertIn('getattr(self, "_theme", None)', source)
+        # The terminal theme is now QTheme(parent=self) owned by DearUIQt's
+        # lifecycle: destroy() must not manage it manually.
+        self.assertIn("self._theme = terminal_theme(parent=self", source)
+        self.assertNotIn('getattr(self, "_theme", None)', source)
         self.assertNotIn("self._click_handlers", source)
 
     def test_console_renders_visible_rows_individually_for_caret_alignment(self):
-        source = (Path(__file__).resolve().parents[1] / "WinUx" / "components" / "console_renderer.py").read_text(encoding="utf-8")
+        source = (Path(__file__).resolve().parents[1] / "WinUx" / "ui" / "components" / "console_renderer.py").read_text(encoding="utf-8")
         self.assertIn("view._line_items = []", source)
-        self.assertIn("for offset, segments in enumerate(styled_rows[first:last]):", source)
-        self.assertIn("view._current_line_fill", source)
-        self.assertIn("caret_top = y + view._line_height - caret_height - 1", source)
+        # styled_rows is already the [first:last] viewport slice produced by
+        # styled_layout_slice; each visible row is drawn as its own item.
+        self.assertIn("styled_layout_slice(", source)
+        self.assertIn("for offset, segments in enumerate(styled_rows):", source)
+        self.assertIn("self._item(view._current_line_fill).configure(", source)
+        self.assertIn("caret_top = y + 2 if overwrite else y + view._line_height - caret_height - 1", source)
 
 
 if __name__ == "__main__":

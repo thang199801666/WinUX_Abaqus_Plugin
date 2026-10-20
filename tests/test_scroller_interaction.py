@@ -1,8 +1,12 @@
 """Exercise visible geometry and pointer gestures without a GUI context."""
 from unittest.mock import patch
+from unittest.mock import Mock
+from types import SimpleNamespace
 import unittest
 
-from WinUx.components.shared_scroller import DpgScrollerArrowOverlay, dpg_window_rect
+from DearUIQt.qt.scroller import (
+    DpgScrollerArrowOverlay, SharedScrollerMetrics, SharedScrollerPalette, dpg_window_rect,
+)
 
 
 class FakeDpg:
@@ -12,6 +16,12 @@ class FakeDpg:
     mvStyleVar_ItemSpacing = "spacing"
     mvStyleVar_ChildBorderSize = "border"
     mvThemeCol_ChildBg = "background"
+    mvButton = 1
+    mvThemeCol_Button = "button"
+    mvThemeCol_ButtonHovered = "hovered"
+    mvThemeCol_ButtonActive = "active"
+    mvStyleVar_FramePadding = "frame_padding"
+    mvStyleVar_FrameBorderSize = "frame_border"
 
     def __init__(self):
         self.items = {"body": {}}
@@ -19,6 +29,8 @@ class FakeDpg:
         self.down = False
         self.hovered = True
         self.visible = True
+        self.hovered_items = {}
+        self.active_items = set()
         self.scroll = {"v": 0.0, "h": 0.0}
         self.maximum = {"v": 600.0, "h": 400.0}
 
@@ -30,6 +42,13 @@ class FakeDpg:
 
     add_group = add_child_window
     add_theme = add_child_window
+    add_button = add_child_window
+
+    def delete_item(self, tag):
+        for child in list(self.items):
+            if self.items[child].get("parent") == tag:
+                self.delete_item(child)
+        self.items.pop(tag, None)
 
     def add_drawlist(self, width, height, **kwargs):
         self.items[kwargs["tag"]] = dict(width=width, height=height, **kwargs)
@@ -47,6 +66,8 @@ class FakeDpg:
 
     def move_item(self, item, **kwargs):
         self.items[item]["parent"] = kwargs["parent"]
+        if "before" in kwargs:
+            self.items[item]["before"] = kwargs["before"]
 
     def draw_rectangle(self, *args, **kwargs):
         self.items[kwargs["tag"]] = kwargs
@@ -87,7 +108,10 @@ class FakeDpg:
         return self.get_item_state(tag).get("rect_size", (200, 200))
 
     def is_item_hovered(self, tag):
-        return self.hovered
+        return self.hovered_items.get(tag, self.hovered)
+
+    def is_item_active(self, tag):
+        return tag in self.active_items
 
     def get_mouse_pos(self, **kwargs):
         return self.mouse
@@ -114,15 +138,38 @@ class FakeDpg:
         self.scroll["h"] = value
 
 
+class FakeGate:
+    def __init__(self):
+        self.owner = None
+        self.protected = set()
+
+    def register_pointer_protected_item(self, tag):
+        self.protected.add(tag)
+
+    def unregister_pointer_protected_item(self, tag):
+        self.protected.discard(tag)
+
+    def acquire_pointer_input(self, owner):
+        if self.owner is None or self.owner is owner:
+            self.owner = owner
+            return True
+        return False
+
+    def release_pointer_input(self, owner):
+        if self.owner is owner:
+            self.owner = None
+
+
 def make_scroller(test):
     dpg = FakeDpg()
-    patcher = patch("WinUx.components.shared_scroller.time.monotonic")
+    patcher = patch("DearUIQt.qt.scroller.time.monotonic")
     clock = patcher.start()
     test.addCleanup(patcher.stop)
     clock.return_value = 0.0
     overlay = DpgScrollerArrowOverlay(
         dpg, "body", "bar", horizontal=True,
-        rect_provider=lambda: (10, 20, 210, 220))
+        rect_provider=lambda: (10, 20, 210, 220), interaction_gate=FakeGate())
+    test.addCleanup(overlay.destroy)
 
     def frame(mouse=None, down=None, dt=0.05):
         if mouse is not None:
@@ -139,12 +186,20 @@ def make_scroller(test):
 def check_hover_expands_and_collapses_without_moving_native_mask(scroller):
     dpg, overlay, frame = scroller
     mask = dict(dpg.items["bar_v_mask"])
-    assert dpg.items["bar_v_track"]["pmin"][0] == 194
+    gutter_left = 200 - SharedScrollerMetrics.THICKNESS
+    gutter_right = 200
+    collapsed_left = gutter_left + (SharedScrollerMetrics.THICKNESS - SharedScrollerMetrics.COLLAPSED_THICKNESS) // 2
+    collapsed_right = collapsed_left + SharedScrollerMetrics.COLLAPSED_THICKNESS
+    assert dpg.items["bar_v_track"]["pmin"][0] == collapsed_left
+    assert dpg.items["bar_v_track"]["pmax"][0] == collapsed_right
+    assert (collapsed_left + collapsed_right) / 2 == (gutter_left + gutter_right) / 2
     frame((205, 90))
-    assert 189 < dpg.items["bar_v_track"]["pmin"][0] < 194
+    assert gutter_left < dpg.items["bar_v_track"]["pmin"][0] < collapsed_left
+    assert collapsed_right < dpg.items["bar_v_track"]["pmax"][0] < gutter_right
     for _ in range(4):
         frame()
-    assert dpg.items["bar_v_track"]["pmin"][0] == 189
+    assert dpg.items["bar_v_track"]["pmin"][0] == gutter_left
+    assert dpg.items["bar_v_track"]["pmax"][0] == gutter_right
     assert dpg.items["bar_v_mask"]["pmin"] == mask["pmin"]
     assert dpg.items["bar_v_mask"]["pmax"] == mask["pmax"]
     assert dpg.items["bar_v_mask"]["show"]
@@ -153,12 +208,15 @@ def check_hover_expands_and_collapses_without_moving_native_mask(scroller):
     assert dpg.items["bar_up_arrow"]["show"]
     for _ in range(4):
         frame((0, 0))
-    assert dpg.items["bar_v_track"]["pmin"][0] == 194
+    assert dpg.items["bar_v_track"]["pmin"][0] == collapsed_left
+    assert dpg.items["bar_v_track"]["pmax"][0] == collapsed_right
     for axis in ("v", "h"):
         assert not dpg.items[f"bar_{axis}_mask"]["show"]
         assert not dpg.items[f"bar_{axis}_track"]["show"]
         assert dpg.items[f"bar_{axis}_thumb"]["show"]
     assert not dpg.items["bar_corner"]["show"]
+    # In the desired Explorer-like idle state, the end-arrow affordances fade
+    # away together with the hover-expanded track.
     for direction in ("up", "down", "left", "right"):
         assert not dpg.items[f"bar_{direction}_cap"]["show"]
         assert not dpg.items[f"bar_{direction}_arrow"]["show"]
@@ -205,9 +263,10 @@ def check_track_pages_and_occluded_target_ignores_press(scroller):
     frame(down=False)
     dpg.hovered = True
     frame((205, 150), True)
-    assert dpg.scroll["v"] == 189
+    expected_page = overlay._last_axes["v"]["viewport"]
+    assert dpg.scroll["v"] == expected_page
     frame(dt=0.5)
-    assert dpg.scroll["v"] == 189
+    assert dpg.scroll["v"] == expected_page
 
 
 def check_no_overflow_and_hidden_target_clear_chrome_and_gesture(scroller):
@@ -259,8 +318,8 @@ class ScrollerInteractionTests(unittest.TestCase):
                            horizontal_scrollbar=False)
         frame()
         config = dpg.get_item_configuration("body")
-        assert config["width"] == -11
-        assert config["height"] == -11
+        assert config["width"] == -SharedScrollerMetrics.THICKNESS
+        assert config["height"] == -SharedScrollerMetrics.THICKNESS
         assert config["no_scrollbar"]
         assert config["horizontal_scrollbar"]
         assert dpg.items["bar_h_thumb"]["show"]
@@ -340,6 +399,139 @@ class ScrollerInteractionTests(unittest.TestCase):
 
     def test_horizontal_drag(self):
         check_drag(make_scroller(self), "h")
+
+    def test_drawn_thumb_drags_when_parent_window_is_not_hovered(self):
+        for axis in ("v", "h"):
+            with self.subTest(axis=axis):
+                dpg, overlay, frame = make_scroller(self)
+                dpg.hovered_items[overlay.container] = False
+                check_drag((dpg, overlay, frame), axis)
+
+    def test_native_active_hit_keeps_drag_when_hover_is_lost(self):
+        dpg, overlay, frame = make_scroller(self)
+        dpg.hovered = False
+        dpg.active_items.add(overlay._hits["v"])
+        data = overlay._last_axes["v"]
+        point = (data["hit"][2] - 2, data["thumb0"] + data["length"] / 2)
+        frame(point, True)
+        assert overlay._gesture["kind"] == "drag"
+        assert overlay._gate().owner is overlay._pointer_owner
+        frame((450, 450))
+        assert dpg.scroll["v"] == dpg.maximum["v"]
+        frame(down=False)
+        assert overlay._gate().owner is None
+
+    def test_activation_after_physical_press_poll_still_starts_thumb_drag(self):
+        dpg, overlay, frame = make_scroller(self)
+        dpg.hovered = False
+        data = overlay._last_axes["v"]
+        point = (data["hit"][2] - 2, data["thumb0"] + data["length"] / 2)
+        frame(point, True)  # hardware down, GLFW has not activated the button yet
+        assert overlay._gesture is None
+        dpg.active_items.add(overlay._hits["v"])
+        frame()
+        assert overlay._gesture["kind"] == "drag"
+        frame((450, 450))
+        assert dpg.scroll["v"] == dpg.maximum["v"]
+
+    def test_native_hit_rects_match_the_painted_gutters(self):
+        dpg, overlay, frame = make_scroller(self)
+        for axis, tag in overlay._hits.items():
+            x0, y0, x1, y1 = overlay._last_axes[axis]["hit"]
+            config = dpg.items[tag]
+            assert config["pos"] == (x0-overlay._origin[0], y0-overlay._origin[1])
+            assert config["width"] == round(x1-x0)
+            assert config["height"] == round(y1-y0)
+            assert tag in overlay._gate().protected
+            assert config["before"] == overlay.anchor
+
+    def test_capture_is_not_stolen_and_is_released_on_hide_destroy_and_range_loss(self):
+        dpg, overlay, frame = make_scroller(self)
+        gate = overlay._gate()
+        other = object()
+        gate.owner = other
+        frame((205, 204), True)
+        assert overlay._gesture is None and gate.owner is other
+        frame(down=False)
+        gate.owner = None
+        for end in ("hide", "range", "destroy"):
+            frame((205, 204), True)
+            assert gate.owner is overlay._pointer_owner
+            if end == "hide":
+                overlay.hide()
+            elif end == "range":
+                dpg.maximum["v"] = 0
+                frame()
+            else:
+                overlay.destroy()
+            assert overlay._gesture is None and gate.owner is None
+            if end != "destroy":
+                dpg.maximum["v"] = 600
+                frame(down=False)
+        assert not gate.protected
+        remaining = dict(dpg.items)
+        overlay.update()  # queued visible callback from the disposed owner
+        overlay.destroy()
+        assert dpg.items == remaining
+
+    def test_native_modal_cancels_capture_without_starting_again_while_held(self):
+        dpg, overlay, frame = make_scroller(self)
+        frame((205, 204), True)
+        gate = overlay._gate()
+        assert gate.owner is overlay._pointer_owner
+        gate.native_modal_input_active = lambda: True
+        frame()
+        assert overlay._gesture is None and gate.owner is None
+        gate.native_modal_input_active = lambda: False
+        frame()
+        assert overlay._gesture is None
+
+    def test_registered_modal_suppresses_background_hover_and_gesture(self):
+        from DearUIQt.modal import MODAL_TAGS
+
+        dpg, overlay, frame = make_scroller(self)
+        # Put the cursor over the vertical scrollbar long enough to reach the
+        # fully expanded/hovered visual state first.
+        for _ in range(4):
+            frame((205, 90))
+        assert overlay._expansion["v"] == 1.0
+        assert dpg.items["bar_v_thumb"]["fill"] == SharedScrollerPalette.THUMB_HOVER
+
+        # QDialog::show() registers modal windows in MODAL_TAGS.  Even though
+        # the global mouse position is still geometrically over this background
+        # scrollbar, the foreground dialog must own the visual/input state.
+        dpg.items["dialog"] = dict(
+            kind="mvWindowAppItem", show=True,
+            state=dict(visible=True, pos=[180, 40], rect_size=[100, 100]),
+        )
+        MODAL_TAGS.add("dialog")
+        self.addCleanup(MODAL_TAGS.discard, "dialog")
+        frame((205, 90), True)
+
+        assert overlay._expansion["v"] == 0.0
+        assert overlay._gesture is None
+        assert overlay._gate().owner is None
+        assert dpg.items["bar_v_thumb"]["fill"] == SharedScrollerPalette.THUMB
+
+        # Closing the dialog while the mouse is still held must not synthesize
+        # a new scrollbar press from the old physical gesture.
+        MODAL_TAGS.discard("dialog")
+        dpg.items["dialog"]["show"] = False
+        frame((205, 90), True)
+        assert overlay._gesture is None
+
+    def test_physical_left_release_overrides_cached_dpg_press(self):
+        dpg, overlay, frame = make_scroller(self)
+        dpg.down = True
+        dpg.__name__ = "dearpygui.dearpygui"
+        keys = Mock(return_value=0)
+        user32 = SimpleNamespace(GetAsyncKeyState=keys)
+        with patch("DearUIQt.qt.scroller.os", SimpleNamespace(name="nt")), \
+             patch("DearUIQt.qt.scroller.ctypes.windll", SimpleNamespace(user32=user32), create=True):
+            assert not overlay._left_button_down()
+            keys.assert_called_once_with(1)
+            keys.return_value = 0x8000
+            assert overlay._left_button_down()
 
     def test_page_and_occlusion(self):
         check_track_pages_and_occluded_target_ignores_press(make_scroller(self))

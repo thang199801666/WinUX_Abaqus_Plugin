@@ -99,14 +99,14 @@ def test_critical_feature_modules_still_exist():
         "services/server_text.py",
         "services/remote_odb.py",
         "services/remote_transfer.py",
-        "components/job_plots.py",
+        "ui/components/job_plots.py",
     )
     missing = [relative for relative in required if not (PACKAGE / relative).is_file()]
     assert not missing, f"critical feature modules missing: {missing}"
 
 
 def test_explorer_pointer_dispatch_priority_contract():
-    source = (PACKAGE / "components" / "explorer_pointer_dispatch.py").read_text(
+    source = (PACKAGE / "ui" / "components" / "explorer_pointer_dispatch.py").read_text(
         encoding="utf-8"
     )
     # These tokens encode the established gesture ownership order.  The exact
@@ -131,9 +131,13 @@ def test_explorer_pointer_dispatch_priority_contract():
 
 
 def test_font_bootstrap_and_modal_compatibility_exports_remain_available():
-    facade = (PACKAGE / "components" / "explorer_list_view.py").read_text(encoding="utf-8")
-    state = (PACKAGE / "components" / "explorer_input_state.py").read_text(encoding="utf-8")
+    facade = (PACKAGE / "ui" / "components" / "explorer_list_view.py").read_text(encoding="utf-8")
+    state = (PACKAGE / "ui" / "components" / "explorer_input_state.py").read_text(encoding="utf-8")
+    modal = ROOT / "DearUIQt" / "modal.py"
     assert "def apply_windows_font(font_size=15):" in facade
     assert "register_modal_window, unregister_modal_window" in facade
-    assert "def register_modal_window(tag):" in state
-    assert "def unregister_modal_window(tag):" in state
+    # Modal registration helpers moved into the DearUIQt shared modal registry;
+    # explorer_input_state re-exports them for backward compatibility.
+    assert "def register_modal_window(tag):" in modal.read_text(encoding="utf-8")
+    assert "def unregister_modal_window(tag):" in modal.read_text(encoding="utf-8")
+    assert "register_modal_window" in state

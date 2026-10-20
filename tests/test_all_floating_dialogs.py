@@ -88,7 +88,7 @@ class ProtocolTests(unittest.TestCase):
         for name in ("login_form", "blocking_form", "bookmarks_form", "site_manager_form", "sync_preview_form",
                      "server_path_form", "progress_form", "job_edit_form", "job_manager_form", "job_schedule_form",
                      "settings_form", "diagnostics_form", "odb_check_form", "odb_extract_form", "console_form",
-                     "transfer_center_form", "modern"):
+                      "transfer_center_form", "reference_chart_form", "modern"):
             source = (root / (name + ".py")).read_text(encoding="utf-8")
             self.assertTrue(source.isascii(), name)
 
@@ -142,6 +142,15 @@ class DeferredFocusTests(unittest.TestCase):
 @unittest.skipUnless(os.name == "nt", "Real floating dialogs require Windows")
 class AllFloatingIntegrationTests(unittest.TestCase):
     def setUp(self):
+        from DearUIQt import input_gate
+        input_gate.reset_pointer_input_gate()
+        # This fixture has a native STATIC owner, not a rendering DPG context.
+        # Advance the release guards with its synthetic UI turns rather than
+        # leaving them latched at DPG's absent/stale global frame counter.
+        self.frame = 0
+        frame_patch = patch("DearUIQt.input_gate._frame_count", side_effect=lambda: self.frame)
+        frame_patch.start()
+        self.addCleanup(frame_patch.stop)
         self.user32 = ctypes.windll.user32
         u = self.user32
         u.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
@@ -184,6 +193,7 @@ class AllFloatingIntegrationTests(unittest.TestCase):
         self.user32.DestroyWindow(self.owner)
 
     def tick(self):
+        self.frame += 1
         message = wintypes.MSG()
         while self.user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 1):
             self.user32.TranslateMessage(ctypes.byref(message))
@@ -195,6 +205,19 @@ class AllFloatingIntegrationTests(unittest.TestCase):
         deadline = time.monotonic() + timeout
         while not predicate() and time.monotonic() < deadline:
             self.tick()
+        if not predicate():
+            from WinUx.ui.native.native_dialog_host import _MODAL_OWNER_COUNTS
+            print("Dialog focus failure:", {
+                "foreground": int(self.user32.GetForegroundWindow() or 0),
+                "thread_focus": int(self.user32.GetFocus() or 0),
+                "owner": int(self.owner),
+                "owner_enabled": bool(self.user32.IsWindowEnabled(self.owner)),
+                "modal_owners": dict(_MODAL_OWNER_COUNTS),
+                "dialogs": [(item.kind if hasattr(item, "kind") else item.title,
+                             item._hwnd, item._visible, item._native_visible, item._closed,
+                             bool(self.user32.IsWindowEnabled(item._hwnd)))
+                            for item in self.instances],
+            }, flush=True)
         self.assertTrue(predicate(), str(self.view.errors))
         self.assertFalse(self.view.errors, str(self.view.errors))
 
@@ -214,6 +237,8 @@ class AllFloatingIntegrationTests(unittest.TestCase):
             self.wait_for(lambda: self.user32.GetForegroundWindow() == instance._hwnd, timeout=5)
 
     def test_every_dialog_is_a_real_floatable_modal_or_modeless_window(self):
+        from WinUx.dialogs.floating_adapters import LocalFileDialog
+        from WinUx.plotdigitizer.integration import open_plot_digitizer
         noop = lambda *args: None
         constructors = [
             ("login", lambda: dialogs.LoginDialog(self.view, noop)),
@@ -222,6 +247,10 @@ class AllFloatingIntegrationTests(unittest.TestCase):
             ("sites", lambda: dialogs.SiteManagerDialog(self.view, [], noop, noop, noop)),
             ("sync", lambda: dialogs.SyncPreviewDialog(self.view, [], "/local", "/remote", noop, noop)),
             ("server_path", lambda: dialogs.ServerPathDialog(self.view, "/", lambda p: ["/test"])),
+            ("local_folder", lambda: dialogs.LocalFolderDialog(self.view, str(Path.cwd()), noop)),
+            ("local_file", lambda: LocalFileDialog(
+                self.view, str(Path.cwd()), noop, extensions=(".png",))),
+            ("plotdigitizer", lambda: open_plot_digitizer(self.view)),
             ("progress", lambda: dialogs.ProgressDialog(self.view, "Upload", threading.Event())),
             ("job_edit", lambda: dialogs.JobEditDialog(self.view, ["1", "test", "user", "4", "Running", "1s"])),
             ("job_manager", lambda: dialogs.JobManagerDialog(self.view, [PurePosixPath("/scratch/job.inp")], noop, noop)),
@@ -230,13 +259,19 @@ class AllFloatingIntegrationTests(unittest.TestCase):
             ("diagnostics", lambda: dialogs.DiagnosticsDialog(self.view)),
             ("odb_check", lambda: dialogs.ODBCheckDialog(self.view, {})),
             ("odb_extract", lambda: dialogs.ODBExtractDialog(self.view, {}, noop)),
+            ("reference_chart", lambda: dialogs.ReferenceChartDialog(self.view, [], noop)),
             ("odb_xy", lambda: dialogs.ODBXYResultDialog(self.view, {"curves": [{"name": "curve", "points": [[0, 1]]}]})),
             ("console", lambda: dialogs.ConsoleDialog(self.view, lambda: "connected", lambda c: True, lambda: True)),
+            ("console_dock", lambda: FloatingDialogController(self.view, "console_dock", "SSH Console")),
+            ("plot_dock", lambda: FloatingDialogController(self.view, "plot_dock", "Job Plots")),
             ("transfer_center", lambda: dialogs.TransferCenterDialog(self.view)),
         ]
         self.assertEqual({kind for kind, constructor in constructors}, set(FORM_KINDS))
         for kind, constructor in constructors:
             with self.subTest(dialog=kind):
+                # Report each dialog's own failure, not stale errors from an
+                # earlier subtest that already failed.
+                self.view.errors.clear()
                 instance = self.create(constructor)
                 hwnd = instance._hwnd
                 startup = instance._startup_layout
@@ -268,13 +303,238 @@ class AllFloatingIntegrationTests(unittest.TestCase):
                     for name, (left, top, right, bottom) in instance._client_layout["widgets"].items():
                         self.assertLessEqual(right, width, name)
                         self.assertLessEqual(bottom, height, name)
-                self.user32.SetWindowPos(hwnd, None, 80, 100, 0, 0, 0x0001 | 0x0004)
+                # Owned is not parented: move beyond the main viewport bounds.
+                owner_right = window_rect(self.owner)[2]
+                outside_x = owner_right + 30
+                self.user32.SetWindowPos(hwnd, None, outside_x, 100, 0, 0, 0x0001 | 0x0004)
                 rectangle = wintypes.RECT()
                 self.user32.GetWindowRect(hwnd, ctypes.byref(rectangle))
-                self.assertEqual(rectangle.left, 80, kind)
+                self.assertEqual(rectangle.left, outside_x, kind)
                 instance.destroy()
-                self.wait_for(lambda: instance._process.poll() is not None, timeout=8)
+                # A clean reusable host stays alive after its dialog closes.
+                # Wait for the idle ACK, not process exit (which only occurs
+                # when the pool retires it or the test tears down).
+                self.wait_for(lambda: not instance.winfo_exists() and (
+                    instance._host_returned if instance._reuse_host
+                    else instance._process.poll() is not None), timeout=8)
                 self.assertTrue(self.user32.IsWindowEnabled(self.owner), kind)
+
+    def test_plotdigitizer_typography_workspace_and_native_file_selector(self):
+        from WinUx.plotdigitizer.integration import open_plot_digitizer
+
+        instance = self.create(lambda: open_plot_digitizer(self.view))
+        self.assertFalse(instance.modal)
+        style = self.user32.GetWindowLongPtrW(instance._hwnd, -16)
+        self.assertEqual(style & 0x00070000, 0x00070000)
+        self.assertEqual(instance._client_layout["footer"],
+                         [0, instance._client_layout["client"][1], 0, instance._client_layout["client"][1]])
+        self.assertTrue(self.user32.IsWindowEnabled(self.owner))
+        self.assertEqual(instance._client_layout["typography"], {"family": "Segoe UI", "size": 14})
+        widgets = instance._client_layout["widgets"]
+        self.assertGreater(widgets["canvas"][2] - widgets["canvas"][0], 400)
+        self.assertGreater(widgets["canvas"][3] - widgets["canvas"][1], 300)
+        width, height = instance._client_layout["client"]
+        for name, (left, top, right, bottom) in widgets.items():
+            self.assertGreaterEqual(left, 0, name)
+            self.assertGreaterEqual(top, 0, name)
+            self.assertLessEqual(right, width + 1, name)
+            self.assertLessEqual(bottom, height + 1, name)
+
+        instance.post("open_file_selector")
+        file_windows = []
+        callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        self.user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        self.user32.EnumWindows.argtypes = [callback_type, wintypes.LPARAM]
+
+        def find_selector():
+            file_windows.clear()
+
+            def visit(hwnd, _param):
+                if self.user32.GetWindowLongPtrW(hwnd, -8) == int(instance._hwnd):
+                    title = ctypes.create_unicode_buffer(256)
+                    self.user32.GetWindowTextW(hwnd, title, 256)
+                    if title.value == "Open File" and self.user32.IsWindowVisible(hwnd):
+                        file_windows.append(hwnd)
+                return True
+
+            self.user32.EnumWindows(callback_type(visit), 0)
+            return bool(file_windows)
+
+        self.wait_for(lambda: find_selector() and not self.user32.IsWindowEnabled(instance._hwnd))
+        selector = file_windows[0]
+        self.assertFalse(self.user32.GetWindowLongPtrW(selector, -16) & 0x40000000)
+        self.assertFalse(self.user32.IsWindowEnabled(instance._hwnd))
+        self.assertTrue(self.user32.IsWindowEnabled(self.owner))
+        self.user32.SetWindowPos(selector, None, 30, 50, 0, 0, 0x0001 | 0x0004)
+        self.assertEqual(window_rect(selector)[:2], (30, 50))
+        self.user32.PostMessageW(selector, 0x0010, 0, 0)
+        self.wait_for(lambda: not self.user32.IsWindowVisible(selector)
+                      and self.user32.IsWindowEnabled(instance._hwnd))
+        # Exercise the actual reported sequence, not just opening each form in
+        # isolation: use a nested selector, return to WinUx with the modeless
+        # digitizer still alive, then open unrelated application dialogs.
+        for constructor in (
+                lambda: dialogs.SettingsDialog(self.view),
+                lambda: dialogs.BlockingDialog(self.view, "Confirm", "Continue?", kind="confirm")):
+            other = self.create(constructor)
+            self.assertTrue(self.user32.IsWindowVisible(other._hwnd))
+            other.destroy()
+            self.wait_for(lambda: not other.winfo_exists() and (
+                other._host_returned if other._reuse_host
+                else other._process.poll() is not None), timeout=8)
+        instance.close()
+
+    def test_legacy_parent_cannot_disable_plot_digitizer_window_controls_in_a_cold_worker(self):
+        instance = self.create(lambda: FloatingDialogController(
+            self.view, "plotdigitizer", "Plot Digitizer", resizable=False,
+            allow_minimize=False, allow_maximize=False))
+        self.assertFalse(instance._from_prewarm)
+        self.assertEqual(self.user32.GetWindowLongPtrW(instance._hwnd, -16) & 0x00070000, 0x00070000)
+        self.assertFalse(self.user32.GetWindowLongPtrW(instance._hwnd, -20) & 0x80)
+        instance.destroy()
+        self.wait_for(lambda: instance._process.poll() is not None, timeout=8)
+        self.assertTrue(self.user32.IsWindowEnabled(self.owner))
+
+    def test_main_input_and_other_dialogs_work_with_digitizer_open_behind(self):
+        from collections import deque
+        from unittest.mock import Mock
+        from DearUIQt import input_gate
+        from WinUx.view import WinUXView
+        from WinUx.plotdigitizer.integration import open_plot_digitizer
+
+        digitizer = self.create(lambda: open_plot_digitizer(self.view))
+        left, top, right, bottom = window_rect(digitizer._hwnd)
+        # Independent native surface models returning to a window covering the
+        # modeless tool. Keep its HWND alive/registered throughout this test.
+        overlay = self.user32.CreateWindowExW(
+            0, "BUTTON", "WinUx foreground input regression", 0x10cf0000,
+            left + 80, top + 80, 240, 180, None, None, None, None)
+        self.assertTrue(overlay)
+        try:
+            # Only this short-lived test cover is TOPMOST: native owned-window
+            # activation would otherwise race the synthetic occlusion setup.
+            self.user32.SetWindowPos(overlay, wintypes.HWND(-1), 0, 0, 0, 0,
+                                     0x0001 | 0x0002 | 0x0010)
+            self.tick()
+            bounds = window_rect(overlay)
+            point = ((bounds[0] + bounds[2]) // 2, (bounds[1] + bounds[3]) // 2)
+            view = object.__new__(WinUXView)
+            view._alive = True
+            view._dpg_callbacks = deque()
+            from DearUIQt.runtime import QGuiRuntime
+            view._gui_runtime = QGuiRuntime()
+            opened = Mock()
+            with patch.object(input_gate, "_native_cursor_position", return_value=point), \
+                    patch.object(input_gate, "_mouse_button_down", return_value=False), \
+                    patch.object(input_gate, "_frame_count", return_value=10), \
+                    patch.object(view._gui_runtime, "callbackQueue", return_value=[(opened,)]):
+                self.assertIsNone(input_gate._native_surface_under_pointer())
+                view._drain_dpg_callbacks()
+            opened.assert_called_once_with()
+        finally:
+            self.user32.DestroyWindow(overlay)
+
+        # Different dialog types must publish while the digitizer stays alive,
+        # then still publish after its host has been returned to the pool.
+        for constructor in (
+                lambda: dialogs.SettingsDialog(self.view),
+                lambda: dialogs.BlockingDialog(self.view, "Confirm", "Continue?", kind="confirm"),
+                lambda: dialogs.BookmarksDialog(self.view, [], lambda *a: None,
+                                                lambda *a: None, lambda *a: None)):
+            dialog = self.create(constructor)
+            self.assertTrue(self.user32.IsWindowVisible(dialog._hwnd))
+            dialog.destroy()
+            self.wait_for(lambda: not dialog.winfo_exists() and (
+                dialog._host_returned if dialog._reuse_host
+                else dialog._process.poll() is not None), timeout=8)
+        digitizer.close()
+        self.wait_for(lambda: not digitizer._visible and not digitizer._native_visible
+                      and not self.user32.IsWindowVisible(digitizer._hwnd), timeout=8)
+        dialog = self.create(lambda: dialogs.SettingsDialog(self.view))
+        self.assertTrue(self.user32.IsWindowVisible(dialog._hwnd))
+
+    def test_repeated_digitizer_selector_escape_cycles_then_close_app(self):
+        from types import MethodType
+        from unittest.mock import Mock
+        from WinUx.controller import WinUXController
+        from WinUx.view import WinUXView
+        from WinUx.plotdigitizer.integration import open_plot_digitizer
+
+        self.user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        enum_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        self.user32.EnumWindows.argtypes = [enum_type, wintypes.LPARAM]
+
+        def selector_window(owner):
+            found = []
+            def visit(hwnd, _param):
+                if (self.user32.GetWindowLongPtrW(hwnd, -8) == owner
+                        and self.user32.IsWindowVisible(hwnd)):
+                    title = ctypes.create_unicode_buffer(128)
+                    self.user32.GetWindowTextW(hwnd, title, 128)
+                    if title.value == "Open File":
+                        found.append(int(hwnd))
+                return True
+            self.user32.EnumWindows(enum_type(visit), 0)
+            return found[0] if found else None
+
+        def escape(hwnd, released_to=None):
+            self.user32.PostMessageW(hwnd, 0x0100, 27, 0x00010001)
+            self.tick()
+            # Real Esc key-up can reach the newly activated owner, not the
+            # hidden/recycled selector that received key-down.
+            self.user32.PostMessageW(released_to or hwnd, 0x0101, 27, 0xc0010001)
+
+        for reopen in range(2):
+            digitizer = self.create(lambda: open_plot_digitizer(self.view))
+            for cycle in range(4):
+                with self.subTest(reopen=reopen, cycle=cycle):
+                    digitizer.post("open_file_selector")
+                    self.wait_for(lambda: selector_window(digitizer._hwnd)
+                                  and not self.user32.IsWindowEnabled(digitizer._hwnd), timeout=8)
+                    selector = selector_window(digitizer._hwnd)
+                    escape(selector, released_to=digitizer._hwnd)
+                    self.wait_for(lambda: not self.user32.IsWindowVisible(selector)
+                                  and self.user32.IsWindowEnabled(digitizer._hwnd), timeout=8)
+                    self.assertTrue(digitizer.winfo_exists(), "Esc closed the tool behind its selector")
+                    self.assertTrue(self.user32.IsWindowEnabled(self.owner))
+            escape(digitizer._hwnd)
+            self.wait_for(lambda: not digitizer._visible and not digitizer._native_visible
+                          and not self.user32.IsWindowVisible(digitizer._hwnd), timeout=8)
+
+        self.view._alive = True
+        self.view._find_main_viewport_hwnd = lambda: int(self.owner)
+        for name in ("confirm_action_async", "_drain_async_confirm_requests"):
+            setattr(self.view, name, MethodType(getattr(WinUXView, name), self.view))
+        app = object.__new__(WinUXController)
+        app._closing = app._close_confirmation_pending = False
+        app.view = self.view
+        app.job_schedules = Mock(return_value=[])
+        app._finish_close = Mock()
+        app.close()
+        confirmation = self.view._async_confirm_dialog
+        self.instances.append(confirmation)
+        self.wait_for(lambda: confirmation._ready, timeout=8)
+        self.assertTrue(self.user32.IsWindowVisible(confirmation._hwnd))
+        confirmation.accept()
+        self.wait_for(lambda: app._finish_close.called, timeout=8)
+
+    def test_reference_chart_opens_native_modal_and_closes_cleanly(self):
+        from WinUx.services.reference_charts import parse_reference_text
+        received = []
+        references = parse_reference_text("0,1\n1,2", "Measured")
+        instance = self.create(lambda: dialogs.ReferenceChartDialog(self.view, references, received.append))
+        self.assertTrue(self.user32.IsWindowVisible(instance._hwnd))
+        self.assertFalse(self.user32.IsWindowEnabled(self.owner))
+        width, height = instance._client_layout["client"]
+        for name, bounds in instance._client_layout["widgets"].items():
+            self.assertGreaterEqual(bounds[0], 0, name)
+            self.assertGreaterEqual(bounds[1], 0, name)
+            self.assertLessEqual(bounds[2], width + 1, name)
+            self.assertLessEqual(bounds[3], height + 1, name)
+        instance.destroy()
+        self.wait_for(lambda: instance._process.poll() is not None, timeout=8)
+        self.assertTrue(self.user32.IsWindowEnabled(self.owner))
+        self.assertEqual(received, [])
 
     def test_native_close_reports_cancel_before_result_dialog_disappears(self):
         received = []
@@ -284,7 +544,49 @@ class AllFloatingIntegrationTests(unittest.TestCase):
         self.assertFalse(instance.winfo_exists())
         self.assertTrue(self.user32.IsWindowEnabled(self.owner))
 
+    def test_close_app_confirmation_survives_an_existing_native_confirm(self):
+        from types import MethodType
+        from unittest.mock import Mock
+        from WinUx.controller import WinUXController
+        from WinUx.view import WinUXView
+
+        self.view._alive = True
+        self.view._find_main_viewport_hwnd = lambda: int(self.owner)
+        for name in ("confirm_action_async", "_drain_async_confirm_requests"):
+            setattr(self.view, name, MethodType(getattr(WinUXView, name), self.view))
+        first = self.view.confirm_action_async("Existing Confirm", "Continue?", lambda value: None)
+        self.instances.append(first)
+        self.wait_for(lambda: first._ready)
+        app = object.__new__(WinUXController)
+        app._closing = app._close_confirmation_pending = False
+        app.view = self.view
+        app.job_schedules = Mock(return_value=[])
+        app._finish_close = Mock()
+        app.close()
+        self.assertIs(self.view._async_confirm_dialog, first)
+        self.user32.PostMessageW(first._hwnd, 0x0010, 0, 0)
+        self.wait_for(lambda: self.view._async_confirm_dialog is not None
+                      and self.view._async_confirm_dialog is not first
+                      and self.view._async_confirm_dialog._ready)
+        confirmation = self.view._async_confirm_dialog
+        self.instances.append(confirmation)
+        self.assertEqual(confirmation.title, "Confirm Close App")
+        self.assertTrue(self.user32.IsWindowVisible(confirmation._hwnd))
+        # Cancel via native X, then verify a second Exit can be accepted.
+        self.user32.PostMessageW(confirmation._hwnd, 0x0010, 0, 0)
+        self.wait_for(lambda: not app._close_confirmation_pending)
+        app._finish_close.assert_not_called()
+        app.close()
+        confirmation = self.view._async_confirm_dialog
+        self.instances.append(confirmation)
+        self.wait_for(lambda: confirmation._ready)
+        confirmation.accept()
+        self.wait_for(lambda: app._finish_close.called)
+        app._finish_close.assert_called_once_with()
+
     def test_close_returns_foreground_and_keyboard_focus_for_modal_and_modeless(self):
+        if not self.foreground_available:
+            self.skipTest("Windows has no interactive foreground desktop for focus assertions")
         for constructor in (
             lambda: dialogs.BlockingDialog(self.view, "Focus", "Close this prompt", kind="confirm"),
             lambda: dialogs.BookmarksDialog(self.view, [], lambda *a: None, lambda *a: None, lambda *a: None),
@@ -295,7 +597,9 @@ class AllFloatingIntegrationTests(unittest.TestCase):
                     self.activate(instance)
                 self.user32.SetFocus(None)
                 self.user32.PostMessageW(instance._hwnd, 0x0010, 0, 0)
-                self.wait_for(lambda: not instance.winfo_exists()
+                self.wait_for(lambda: (not instance.winfo_exists() or (
+                    instance._retain_on_close and not instance._visible
+                    and not self.user32.IsWindowVisible(instance._hwnd)))
                     and (not self.foreground_available or self.user32.GetForegroundWindow() == self.owner)
                     and self.user32.GetFocus() == self.owner, timeout=5)
 
@@ -317,6 +621,19 @@ class AllFloatingIntegrationTests(unittest.TestCase):
         self.assertEqual(received, [second])
         self.assertTrue(self.user32.IsWindowEnabled(self.owner))
 
+    def test_bookmarks_initial_current_row_activates_without_an_extra_click(self):
+        received = []
+        entry = {"panel_id": "server", "path": "/first", "label": "First"}
+        instance = self.create(lambda: dialogs.BookmarksDialog(
+            self.view, [entry], received.append, lambda *args: None, lambda *args: None))
+        from WinUx.platform.native_dialog_host import restore_owner_focus
+        restore_owner_focus(instance._hwnd)
+        self.user32.PostMessageW(instance._hwnd, 0x0007, 0, 0)
+        self.user32.PostMessageW(instance._hwnd, 0x0100, 13, 0x001c0001)
+        self.user32.PostMessageW(instance._hwnd, 0x0101, 13, 0xc01c0001)
+        self.wait_for(lambda: bool(received), timeout=5)
+        self.assertEqual(received, [entry])
+
     def test_transfer_native_close_hides_without_cancelling_task_and_show_restores(self):
         center = self.create(lambda: dialogs.TransferCenterDialog(self.view))
         event = threading.Event()
@@ -329,8 +646,11 @@ class AllFloatingIntegrationTests(unittest.TestCase):
         self.assertLessEqual(center._outgoing.qsize(), 4)
         self.user32.PostMessageW(center._hwnd, 0x0010, 0, 0)
         self.wait_for(lambda: not self.user32.IsWindowVisible(center._hwnd))
-        self.wait_for(lambda: (not self.foreground_available or self.user32.GetForegroundWindow() == self.owner)
-                      and self.user32.GetFocus() == self.owner, timeout=5)
+        with self.subTest(check="foreground-and-keyboard-return"):
+            if not self.foreground_available:
+                self.skipTest("No interactive foreground desktop; transfer lifecycle still checked")
+            self.wait_for(lambda: self.user32.GetForegroundWindow() == self.owner
+                          and self.user32.GetFocus() == self.owner, timeout=5)
         self.assertTrue(center.winfo_exists())
         self.assertTrue(task.winfo_exists())
         self.assertFalse(event.is_set())
@@ -358,8 +678,11 @@ class AllFloatingIntegrationTests(unittest.TestCase):
         nested.destroy()
         self.assertTrue(self.user32.IsWindowEnabled(bookmarks._hwnd))
         from WinUx.dialogs.floating_dialog import _owner_has_keyboard_focus
-        self.wait_for(lambda: _owner_has_keyboard_focus(bookmarks._hwnd)
-            and (not self.foreground_available or self.user32.GetForegroundWindow() == bookmarks._hwnd), timeout=5)
+        with self.subTest(check="foreground-and-keyboard-return"):
+            if not self.foreground_available:
+                self.skipTest("No interactive foreground desktop; nested modality still checked")
+            self.wait_for(lambda: _owner_has_keyboard_focus(bookmarks._hwnd)
+                and self.user32.GetForegroundWindow() == bookmarks._hwnd, timeout=5)
 
     def test_background_close_does_not_take_focus_from_another_dialog(self):
         constructor = lambda: dialogs.BookmarksDialog(self.view, [], lambda *a: None, lambda *a: None, lambda *a: None)
@@ -378,6 +701,28 @@ class AllFloatingIntegrationTests(unittest.TestCase):
                 first.destroy()
                 self.wait_for(lambda: first._process.poll() is not None, timeout=8)
                 restore.assert_not_called()
+
+    def test_closing_bookmark_parent_with_active_rename_returns_focus_to_main(self):
+        from WinUx.platform.dialog_focus import owner_has_keyboard_focus
+        from DearUIQt.input_gate import native_modal_input_active
+        bookmarks = self.create(lambda: dialogs.BookmarksDialog(
+            self.view, [], lambda *a: None, lambda *a: None, lambda *a: None))
+        bookmarks.handle_event("rename_prompt", {"entry": {
+            "label": "test", "path": "/test", "panel_id": "server"}})
+        nested = bookmarks._owned_dialogs[-1]
+        self.instances.append(nested)
+        self.wait_for(lambda: nested._ready)
+        self.activate(nested)
+        self.assertFalse(self.user32.IsWindowEnabled(bookmarks._hwnd))
+        bookmarks.destroy()
+        self.wait_for(lambda: bookmarks._closed and nested._closed)
+        self.assertTrue(self.user32.IsWindowEnabled(self.owner))
+        self.assertFalse(native_modal_input_active())
+        with self.subTest(check="foreground-and-keyboard-return"):
+            if not self.foreground_available:
+                self.skipTest("No interactive foreground desktop; teardown and input release still checked")
+            self.wait_for(lambda: int(self.user32.GetForegroundWindow() or 0) == self.owner
+                           and owner_has_keyboard_focus(self.owner), timeout=5)
 
     def test_shutdown_closes_modal_and_modeless_windows_and_releases_registry(self):
         self.create(lambda: dialogs.BookmarksDialog(self.view, [], lambda *a: None, lambda *a: None, lambda *a: None))

@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TRANSFER = ROOT / "WinUx" / "dialogs" / "transfer_center_form.py"
 TRANSFER_ADAPTER = ROOT / "WinUx" / "dialogs" / "floating_adapters.py"
 TRANSFER_LOGIC = ROOT / "WinUx" / "dialogs" / "logic" / "transfer.py"
-FILE_PANEL = ROOT / "WinUx" / "components" / "file_panel.py"
+FILE_PANEL = ROOT / "WinUx" / "ui" / "components" / "file_panel.py"
 CONTROLLER = ROOT / "WinUx" / "controller.py"
 TRANSFER_CONTROLLER = ROOT / "WinUx" / "controllers" / "transfer.py"
 
@@ -29,10 +29,11 @@ class TransferCenterV2Tests(unittest.TestCase):
     def test_each_transfer_row_owns_a_progress_bar(self):
         source = TRANSFER.read_text(encoding="utf-8")
         self.assertIn("self.progress_bar(", source)
-        self.assertIn('progress_text = dpg.draw_text(', source)
-        self.assertIn('action = self.action(', source)
+        self.assertIn('percentage = QLabel("0.0%", parent=progress_host_frame)', source)
+        self.assertIn("progress_host = progress_host_frame.tag", source)
+        self.assertIn("action = self.action(", source)
         self.assertIn('"Cancel",', source)
-        self.assertIn('self.row_widgets[row_id]', source)
+        self.assertIn("self.row_widgets[row_id]", source)
 
     def test_context_menu_exposes_multi_file_upload_and_download(self):
         source = FILE_PANEL.read_text(encoding="utf-8")
@@ -52,27 +53,41 @@ class TransferCenterV2Tests(unittest.TestCase):
         self.assertIn("self.process_queued_drop", block)
         self.assertIn("list(paths", block)
 
-    def test_percentage_is_centered_over_progress_bar(self):
+    def test_percentage_is_rendered_inside_the_progress_bar_with_fixed_center_text(self):
         source = TRANSFER.read_text(encoding="utf-8")
-        self.assertIn('progress_text = dpg.draw_text(', source)
-        self.assertIn('def _center_progress_text', source)
+        self.assertIn('self.progress_bar(0.0, parent=progress_host, overlay="")', source)
+        self.assertIn('percentage = QLabel("0.0%", parent=progress_host_frame)', source)
+        self.assertIn("self._recenter_progress_text(row)", source)
         self.assertIn('self._set_progress_text(row_id, values["ratio"])', source)
-        self.assertNotIn('dpg.configure_item(row["progress"], overlay=', source)
+        self.assertIn("self._schedule_progress_recenter(row_id)", source)
 
-    def test_cancel_button_shares_progress_row(self):
+    def test_cancel_button_shares_the_progress_row_and_matches_progress_height(self):
         source = TRANSFER.read_text(encoding="utf-8")
-        self.assertIn("with dpg.table_row(parent=table) as row_parent:", source)
-        row = source.split("with dpg.table_row(parent=table) as row_parent:", 1)[1].split("stats =", 1)[0]
-        self.assertIn("self.progress_bar(", row)
-        self.assertIn("progress_host = dpg.add_child_window(", row)
-        self.assertIn("action = self.action(", row)
-        self.assertIn("dpg.add_spacer(parent=row_parent, width=10)", row)
+        self.assertNotIn("dpg.table_row", source)
+        # Cancel and progress live on the same grid row, inside the row card.
+        progress_row = source.split("progress_cell = controls_grid.cell(0, 0)", 1)[1].split("stats = self.status_text", 1)[0]
+        self.assertIn('progress = self.progress_bar(0.0, parent=progress_host, overlay="")', progress_row)
+        self.assertIn('percentage = QLabel("0.0%", parent=progress_host_frame)', progress_row)
+        self.assertIn("action = self.action(", progress_row)
+        self.assertIn('"Cancel"', progress_row)
+        self.assertIn("width=self.ACTION_WIDTH, height=self.PROGRESS_HEIGHT", progress_row)
 
     def test_speed_sampler_resets_when_byte_counter_restarts(self):
-        source = TRANSFER_LOGIC.read_text(encoding="utf-8")
-        server = (ROOT / "WinUx" / "services" / "remote_jobs.py").read_text(encoding="utf-8")
-        self.assertIn("elif done < self._sample_done", source)
-        self.assertIn("progress(source.name, 0, total", server)
+        from types import SimpleNamespace
+        from unittest.mock import Mock, patch
+        from WinUx.dialogs.logic.transfer import TransferItemRow
+        row = object.__new__(TransferItemRow)
+        row.exists = Mock(return_value=True)
+        row.task = SimpleNamespace(center=Mock())
+        row.row_id = 1
+        row._sample_time, row._sample_done, row._smoothed_speed = None, 0, 0
+        with patch("WinUx.dialogs.logic.transfer.time.monotonic", side_effect=[1., 2., 3.]):
+            row.update_progress(100, 1000)
+            row.update_progress(200, 1000)
+            self.assertGreater(row._smoothed_speed, 0)
+            row.update_progress(50, 1000)
+        self.assertEqual(row._smoothed_speed, 0)
+        self.assertEqual(row._sample_done, 50)
 
 
     def test_progress_updates_are_coalesced(self):

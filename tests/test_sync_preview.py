@@ -59,6 +59,15 @@ def make_app():
         after=lambda delay, callback, *args: callbacks.append((callback, args)),
         show_sync_preview=Mock(), show_error=Mock(), show_message=Mock(),
     )
+    dialog = SimpleNamespace(winfo_exists=lambda: True, isVisible=lambda: True,
+                             begin_scan=Mock(), set_status=Mock(), lift=Mock(),
+                             after_first_present=lambda callback: callback())
+
+    def show(*args):
+        view.sync_preview_dialog = dialog
+        return dialog
+
+    view.show_sync_preview.side_effect = show
     app = SimpleNamespace(
         view=view, _closing=False, _connection_generation=0,
         model=SimpleNamespace(list_directory=Mock(return_value=[item("a")])),
@@ -85,6 +94,9 @@ class SyncScanTests(unittest.TestCase):
     def test_latest_scan_publishes_and_routes_upload_to_captured_root(self):
         app, component, workers, callbacks = make_app()
         component.preview()
+        app.view.show_sync_preview.assert_called_once()
+        self.assertEqual(app.view.show_sync_preview.call_args.args[0], [])
+        app.view.show_sync_preview.reset_mock()
         workers[0]()
         self.assertFalse(app.view.show_sync_preview.called)
         drain(callbacks)
@@ -98,6 +110,7 @@ class SyncScanTests(unittest.TestCase):
         component.preview()
         workers[0]()
         component.preview()
+        app.view.show_sync_preview.reset_mock()
         drain(callbacks)
         app.view.show_sync_preview.assert_not_called()
         workers[1]()
@@ -125,12 +138,14 @@ class SyncScanTests(unittest.TestCase):
         for change in (lambda app: setattr(app.view.left, "current_path", Path("other")),
                        lambda app: setattr(app.view.right, "current_path", PurePosixPath("/other")),
                        lambda app: setattr(app, "_closing", True),
-                       lambda app: setattr(app, "_connection_generation", 1),
-                       lambda app: setattr(app.server, "connected", False),
-                       lambda app: setattr(app.view, "winfo_exists", lambda: False)):
+                        lambda app: setattr(app, "_connection_generation", 1),
+                        lambda app: setattr(app.server, "connected", False),
+                        lambda app: setattr(app.view.sync_preview_dialog, "isVisible", lambda: False),
+                        lambda app: setattr(app.view, "winfo_exists", lambda: False)):
             with self.subTest(change=change):
                 app, component, workers, callbacks = make_app()
                 component.preview()
+                app.view.show_sync_preview.reset_mock()
                 workers[0]()
                 change(app)
                 drain(callbacks)
@@ -153,6 +168,28 @@ class SyncScanTests(unittest.TestCase):
         component.transfer_rows([{"action": "Upload", "local_path": "local/a"},
                                  {"action": "Download", "server_path": "/remote/b"}])
         app.view.show_message.assert_called_once()
+        app._process_queued_drop.assert_not_called()
+
+    def test_shell_is_shown_before_scan_is_even_submitted(self):
+        app, component, workers, _ = make_app()
+        presented = []
+        dialog = app.view.show_sync_preview.side_effect()
+        app.view.sync_preview_dialog = None
+        dialog.after_first_present = lambda callback: presented.append(callback)
+        app.view.show_sync_preview.reset_mock()
+        component.preview()
+        app.view.show_sync_preview.assert_called_once()
+        dialog.begin_scan.assert_called_once()
+        self.assertEqual(workers, [])
+        app.model.list_directory.assert_not_called()
+        app.server.list_directory.assert_not_called()
+        presented[0]()
+        self.assertEqual(len(workers), 1)
+
+    def test_pending_scan_cannot_transfer_stale_rows(self):
+        app, component, _, _ = make_app()
+        component.preview()
+        component.transfer_rows([{"action": "Upload", "local_path": "local/old"}])
         app._process_queued_drop.assert_not_called()
 
 

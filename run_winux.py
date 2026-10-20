@@ -14,6 +14,7 @@ import subprocess
 import sys
 
 
+
 _VENDOR_DLL_HANDLES = []
 
 
@@ -44,6 +45,11 @@ def _project_dir():
         raise RuntimeError(
             "WinUx must be beside run_winux.py, or WINUX_APP_DIR must point "
             "to the directory containing WinUx."
+        )
+    if not os.path.isfile(os.path.join(configured, "DearUIQt", "__init__.py")):
+        raise RuntimeError(
+            "DearUIQt is missing. The DearUIQt folder must sit beside WinUx "
+            "in the WinUx application directory."
         )
     return configured
 
@@ -132,6 +138,7 @@ def _terminate_existing_winux(pid):
 
 
 def _vendor_candidates(project_dir):
+    from winux_native_runtime import native_runtime_path
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     project_dir = os.path.abspath(project_dir)
     # During the first transition from a flat deployment to an immutable
@@ -151,7 +158,8 @@ def _vendor_candidates(project_dir):
         os.path.join(plugin_dir, "site-packages"),
         os.path.join(plugin_dir, "winux_vendor.zip"),
     )
-    candidates = project_candidates + plugin_candidates
+    native = native_runtime_path(project_dir)
+    candidates = ((native,) if native else ()) + project_candidates + plugin_candidates
     result = []
     seen = set()
     for path in candidates:
@@ -204,6 +212,13 @@ def _configure_bundled_dependencies(project_dir, environ=None):
     return vendor_paths
 
 
+def _safe_getcwd(fallback=None):
+    try:
+        return os.getcwd()
+    except (OSError, RuntimeError):
+        return os.path.abspath(fallback or os.path.dirname(__file__))
+
+
 def _show_error(message):
     message = str(message)
     print(message, file=sys.stderr)
@@ -240,7 +255,7 @@ def _check_for_update(project_dir, update_callable=None, before_sync=None):
         from winux_updater import update_local_if_newer
         update_callable = update_local_if_newer
 
-    previous_cwd = os.getcwd()
+    previous_cwd = _safe_getcwd(os.path.dirname(project_dir))
     safe_cwd = os.environ.get("TEMP") or os.environ.get("TMP") or os.path.dirname(project_dir)
     try:
         try:

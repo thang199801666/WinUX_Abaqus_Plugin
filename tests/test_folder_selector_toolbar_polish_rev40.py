@@ -29,5 +29,5 @@ def test_toolbar_divider_is_one_pixel_short_and_vertically_centered():
 
 def test_folder_form_uses_drawn_toolbar_divider_not_one_pixel_child_window():
     source = FORM.read_text(encoding="utf-8")
-    assert "tool_divider = create_toolbar_divider(location_row)" in source
+    assert "tool_divider = create_toolbar_divider(self._location_grid.cell(0, 3).tag)" in source
     assert "parent=location_row, width=1, height=20" not in source

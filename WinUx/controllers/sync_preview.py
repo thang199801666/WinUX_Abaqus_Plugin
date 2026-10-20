@@ -11,6 +11,8 @@ class SyncPreviewController:
         self.app = app
         self._generation = 0
         self._connection_generation = None
+        self._scan_dialog = None
+        self._scan_pending = False
 
     @property
     def view(self):
@@ -108,9 +110,15 @@ class SyncPreviewController:
         self._connection_generation = getattr(self.app, "_connection_generation", None)
         local_root = Path(self.view.left.current_path)
         server_root = self.server.normalize(self.view.right.current_path)
-        existing = getattr(self.view, "sync_preview_dialog", None)
-        if existing is not None and existing.winfo_exists():
-            existing.set_status("Scanning Local and Server folders...")
+        dialog = getattr(self.view, "sync_preview_dialog", None)
+        if dialog is not None and dialog.winfo_exists():
+            dialog.lift()
+        else:
+            dialog = self.view.show_sync_preview(
+                [], local_root, server_root, self.app.sync_preview, self.app._sync_transfer_rows)
+        self._scan_dialog = dialog
+        self._scan_pending = True
+        dialog.begin_scan(local_root, server_root)
 
         def worker():
             if not self._scan_is_current(generation):
@@ -133,8 +141,14 @@ class SyncPreviewController:
                 0, self._scan_ready,
                 generation, rows, local_root, server_root)
 
-        self.app._submit_background(
-            "sync-preview", worker, key="sync-preview", replace=True)
+        def submit():
+            if self._can_publish(generation, local_root, server_root):
+                self.app._submit_background(
+                    "sync-preview", worker, key="sync-preview", replace=True)
+
+        # A fast scan/result must not fill a large table before the user has
+        # seen its shell. Both in-process and native controllers expose this.
+        dialog.after_first_present(submit)
 
     def _scan_is_current(self, generation):
         return (
@@ -144,20 +158,30 @@ class SyncPreviewController:
         )
 
     def _can_publish(self, generation, local_root, server_root):
+        if not self._scan_is_current(generation) or not self.view.winfo_exists():
+            return False
+        dialog = self._scan_dialog
+        if dialog is not None:
+            if (getattr(self.view, "sync_preview_dialog", None) is not dialog
+                    or not dialog.winfo_exists()):
+                return False
+            visible = getattr(dialog, "isVisible", None)
+            if not (visible() if callable(visible) else getattr(dialog, "_visible", False)):
+                return False
         return (
-            self._scan_is_current(generation)
-            and self.view.winfo_exists()
-            and self.server.connected
+            self.server.connected
             and Path(self.view.left.current_path) == local_root
             and self.server.normalize(self.view.right.current_path) == server_root
         )
 
     def _scan_ready(self, generation, rows, local_root, server_root):
         if self._can_publish(generation, local_root, server_root):
+            self._scan_pending = False
             self.app._sync_preview_ready(rows, local_root, server_root)
 
     def _scan_failed(self, generation, local_root, server_root, error):
         if self._can_publish(generation, local_root, server_root):
+            self._scan_dialog.set_status("Scan failed: {}. Refresh to retry.".format(error))
             self.view.show_error("Directory Synchronization", error)
 
     def ready(self, rows, local_root, server_root):
@@ -168,6 +192,11 @@ class SyncPreviewController:
             self.app.sync_preview, self.app._sync_transfer_rows)
 
     def transfer_rows(self, rows):
+        if self._scan_pending:
+            dialog = getattr(self.view, "sync_preview_dialog", None)
+            if dialog is not None and dialog.winfo_exists():
+                dialog.set_status("Wait for the current scan to finish before transferring.")
+            return
         if not self.app._ensure_server_online():
             return
         uploads = [Path(row["local_path"]) for row in rows

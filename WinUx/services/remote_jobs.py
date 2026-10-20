@@ -8,7 +8,7 @@ import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path, PurePosixPath
 
-from ..model import JobItem
+from ..models import JobItem
 from .ssh_serialization import _serialized_wire_call
 
 
@@ -219,60 +219,673 @@ class RemoteJobsMixin:
         return "'{}'".format(str(value).replace("'", "'\"'\"'"))
 
     @_serialized_wire_call
-    def read_job_status(self, job_id, job_name):
+    def read_job_status(self, job_id, job_name, job_owner=None):
         """Read the latest Abaqus progress marker from a job's .sta file."""
         name = str(job_name).strip()
-        temp_folder = self._find_job_temp_folder_by_id(job_id)
-        first_path = self._find_latest_file(temp_folder, "*.sta") if temp_folder else ""
+        current_username, current_hostname = self.current_remote_identity()
+        owner = self._clean_job_owner(job_owner)
+        if owner and owner.casefold() != current_username.casefold():
+            raise RuntimeError(
+                "Job {} belongs to {}, but the current SSH user is {}.".format(
+                    self.numeric_job_id(job_id), owner, current_username))
+        lookup_owner = owner or current_username
+        temp_folder = self._find_job_temp_folder_by_id(
+            job_id, lookup_owner, current_username, current_hostname)
+        first_path = self._find_job_status_file(temp_folder, name) if temp_folder else ""
         if not first_path and name:
-            first_path = self._find_job_file(job_id, name, ".sta")
+            first_path = self._find_job_file(
+                job_id, name, ".sta", lookup_owner, current_username, current_hostname)
         if not first_path:
             return "No progress information found in the job file."
 
         file_content = self.run_command(
             "cat {}".format(self._shell_quote(first_path)))
-        progress_pattern = re.compile(
-            r"Output Field Frame Number\s+(?P<currentNum>\d+),\s+"
-            r"of\s+(?P<totalNum>\d+),")
-        matches = list(progress_pattern.finditer(file_content))
-        if matches:
-            latest = matches[-1]
-            return "Process {}/{}.".format(
-                latest.group("currentNum"), latest.group("totalNum"))
-        return "No progress information found in the job file."
+        status = self._parse_abaqus_status(file_content)
+        if status.get("state") in {"running", "starting", "preprocessing"}:
+            try:
+                checked_at = self.run_command(
+                    "date '+%d-%b-%Y %H:%M:%S'").strip()
+            except Exception:
+                checked_at = ""
+            self._apply_check_time_runtime(status, checked_at)
+        return self._format_abaqus_status(status)
+
+    def _find_job_status_file(self, folder, job_name):
+        """Return the most appropriate ``.sta`` file in one scheduler folder.
+
+        A scheduler directory can occasionally contain more than one status
+        file (for example after retries or helper jobs).  The exact Abaqus job
+        stem is authoritative; only when it is absent do we fall back to the
+        newest ``*.sta`` file inside the already validated job-ID directory.
+        """
+        if not folder:
+            return ""
+        name = str(job_name or "").strip()
+        if name:
+            exact = self._find_latest_file(folder, name + ".sta")
+            if exact:
+                return exact
+        return self._find_latest_file(folder, "*.sta")
+
+    @staticmethod
+    def _wall_time_seconds(value):
+        """Convert Abaqus ``H+:MM:SS`` wall time to seconds."""
+        match = re.fullmatch(r"\s*(\d{1,6}):(\d{2}):(\d{2})\s*", str(value or ""))
+        if not match:
+            return None
+        return int(match.group(1)) * 3600 + int(match.group(2)) * 60 + int(match.group(3))
+
+    @staticmethod
+    def _format_wall_seconds(value):
+        """Format a non-negative number of seconds as ``H+:MM:SS``."""
+        try:
+            seconds = max(0, int(value))
+        except (TypeError, ValueError):
+            return None
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return "{:02d}:{:02d}:{:02d}".format(hours, minutes, seconds)
+
+    @staticmethod
+    def _parse_abaqus_status(file_content):
+        """Parse a live Abaqus ``.sta`` file into job and per-step status.
+
+        Abaqus/Explicit writes cumulative TOTAL TIME/WALL TIME while STEP TIME
+        resets at every step.  Keeping one record per ``STEP n ORIGIN`` lets
+        Check Job report multi-step analyses without losing compatibility with
+        the legacy top-level fields (``frame``, ``increment``, ``step_time``,
+        ...), which continue to mirror the latest/current step.
+        """
+        text = str(file_content or "").replace("\x00", "")
+        result = {
+            "state": "unknown",
+            "frame": None,
+            "total_frames": None,
+            "step": None,
+            "increment": None,
+            "step_time": None,
+            "total_time": None,
+            "wall_time": None,
+            "total_wall_time": None,
+            "step_runtime": None,
+            "frame_runtime": None,
+            "total_runtime": None,
+            "step_count": 0,
+            "steps": [],
+        }
+        if not text.strip():
+            return result
+
+        number = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[EeDd][+-]?\d+)?"
+        step_pattern = re.compile(
+            r"^\s*STEP\s+(?P<step>\d+)\s+ORIGIN(?:\s+(?P<origin>" + number + r"))?\b",
+            re.IGNORECASE)
+        frame_pattern = re.compile(
+            r"^\s*Output\s+Field\s+Frame\s+Number\s+"
+            r"(?P<frame>\d+)\s*,?\s*of\s+(?P<total>\d+)"
+            r"(?:\s+(?:requested\s+)?time\s+points\b)?"
+            r"(?:\s*,?\s*at\s+(?:step\s+time\s+(?P<frame_time>" + number + r")|increment\s+zero))?",
+            re.IGNORECASE)
+        increment_pattern = re.compile(
+            r"^\s*(?P<increment>\d+)\s+"
+            r"(?P<step_time>" + number + r")\s+"
+            r"(?P<total_time>" + number + r")\s+"
+            r"(?P<wall_time>\d{1,6}:\d{2}:\d{2})\s+"
+            r"(?P<stable>" + number + r")\s+"
+            r"(?P<critical>\d+)\b",
+            re.IGNORECASE)
+
+        steps = []
+        current = None
+        latest_activity_pos = -1
+        offset = 0
+
+        def make_step(number_value, origin, position):
+            return {
+                "number": int(number_value),
+                "origin": origin,
+                "state": "starting",
+                "frame": None,
+                "total_frames": None,
+                "increment": None,
+                "step_time": None,
+                "total_time": None,
+                "wall_time": None,
+                "wall_elapsed": None,
+                "frame_runtime": None,
+                "_last_wall_seconds": None,
+                "_frame_streams": {},
+                "_activity_pos": position,
+            }
+
+        for raw_line in text.splitlines(True):
+            line = raw_line.rstrip("\r\n")
+            step_match = step_pattern.match(line)
+            if step_match:
+                step_number = int(step_match.group("step"))
+                origin = step_match.group("origin")
+                # A new step proves that the previous one reached its boundary.
+                if current is not None and current.get("number") != step_number:
+                    if (current.get("frame") is not None or
+                            current.get("increment") is not None):
+                        current["state"] = "completed"
+                # Repeated STEP headers can occur after a restart. Reuse the
+                # same logical step but let new activity supersede stale data.
+                existing = next((item for item in reversed(steps)
+                                 if item["number"] == step_number), None)
+                if existing is None or (current is not None and current is not existing
+                                        and current.get("number") == step_number):
+                    current = make_step(step_number, origin, offset)
+                    steps.append(current)
+                else:
+                    current = existing
+                    if origin is not None:
+                        current["origin"] = origin
+                    current["_activity_pos"] = max(current.get("_activity_pos", -1), offset)
+
+            frame_match = frame_pattern.match(line)
+            if frame_match:
+                frame = int(frame_match.group("frame"))
+                total = int(frame_match.group("total"))
+                if total > 0 and 0 <= frame <= total:
+                    if current is None:
+                        current = make_step(1, None, offset)
+                        steps.append(current)
+                    # Abaqus can emit more than one Output Field frame stream
+                    # inside the same analysis step (for example 20 regular
+                    # frames plus 6 requested time points).  The user-facing
+                    # step progress should follow the primary stream, which is
+                    # the stream with the largest total frame count.  A smaller
+                    # auxiliary stream must never overwrite it merely because
+                    # it was written later in the .sta file.
+                    previous_total = current.get("total_frames")
+                    use_frame = previous_total is None or total > previous_total or total == previous_total
+                    if use_frame:
+                        current["frame"] = frame
+                        current["total_frames"] = total
+                        frame_time = frame_match.group("frame_time")
+                        if frame_time is not None:
+                            current["step_time"] = frame_time
+                    # Associate each frame marker with the WALL TIME from the
+                    # immediately preceding increment record. Keep streams
+                    # separated by their total frame count so auxiliary output
+                    # streams (for example 6 requested points beside 20 regular
+                    # frames) cannot corrupt the primary frame duration.
+                    frame_wall = current.get("_last_wall_seconds")
+                    if frame_wall is not None:
+                        stream = current.setdefault("_frame_streams", {}).setdefault(total, [])
+                        event = (frame, int(frame_wall), offset)
+                        if not stream or stream[-1][:2] != event[:2]:
+                            stream.append(event)
+                    current["state"] = "running"
+                    current["_activity_pos"] = offset
+                    latest_activity_pos = max(latest_activity_pos, offset)
+
+            increment_match = increment_pattern.match(line)
+            if increment_match:
+                if current is None:
+                    current = make_step(1, None, offset)
+                    steps.append(current)
+                current["increment"] = int(increment_match.group("increment"))
+                current["step_time"] = increment_match.group("step_time")
+                current["total_time"] = increment_match.group("total_time")
+                current["wall_time"] = increment_match.group("wall_time")
+                current["_last_wall_seconds"] = RemoteJobsMixin._wall_time_seconds(
+                    current["wall_time"])
+                current["state"] = "running"
+                current["_activity_pos"] = offset
+                latest_activity_pos = max(latest_activity_pos, offset)
+            offset += len(raw_line)
+
+        terminal_events = []
+        terminal_patterns = (
+            ("completed", re.compile(
+                r"(?im)^\s*(?:THE\s+)?ANALYSIS\s+(?:HAS\s+)?(?:BEEN\s+)?COMPLETED(?:\s+SUCCESSFULLY)?\b.*$")),
+            ("completed", re.compile(
+                r"(?im)^\s*Abaqus\s+JOB\b.*\bCOMPLETED\b.*$")),
+            ("failed", re.compile(
+                r"(?im)^\s*(?:THE\s+)?ANALYSIS\s+(?:HAS\s+)?(?:BEEN\s+)?TERMINATED\b.*$")),
+            ("failed", re.compile(
+                r"(?im)^\s*Abaqus(?:/Explicit)?\s+Analysis\s+exited\s+with\s+an\s+error\b.*$")),
+            ("failed", re.compile(
+                r"(?im)^\s*Abaqus\s+JOB\b.*\b(?:ABORTED|TERMINATED)\b.*$")),
+            ("failed", re.compile(r"(?im)^\s*\*{3}\s*ERROR\b.*$")),
+        )
+        for state, pattern in terminal_patterns:
+            terminal_events.extend((match.start(), state) for match in pattern.finditer(text))
+
+        terminal_state = None
+        if terminal_events:
+            event_pos, event_state = max(terminal_events, key=lambda item: item[0])
+            if event_pos >= latest_activity_pos:
+                terminal_state = event_state
+
+        # Normalize per-step state. Entering a later step proves all previous
+        # step occurrences completed; only the latest step can be running or
+        # failed at the end of the current status file.
+        if steps:
+            # Reaching a later STEP header is sufficient evidence that every
+            # earlier step crossed its boundary, even when that earlier step
+            # produced no output frame/increment row that our parser recognizes.
+            for item in steps[:-1]:
+                item["state"] = "completed"
+            latest = steps[-1]
+            if terminal_state == "completed":
+                for item in steps:
+                    item["state"] = "completed"
+            elif terminal_state == "failed":
+                latest["state"] = "failed"
+            elif latest.get("frame") is not None or latest.get("increment") is not None:
+                latest["state"] = "running"
+            else:
+                latest["state"] = "starting"
+
+        # Derive the duration of the most recently completed frame in the
+        # primary output stream. Frame time is the difference between the WALL
+        # TIME recorded at frame N and frame N-1 of the same stream.
+        for item in steps:
+            total = item.get("total_frames")
+            frame = item.get("frame")
+            events = item.get("_frame_streams", {}).get(total, []) if total else []
+            if frame is None or frame <= 0 or not events:
+                continue
+            current_index = next(
+                (idx for idx in range(len(events) - 1, -1, -1)
+                 if events[idx][0] == frame), None)
+            if current_index is None:
+                continue
+            current_wall = events[current_index][1]
+            previous = next(
+                (event for event in reversed(events[:current_index])
+                 if event[0] == frame - 1), None)
+            if previous is None:
+                continue
+            previous_wall = previous[1]
+            if current_wall >= previous_wall:
+                item["frame_runtime"] = RemoteJobsMixin._format_wall_seconds(
+                    current_wall - previous_wall)
+
+        # Derive per-step runtime from Abaqus' wall clock. Normally WALL TIME
+        # is cumulative, so the current step runtime is the difference between
+        # the two nearest step endpoints. If Abaqus restarts its wall clock,
+        # treat the current value as a fresh step duration instead of returning
+        # a misleading zero.
+        previous_wall_seconds = 0
+        total_runtime_seconds = 0
+        has_wall_time = False
+        for item in steps:
+            wall_seconds = RemoteJobsMixin._wall_time_seconds(item.get("wall_time"))
+            if wall_seconds is not None:
+                has_wall_time = True
+                if wall_seconds >= previous_wall_seconds:
+                    elapsed = wall_seconds - previous_wall_seconds
+                else:
+                    elapsed = wall_seconds
+                item["wall_elapsed"] = RemoteJobsMixin._format_wall_seconds(elapsed)
+                total_runtime_seconds += elapsed
+                previous_wall_seconds = wall_seconds
+        result["total_runtime"] = (
+            RemoteJobsMixin._format_wall_seconds(total_runtime_seconds)
+            if has_wall_time else None)
+
+        # WALL TIME begins with the solution phase, not necessarily when the
+        # Abaqus process/job itself first started.  Keep Step runtime tied to
+        # WALL TIME, but make Total runtime include the preprocessing/startup
+        # interval when the .sta file provides both absolute timestamps.
+        #
+        # Do not use an arbitrary later Abaqus page header as the solution
+        # anchor: long .sta files can repeat DATE/TIME headers.  The header
+        # immediately preceding the first SOLUTION PROGRESS section is the
+        # stable boundary between startup/preprocessing and step execution.
+        header_pattern = re.compile(
+            r"(?im)^.*?DATE\s+(?P<date>\d{1,2}-[A-Za-z]{3}-\d{4})"
+            r"\s+TIME\s+(?P<time>\d{1,2}:\d{2}:\d{2})\s*$")
+        header_events = []
+        for header_match in header_pattern.finditer(text):
+            try:
+                stamp = datetime.strptime(
+                    "{} {}".format(header_match.group("date"), header_match.group("time")),
+                    "%d-%b-%Y %H:%M:%S")
+            except (TypeError, ValueError):
+                continue
+            header_events.append((header_match.start(), stamp))
+
+        if header_events:
+            result["_job_start_datetime"] = header_events[0][1]
+
+        startup_seconds = None
+        solution_match = re.search(r"(?im)^\s*SOLUTION\s+PROGRESS\s*$", text)
+        if has_wall_time and header_events and solution_match is not None:
+            solution_headers = [
+                event for event in header_events if event[0] <= solution_match.start()
+            ]
+            if solution_headers:
+                first_stamp = header_events[0][1]
+                solution_stamp = solution_headers[-1][1]
+                delta = int((solution_stamp - first_stamp).total_seconds())
+                # Negative deltas mean malformed/out-of-order timestamps.  A
+                # huge delta is also more likely a concatenated/stale status
+                # file than one continuous job startup, so ignore it rather
+                # than reporting a misleading runtime.
+                if 0 <= delta <= 7 * 24 * 3600:
+                    startup_seconds = delta
+                    result["startup_runtime"] = RemoteJobsMixin._format_wall_seconds(delta)
+                    result["total_runtime"] = RemoteJobsMixin._format_wall_seconds(
+                        total_runtime_seconds + delta)
+
+        public_steps = []
+        for item in steps:
+            public_steps.append({
+                key: value for key, value in item.items()
+                if not key.startswith("_")
+                and not (key == "frame_runtime" and value is None)
+            })
+        result["steps"] = public_steps
+        result["step_count"] = len(public_steps)
+
+        latest = public_steps[-1] if public_steps else None
+        if latest:
+            result["step"] = latest.get("number")
+            for key in ("frame", "total_frames", "increment", "step_time",
+                        "total_time", "wall_time", "frame_runtime"):
+                result[key] = latest.get(key)
+            result["step_runtime"] = latest.get("wall_elapsed")
+            result["total_wall_time"] = next(
+                (item.get("wall_time") for item in reversed(public_steps)
+                 if item.get("wall_time")), None)
+            if not result.get("total_runtime"):
+                result["total_runtime"] = result.get("total_wall_time")
+
+        if terminal_state:
+            result["state"] = terminal_state
+        elif latest and (latest.get("frame") is not None or latest.get("increment") is not None):
+            result["state"] = "running"
+        elif re.search(r"(?im)^\s*SOLUTION\s+PROGRESS\s*$", text):
+            result["state"] = "starting"
+        else:
+            result["state"] = "preprocessing"
+        return result
+
+    @staticmethod
+    def _parse_remote_datetime(value):
+        """Parse the server-local timestamp used by Check Job."""
+        value = str(value or "").strip()
+        for fmt in ("%d-%b-%Y %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                return datetime.strptime(value, fmt)
+            except ValueError:
+                pass
+        return None
+
+    @staticmethod
+    def _apply_check_time_runtime(status, checked_at):
+        """Set Total runtime to elapsed wall time from job start to Check Job."""
+        status = status if isinstance(status, dict) else {}
+        if status.get("state") not in {"running", "starting", "preprocessing"}:
+            return status
+        started_at = status.get("_job_start_datetime")
+        if not isinstance(started_at, datetime):
+            return status
+        if not isinstance(checked_at, datetime):
+            checked_at = RemoteJobsMixin._parse_remote_datetime(checked_at)
+        if not isinstance(checked_at, datetime):
+            return status
+        elapsed = int((checked_at - started_at).total_seconds())
+        if 0 <= elapsed <= 30 * 24 * 3600:
+            status["total_runtime"] = RemoteJobsMixin._format_wall_seconds(elapsed)
+        return status
+
+    @staticmethod
+    def _format_abaqus_status(status):
+        """Format Check Job using plain ASCII and only the key runtime fields."""
+        status = dict(status or {})
+        state = status.get("state") or "unknown"
+        steps = list(status.get("steps") or [])
+        state_labels = {
+            "running": "Running",
+            "completed": "Completed",
+            "failed": "Terminated",
+            "starting": "Starting",
+            "preprocessing": "Preprocessing",
+            "unknown": "Unknown",
+        }
+
+        if not steps:
+            if state == "completed":
+                return "Status: Completed"
+            if state == "failed":
+                return "Status: Terminated"
+            if state == "starting":
+                return "Status: Starting\nCurrent step: 1\nFrame: N/A\nFrame time: N/A\nTotal runtime: N/A"
+            if state == "preprocessing":
+                return "Status: Preprocessing\nCurrent step: N/A\nFrame: N/A\nFrame time: N/A\nTotal runtime: N/A"
+            return "Status: Unknown\nCurrent step: N/A\nFrame: N/A\nFrame time: N/A\nTotal runtime: N/A"
+
+        current_number = status.get("step") or steps[-1].get("number")
+        current = next(
+            (item for item in reversed(steps) if item.get("number") == current_number),
+            steps[-1])
+        frame = current.get("frame")
+        total_frames = current.get("total_frames")
+        frame_text = "{}/{}".format(frame, total_frames) if frame is not None and total_frames else "N/A"
+        frame_runtime = current.get("frame_runtime") or status.get("frame_runtime") or "N/A"
+        total_runtime = status.get("total_runtime") or status.get("total_wall_time") or status.get("wall_time") or "N/A"
+
+        lines = [
+            "Status: {}".format(state_labels.get(state, str(state).title())),
+            "Current step: {}".format(current_number),
+            "Frame: {}".format(frame_text),
+            "Frame time: {}".format(frame_runtime),
+            "Total runtime: {}".format(total_runtime),
+        ]
+        # Keep dialog text strictly ASCII so typographic punctuation such as
+        # em dashes cannot creep back into status output.
+        return "\n".join(lines).encode("ascii", "replace").decode("ascii")
+
+    @staticmethod
+    def _parse_abaqus_progress(file_content):
+        """Compatibility wrapper returning the latest ``(frame, total)`` pair."""
+        status = RemoteJobsMixin._parse_abaqus_status(file_content)
+        if status.get("frame") is None or not status.get("total_frames"):
+            return None
+        return int(status["frame"]), int(status["total_frames"])
 
     @_serialized_wire_call
-    def find_job_temp_folder(self, job_id, job_name):
+    def find_job_temp_folder(self, job_id, job_name, job_owner=None):
         """Locate the scheduler Temp folder using username and numeric job ID."""
-        temp_folder = self._find_job_temp_folder_by_id(job_id)
+        current_username, current_hostname = self.current_remote_identity()
+        owner = self._clean_job_owner(job_owner)
+        if owner and owner.casefold() != current_username.casefold():
+            raise RuntimeError(
+                "Job {} belongs to {}, but the current SSH user is {}.".format(
+                    self.numeric_job_id(job_id), owner, current_username))
+        lookup_owner = owner or current_username
+        temp_folder = self._find_job_temp_folder_by_id(
+            job_id, lookup_owner, current_username, current_hostname)
         if temp_folder:
             return PurePosixPath(temp_folder)
 
         # Compatibility fallback for older layouts that were located through
         # the status filename rather than the scheduler directory name.
         name = str(job_name).strip()
-        first_path = self._find_job_file(job_id, name, ".sta") if name else ""
+        first_path = self._find_job_file(
+            job_id, name, ".sta", lookup_owner, current_username, current_hostname
+        ) if name else ""
         if first_path:
             return PurePosixPath(first_path).parent
         raise RuntimeError("No Temp folder was found for job {}.".format(
             self.numeric_job_id(job_id)))
 
+    @staticmethod
+    def _component_has_exact_job_id(component, job_id):
+        """Return True when *component* contains the exact numeric job ID."""
+        numeric_id = RemoteJobsMixin.numeric_job_id(job_id)
+        token = re.compile(r"(?<!\d){}(?!\d)".format(re.escape(numeric_id)))
+        return bool(token.search(str(component)))
+
+    @staticmethod
+    def _path_has_exact_job_id(path, job_id):
+        """Return True when a directory component carries exactly *job_id*.
+
+        Job files are associated with the scheduler through directory names
+        such as ``31635.server_job``. Matching the ID as an isolated numeric
+        token prevents job 31635 from accepting paths for 131635 or 316350.
+        """
+        parts = PurePosixPath(str(path)).parts
+        # Only directory components prove scheduler ownership. The file name
+        # may contain unrelated digits from the model/job name.
+        return any(RemoteJobsMixin._component_has_exact_job_id(component, job_id)
+                   for component in parts[:-1])
+
+    @staticmethod
+    def _clean_job_owner(value):
+        owner = str(value or "").strip().split("@", 1)[0]
+        if not owner or not re.fullmatch(r"[A-Za-z0-9._-]+", owner):
+            return ""
+        return owner
+
+    @staticmethod
+    def _clean_remote_hostname(value):
+        hostname = str(value or "").strip().rstrip(".")
+        if not hostname or not re.fullmatch(r"[A-Za-z0-9._-]+", hostname):
+            return ""
+        return hostname
+
     @_serialized_wire_call
-    def _find_job_temp_folder_by_id(self, job_id):
-        """Find Temp/<user>/<jobid>.<server>_<job> without needing job name."""
+    def current_remote_identity(self):
+        """Return the username/hostname reported by the live SSH session.
+
+        Check Job must not trust login-time cached identity because WinUx can
+        reconnect or reuse a server model after the remote account/host has
+        changed. Query both values for every operation that resolves scheduler
+        Temp paths. ``hostname -f`` is preferred because PBS scratch folders
+        normally embed the FQDN; plain ``hostname`` is the fallback.
+        """
+        command = (
+            "_winux_user=$(whoami 2>/dev/null); "
+            "[ -n \"$_winux_user\" ] || _winux_user=$(id -un 2>/dev/null); "
+            "_winux_host=$(hostname -f 2>/dev/null); "
+            "[ -n \"$_winux_host\" ] || _winux_host=$(hostname 2>/dev/null); "
+            "printf '__WINUX_USER__=%s\\n__WINUX_HOST__=%s\\n' "
+            "\"$_winux_user\" \"$_winux_host\""
+        )
+        output = self.run_command(command)
+        user_match = re.search(r"(?:^|\n)__WINUX_USER__=([^\r\n]+)", output)
+        host_match = re.search(r"(?:^|\n)__WINUX_HOST__=([^\r\n]+)", output)
+        username = self._clean_job_owner(
+            user_match.group(1) if user_match else "")
+        hostname = self._clean_remote_hostname(
+            host_match.group(1) if host_match else "")
+        if not username or not hostname:
+            raise RuntimeError(
+                "Could not determine the current SSH username and hostname")
+        return username, hostname
+
+    @staticmethod
+    def _hostname_aliases(hostname):
+        hostname = RemoteJobsMixin._clean_remote_hostname(hostname).casefold()
+        if not hostname:
+            return ()
+        # When hostname -f succeeds, keep the FQDN strict so a different host
+        # with the same short label cannot be accepted accidentally. If only
+        # the short hostname is available, matching permits a FQDN suffix.
+        return (hostname,)
+
+    @staticmethod
+    def _component_matches_job_identity(component, job_id, hostname=None):
+        """Match scheduler folder identity using exact job ID and live host.
+
+        Current layouts use ``<id>.<hostname>_<job-name>``. Legacy layouts
+        without a hostname (``<id>_...``/``<id>-...``) remain supported, but
+        a folder that explicitly names a different host is rejected.
+        """
+        numeric_id = RemoteJobsMixin.numeric_job_id(job_id)
+        value = str(component or "").strip()
+        if not RemoteJobsMixin._component_has_exact_job_id(value, numeric_id):
+            return False
+        folded = value.casefold()
+        prefix = numeric_id.casefold()
+        aliases = RemoteJobsMixin._hostname_aliases(hostname)
+        if folded == prefix or folded.startswith(prefix + "_") or folded.startswith(prefix + "-"):
+            return True
+        if folded.startswith(prefix + "."):
+            if not aliases:
+                return True
+            remainder = folded[len(prefix) + 1:]
+            return any(
+                remainder == alias
+                or remainder.startswith(alias + "_")
+                or remainder.startswith(alias + "-")
+                or ("." not in alias and remainder.startswith(alias + "."))
+                for alias in aliases
+            )
+        # Nonstandard legacy names that merely contain the isolated ID are
+        # accepted only when they do not advertise a conflicting hostname.
+        return not aliases
+
+    def _job_temp_search_roots(self, job_owner=None, current_username=None):
+        """Return Temp roots, preferring live identity and selected job owner."""
+        home = PurePosixPath(self.home)
+        owner = self._clean_job_owner(job_owner)
+        username = (self._clean_job_owner(current_username)
+                    or self._clean_job_owner(getattr(self, "username", "")))
+        candidates = []
+        if owner:
+            owner_home = home.parent / owner
+            canonical_home = PurePosixPath("/home") / owner
+            candidates.extend((
+                owner_home / "Temp" / owner,
+                owner_home / "Temp",
+                canonical_home / "Temp" / owner,
+                canonical_home / "Temp",
+                home / "Temp" / owner,
+            ))
+        if username:
+            current_home = PurePosixPath("/home") / username
+            candidates.extend((
+                current_home / "Temp" / username,
+                current_home / "Temp",
+                home / "Temp" / username,
+            ))
+        candidates.append(home / "Temp")
+        unique, seen = [], set()
+        for root in candidates:
+            key = str(root)
+            if key not in seen:
+                seen.add(key)
+                unique.append(root)
+        return tuple(unique)
+
+    @_serialized_wire_call
+    def _find_job_temp_folder_by_id(self, job_id, job_owner=None, current_username=None, current_hostname=None):
+        """Find a Temp job directory using the exact numeric scheduler ID.
+
+        Both ``Temp/<job-dir>`` and ``Temp/<owner>/<job-dir>`` layouts are
+        supported.  The latter matches cluster paths such as
+        ``/home/huyhuynh/Temp/huyhuynh/31646.server_Job``.
+        """
         numeric_id = self.numeric_job_id(job_id)
-        roots = (self.home / "Temp" / self.username, self.home / "Temp")
-        pattern = "{}.*".format(numeric_id)
-        for root in roots:
+        patterns = (
+            numeric_id,
+            "{}.*".format(numeric_id),
+            "{}_*".format(numeric_id),
+            "{}-*".format(numeric_id),
+        )
+        for root in self._job_temp_search_roots(job_owner, current_username):
+            predicates = " -o ".join(
+                "-name {}".format(self._shell_quote(pattern))
+                for pattern in patterns)
+            quoted_root = self._shell_quote(root)
             command = (
-                "find {} -mindepth 1 -maxdepth 1 -type d -name {} "
-                "-print 2>/dev/null | head -n 1").format(
-                    self._shell_quote(root), self._shell_quote(pattern))
+                "if [ -d {} ]; then find {} -mindepth 1 -maxdepth 2 "
+                "-type d \\( {} \\) -print 2>/dev/null; fi").format(
+                    quoted_root, quoted_root, predicates)
             result = self.run_command(command)
-            first_path = next((line.strip() for line in result.splitlines()
-                               if line.strip()), "")
-            if first_path:
-                return first_path
+            for line in result.splitlines():
+                candidate = line.strip()
+                if (candidate and self._component_matches_job_identity(
+                        PurePosixPath(candidate).name, numeric_id, current_hostname)):
+                    return candidate
         return ""
 
     @_serialized_wire_call
@@ -307,41 +920,47 @@ class RemoteJobsMixin:
         return PurePosixPath(first_path)
 
     @_serialized_wire_call
-    def _find_job_file(self, job_id, job_name, extension):
-        """Find a job file below the connected account's actual home path."""
+    def _find_job_file(self, job_id, job_name, extension, job_owner=None, current_username=None, current_hostname=None):
+        """Find the newest matching file owned by the exact scheduler job ID.
+
+        Job names are reusable, so a name-only fallback can read the status or
+        output of a different submission. A candidate is accepted only when a
+        directory component contains the requested numeric ID as an isolated
+        token.
+        """
         numeric_id = self.numeric_job_id(job_id)
         name = str(job_name).strip()
         if not name:
             return ""
-        root = self.home
         filename_pattern = "*{}*{}".format(name, extension)
-        job_path_pattern = "*{}*/*{}*{}".format(
-            numeric_id, name, extension)
         exclusion = (" ! -name {}".format(self._shell_quote("*-Temp.odb"))
                      if extension == ".odb" else "")
 
-        # Older OHPC wrappers place results below a directory containing the
-        # PBS ID. Preserve that exact match first. Jobs submitted directly by
-        # WinUx write beside the .inp, so fall back to the newest matching file
-        # anywhere below the home returned by SFTP. This is identical whether
-        # the connection used the hostname or its IP address.
-        exact_command = "find {} -type f -wholename {}{} -print -quit".format(
-            self._shell_quote(root), self._shell_quote(job_path_pattern),
-            exclusion)
-        result = self.run_command(exact_command)
-        first_path = next((line.strip() for line in result.splitlines()
-                           if line.strip()), "")
-        if first_path:
-            return first_path
-
-        latest_command = (
-            "find {} -type f -name {}{} -printf '%T@\\t%p\\n' 2>/dev/null "
-            "| sort -nr | cut -f2- | head -n 1").format(
-                self._shell_quote(root), self._shell_quote(filename_pattern),
-                exclusion)
-        result = self.run_command(latest_command)
-        return next((line.strip() for line in result.splitlines()
-                     if line.strip()), "")
+        roots = list(self._job_temp_search_roots(job_owner, current_username))
+        search_home = (PurePosixPath("/home") / current_username
+                       if self._clean_job_owner(current_username)
+                       else PurePosixPath(self.home))
+        roots.append(search_home)
+        seen = set()
+        for root in roots:
+            key = str(root)
+            if key in seen:
+                continue
+            seen.add(key)
+            command = (
+                "find {} -type f -name {}{} -printf '%T@\t%p\n' 2>/dev/null "
+                "| sort -nr | cut -f2-").format(
+                    self._shell_quote(root), self._shell_quote(filename_pattern),
+                    exclusion)
+            result = self.run_command(command)
+            for line in result.splitlines():
+                candidate = line.strip()
+                if candidate and self._path_has_exact_job_id(candidate, numeric_id):
+                    parts = PurePosixPath(candidate).parts[:-1]
+                    if any(self._component_matches_job_identity(
+                            component, numeric_id, current_hostname) for component in parts):
+                        return candidate
+        return ""
 
     def hot_download(self, job_id, job_name, local_folder, cancel=None,
                      progress=None, abaqus_commands=None):

@@ -3,36 +3,46 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import time
 from collections import deque
 from ctypes import wintypes
 from pathlib import Path, PurePosixPath
 
-import dearpygui.dearpygui as dpg
+from DearUIQt.runtime import QGuiRuntime
 
-from .components import (
-    DockDropPreview, DockManager, DockWidget, ExplorerListView, FilePanel, JobsView, ResourceTextures,
+from .ui.components import (
+    ExplorerListView, FilePanel, JobsView, ResourceTextures,
     apply_white_explorer_theme, reset_component_runtime_resources,
 )
+from DearUIQt.widgets import DockDropPreview, DockManager, QDockWidget as DockWidget
+from DearUIQt.core import Qt, QGlobalInputBinding, QItemInputBinding
+from DearUIQt.layouts import QSplitterHandle, QHBoxLayout
+from DearUIQt.gui import QAction, QFontDatabase
+from DearUIQt.widgets import (
+    QMenuBar, QApplication, QFrame, QLabel, QSpacer, QToolButton,
+    QMainWindow, QRetainedItem, QImageView,
+)
 from .resources import resource_path
-from .general_preferences import GeneralPreferences
+from .preferences.general import GeneralPreferences
 from .dialogs.console_form import ConsoleDockPanel
 from .controllers import validate_callbacks
 from . import dialogs as _dialogs
 from .diagnostics import crash_guard, log_event, log_exception
 from .runtime import UIHangWatchdog, UiDispatcher
+from .runtime.paths import safe_current_directory
 from .runtime.dpg_callbacks import invoke_callback_job
-from .components.qt_style import QtFusionPalette
-from .components.toolbar import (
+from .ui.components.toolbar import (
     file_status_bar_theme, file_status_text_theme, resource_menu_theme,
 )
-from .widgets.imgui_qt_style import (
-    application_theme, splitter_hitbox_theme, splitter_theme,
+from DearUIQt.themes import (
+    application_theme, compact_layout_surface_theme, floating_window_theme,
+    splitter_hitbox_theme, splitter_theme,
 )
 from .ui import (
     ConsoleDockingMixin, PlotDockingMixin, PointerRoutingMixin,
     SplitterLayoutMixin,
 )
-from .components.interaction_gate import (
+from DearUIQt.input_gate import (
     native_background_input_blocked, release_pointer_input,
 )
 
@@ -45,15 +55,62 @@ def __getattr__(name):
     raise AttributeError(name)
 
 
+_INPROCESS_DIALOG_TYPES = frozenset({
+    # All DearUIQt/DPG application dialogs share the main QApplication event
+    # loop. Server Notepad remains a standalone editor service rather than a
+    # QDialog and is therefore intentionally outside this routing table.
+    "BlockingDialog", "LoginDialog", "JobEditDialog", "JobManagerDialog",
+    "LocalFolderDialog", "ServerPathDialog", "ProgressDialog",
+    "ODBCheckDialog", "ODBExtractDialog", "ODBXYResultDialog",
+    "SettingsDialog", "DiagnosticsDialog", "BookmarksDialog",
+    "SiteManagerDialog", "SyncPreviewDialog", "JobScheduleDialog",
+    "TransferCenterDialog",
+})
+
+
+def _use_inprocess_dialogs():
+    """Use one QApplication/renderer event loop for dialogs by default.
+
+    ``WINUX_DIALOG_PROCESS_HOSTS=1`` is the explicit legacy escape hatch for an
+    installation that still needs process-isolated dialog hosts. The historical
+    ``WINUX_INPROCESS_DIALOGS`` flag is still accepted, but now defaults on.
+    """
+    process_hosts = str(
+        os.environ.get("WINUX_DIALOG_PROCESS_HOSTS", "0")
+    ).strip().lower()
+    if process_hosts not in {"0", "false", "off", "no", ""}:
+        return False
+    return str(
+        os.environ.get("WINUX_INPROCESS_DIALOGS", "1")
+    ).strip().lower() not in {"0", "false", "off", "no"}
+
+
 def _dialog_type(name):
-    # Historical callers/tests can override the named constructor on this
-    # module. Otherwise resolve it only when the user opens that dialog.
-    return globals().get(name) or getattr(_dialogs, name)
+    # Tests/integrations can still override a constructor on this module. Normal
+    # application dialogs resolve to in-process forms and therefore incur no
+    # process spawn, IPC handshake or secondary render loop.
+    override = globals().get(name)
+    if override is not None:
+        return override
+    if name in _INPROCESS_DIALOG_TYPES:
+        if _use_inprocess_dialogs():
+            from .dialogs import inprocess_adapters
+            return getattr(inprocess_adapters, name)
+        # Explicit compatibility mode only. Keeping this import here prevents
+        # accidental process-host selection through the normal public API.
+        from .dialogs import floating_adapters
+        return getattr(floating_adapters, name)
+    return getattr(_dialogs, name)
+
 
 
 class WinUXView(
         SplitterLayoutMixin, PlotDockingMixin, ConsoleDockingMixin,
         PointerRoutingMixin):
+    # File/folder selectors share the QApplication/renderer event loop. With
+    # DearUIQt native multi-window support they are owned HWNDs; otherwise they
+    # are modal overlays in the main viewport. Neither path spawns a process.
+    use_native_file_selectors = False
     WIDTH, HEIGHT = 850, 620
     MIN_PANEL_WIDTH = 260
     MIN_TOP_HEIGHT = 260
@@ -66,15 +123,14 @@ class WinUXView(
     MIN_PLOT_DOCK_WIDTH = 360
     MIN_JOB_VIEWER_DOCK_HEIGHT = 120
     MIN_PLOT_DOCK_HEIGHT = 180
-    PLOT_DOCK_SEPARATOR_SIZE = 1
+    PLOT_DOCK_SEPARATOR_SIZE = 9
     CONSOLE_DOCK_DEFAULT_HEIGHT = 220
     MIN_CONSOLE_DOCK_HEIGHT = 150
     CONSOLE_DOCK_SEPARATOR_SIZE = 1
     PLOT_DOCK_AREAS = ("left", "right", "top", "bottom")
     # Keep every visible divider hairline-thin, but make the pointer target much
-    # larger than the painted handle. Vertical splitters already acquire well
-    # with a 10 px halo. Horizontal dividers need a taller Y grab band on high
-    # DPI displays, so they deliberately use a larger orientation-specific halo.
+    # larger than the painted handle, but reserve real space rather than
+    # overlapping list rows/headers with invisible resize halos.
     SPLITTER_SIZE = 1
     # Dedicated File/Job Viewer gutter.  Unlike the other horizontal splitters,
     # this one sits immediately above the Job Viewer header, so it owns real
@@ -86,30 +142,47 @@ class WinUXView(
     # The Console divider also owns real layout space instead of an invisible
     # hit halo overlapping Job Viewer/Plots.
     CONSOLE_DOCK_SPLITTER_GUTTER_SIZE = 9
+    # Compatibility constants only; workspace handles no longer borrow pane space.
     SPLITTER_HIT_PADDING = 10
     HORIZONTAL_SPLITTER_HIT_PADDING = 18
     # Compatibility value retained for older integrations; no longer used by
     # the Local/Server splitter implementation.
     FILE_PANEL_SPLITTER_HIT_PADDING = 6
     FILE_STATUS_HEIGHT = 20
-    APP_PADDING = 4
+    APP_PADDING = 2
     DOCK_SNAP_DISTANCE = 56
 
     @crash_guard("WinUXView initialization failed")
     def __init__(self, callbacks):
         self.callbacks = validate_callbacks(callbacks)
         self._general_preferences = GeneralPreferences()
+        self._show_hidden_files = self._general_preferences.load_show_hidden_files()
         try:
             self._console_dock_visible = bool(
                 self._general_preferences.load_console_visible())
         except Exception:
             self._console_dock_visible = False
         self._console_dock_height = self.CONSOLE_DOCK_DEFAULT_HEIGHT
+        # Reference charts are application-level data, not Job Plot state.
+        # Keep the handles on the main view so Reference -> Chart works even
+        # before any job/ODB Plot dock has ever been opened.
+        self._reference_chart_library = None
+        self._reference_chart_dialog = None
+        self._plot_digitizer_dialog = None
+        # Process-isolated floating dialogs are expensive Abaqus children
+        # (typically one SMALncMain + one SMAPython).  Do not keep hidden
+        # dialog hosts resident after the user closes them: a hidden cache of
+        # several dialogs looks like a process leak in Task Manager and holds
+        # native runtime resources for no user-visible benefit.  One warm host
+        # is still maintained by the prewarm pool for responsive reopening.
+        self._dialog_resident_limit = 0
         # QDockWidget-style Console state.  Visibility is persisted separately
         # from docking mode: a visible Console may either occupy the bottom dock
         # site or live in a detachable floating tool window.
         self._console_dock_mode = "docked"
         self._console_float_window = None
+        self._native_console_host = None
+        self._native_plot_hosts = {}
         self._console_float_resizer = None
         self._console_float_geometry = {}
         self._console_float_last_position = None
@@ -128,6 +201,11 @@ class WinUXView(
         # both down/up so Dear ImGui never enters a right-button ActiveId state
         # on the custom console draw-list.
         self._dispatcher = UiDispatcher()
+        # One logical QApplication owns focus/posted-event semantics for every
+        # in-process QWidget/QDialog.  It reuses WinUx's dispatcher and creates
+        # no worker thread or secondary render loop.
+        application = QApplication.instance()
+        self._qapplication = application or QApplication(after=self.after)
         self._watchdog = None
         # Callbacks that must run only after a rendered frame (most notably
         # actions accepted from a closing modal). Dear PyGui does not fully
@@ -135,11 +213,18 @@ class WinUXView(
         # immediately in the same UI iteration.
         self._render_generation = 0
         self._rendering = False
-        self._after_render_callbacks = []
+        # Targets are appended in monotonically non-decreasing render
+        # generations. A deque lets each frame consume only callbacks that are
+        # actually due instead of partitioning/copying the entire pending list.
+        self._after_render_callbacks = deque()
         self._dpg_callbacks = deque()
         # Compatibility for integrations that inspect the old queue attribute.
         self._queue = self._dispatcher.queue
         self._alive = True
+        # Per-frame interaction code touches many transient DPG items. A stale
+        # item during resize/dock/rename must not tear down the whole render
+        # loop. Track failures for rate-limited non-fatal logging.
+        self._frame_step_errors = {}
 
         self._top_ratio = 0.66
         self._last_content_size = (0, 0)
@@ -230,175 +315,233 @@ class WinUXView(
         self._startup_layout_frames = 8
         self._components_destroyed = False
 
-        dpg.create_context()
-        # Run input callbacks on the render/UI thread. The default DPG worker
-        # otherwise mutates/queries the native item registry concurrently with
-        # layout, modal deletion and rendering (seen in native crash traces).
-        dpg.configure_app(manual_callback_management=True)
-        apply_white_explorer_theme()
+        self._gui_runtime = QGuiRuntime()
+        self._gui_runtime.createContext(manual_callbacks=True)
+        self._native_dialogs = False
+        if (self._gui_runtime.supportsNativeWindows() and
+                str(os.environ.get("WINUX_NATIVE_WINDOWS", "1")).strip().lower() not in {"0", "false", "off", "no"}):
+            self._gui_runtime.enableNativeWindows()
+            self._native_dialogs = True
+            log_event("DearUIQt native reference/in-process tools enabled: shared process/context")
+        # Native DPG registries require a live context. Installing this bridge
+        # alongside the logical QApplication above crashes in handler_registry
+        # with an access violation (not a catchable Python exception).
+        # Run input callbacks on the UI thread: DPG's default callback worker
+        # must not mutate/query the registry concurrently with native rendering.
+        try:
+            self._qapplication.installInputBackend(self._gui_runtime.backend)
+        except Exception:
+            # The centralized Qt-style input bridge improves focus routing but
+            # is not required for rendering the application. If an older DPG
+            # backend rejects one handler/key registration, keep WinUx alive;
+            # widget-local handlers remain available as a degraded fallback.
+            log_exception(
+                "QApplication input bridge installation failed during startup",
+                sys.exc_info(), fatal=False)
+        activity_callback = self.callbacks.get("user_activity")
+        if callable(activity_callback):
+            try:
+                self._qapplication.userActivity.connect(activity_callback)
+            except Exception:
+                log_exception(
+                    "QApplication user-activity hook failed during startup",
+                    sys.exc_info(), fatal=False)
+        # Process-host prewarming is legacy-only. The normal in-process path
+        # constructs QDialogs directly on this application's GUI event loop and
+        # therefore has no worker/socket pool to warm.
+        if not _use_inprocess_dialogs():
+            try:
+                # Keep process-host modules completely out of normal startup.
+                from .dialogs.prewarm_pool import start_dialog_prewarm
+                start_dialog_prewarm(self)
+            except Exception:
+                # Legacy prewarming is optional and never a startup dependency.
+                # Any host failure falls back to a cold compatibility dialog.
+                log_exception(
+                    "Floating dialog prewarm failed during startup",
+                    sys.exc_info(), fatal=False)
+                self._dialog_host_pool = None
+                self._dialog_prewarm_pool = None
+        try:
+            apply_white_explorer_theme()
+        except Exception:
+            # Dear ImGui's default palette is usable.  Keep WinUx alive if a
+            # font/theme API is unavailable in an older bundled DPG runtime.
+            log_exception(
+                "Explorer theme warm-up failed during startup",
+                sys.exc_info(), fatal=False)
         # Shared QMainWindow-style docking feedback.  It is built lazily on the
         # first real drag so the native viewport already exists.  A viewport-
         # front drawlist guarantees that sibling child windows cannot cover the
         # preview rectangle.
-        self._dock_drop_preview = DockDropPreview()
+        try:
+            self._dock_drop_preview = DockDropPreview()
+        except Exception:
+            # Dock-drop highlighting is cosmetic.  Older/native DPG builds can
+            # reject a viewport draw-list during early construction; keep the
+            # app usable and simply omit the preview for this session.
+            self._dock_drop_preview = None
+            log_exception(
+                "Dock drop preview initialization failed during startup",
+                sys.exc_info(), fatal=False)
         self.terminal_font = None
+        self._font_database = None
         try:
             terminal_path = (
                 Path(os.environ.get("WINDIR", "C:/Windows"))
                 / "Fonts" / "consola.ttf")
             if terminal_path.is_file():
-                with dpg.font_registry():
-                    self.terminal_font = dpg.add_font(
-                        str(terminal_path), 14)
+                self._font_database = QFontDatabase(parent=self._qapplication)
+                self.terminal_font = self._font_database.addApplicationFont(
+                    terminal_path, 14)
         except Exception:
             self.terminal_font = None
+            self._font_database = None
 
-        # Zero-spacing layout theme for the two file panels.
-        with dpg.theme() as self._panel_layout_theme:
-            with dpg.theme_component(dpg.mvAll):
-                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
-                dpg.add_theme_style(dpg.mvStyleVar_ItemInnerSpacing, 0, 0)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-                dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-                dpg.add_theme_style(dpg.mvStyleVar_CellPadding, 0, 0)
+        # Zero-spacing shell layout is expressed through DearUIQt theme roles;
+        # WinUx no longer depends on renderer style constants here.
+        self._panel_layout_theme = compact_layout_surface_theme()
 
         # One application-wide Dear ImGui theme defines the Qt/Fusion state
         # palette for every control that does not own a more specific theme.
         # This keeps focus/hover/pressed visuals consistent across menu bars,
         # dock controls and ordinary widgets instead of falling back to the
         # stock Dear ImGui palette.
-        self._app_theme = application_theme(dpg)
+        self._app_theme = application_theme()
 
-        # Windows 11 / Qt-like floating dock chrome. The built-in Dear ImGui
-        # resize grip is disabled on detached docks; FloatingWindowResizer
-        # restores native-feeling border/corner resizing without a grip glyph.
-        with dpg.theme() as self._floating_dock_window_theme:
-            with dpg.theme_component(dpg.mvAll):
-                dpg.add_theme_color(dpg.mvThemeCol_Border, QtFusionPalette.BORDER)
-                dpg.add_theme_color(dpg.mvThemeCol_ResizeGrip, (0, 0, 0, 0))
-                dpg.add_theme_color(dpg.mvThemeCol_ResizeGripHovered, (0, 0, 0, 0))
-                dpg.add_theme_color(dpg.mvThemeCol_ResizeGripActive, (0, 0, 0, 0))
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, QtFusionPalette.WINDOW)
-                dpg.add_theme_color(dpg.mvThemeCol_TitleBg, QtFusionPalette.TITLE)
-                dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, QtFusionPalette.TITLE_ACTIVE)
-                dpg.add_theme_color(dpg.mvThemeCol_TitleBgCollapsed, QtFusionPalette.TITLE)
-                dpg.add_theme_color(dpg.mvThemeCol_Text, QtFusionPalette.TEXT)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 1)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowBorderSize, 1)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-                title_align = getattr(dpg, "mvStyleVar_WindowTitleAlign", None)
-                if title_align is not None:
-                    dpg.add_theme_style(title_align, 0.0, 0.5)
+        # Detached dock chrome is owned by DearUIQt; renderer feature probes
+        # (including optional title alignment) stay behind the theme boundary.
+        self._floating_dock_window_theme = floating_window_theme()
 
-        with dpg.window(
-            tag="winux_primary", label="WinUX",
-            no_scrollbar=True, no_scroll_with_mouse=True,
-        ):
-            self.menu_bar = self._build_menu()
+        self.primary_window_tag = "winux_primary"
+        with QMainWindow(
+            "WinUX", width=self.WIDTH, height=self.HEIGHT,
+            tag=self.primary_window_tag, no_scrollbar=True,
+            no_scroll_with_mouse=True) as self._main_window:
+            # Create the menu-bar surface first so it stays above the central
+            # content, but populate actions only after QDockWidget ownership is
+            # established (View -> Console reuses toggleViewAction()).
+            self._menu_bar_wrapper = QMenuBar(
+                parent=self._main_window, height=20)
+            self.menu_bar = self._menu_bar_wrapper.tag
 
             # A single root child owns the complete content area. The top and
             # bottom regions are positioned absolutely inside this root instead
             # of being stacked by Dear PyGui. This prevents a 1-2 px DPI/menu
             # rounding error from increasing the primary window content height
             # and permanently showing its vertical scrollbar.
-            self.layout_root = dpg.add_child_window(
-                width=-1, height=-1, border=False,
+            self._layout_root_frame = QFrame(
+                parent=self._main_window, width=-1, height=-1, frame_shape=QFrame.NoFrame,
                 no_scrollbar=True, no_scroll_with_mouse=True,
             )
+            self.layout_root = self._layout_root_frame.tag
 
             # Local/Server panes are positioned around a real vertical gutter.
             # The gutter is layout space, not an invisible halo over either
             # ListView, matching the QSplitter behavior used elsewhere.
-            self.top_region = dpg.add_child_window(
-                parent=self.layout_root,
-                pos=(0, 0),
-                width=-1, height=476, border=False,
-                no_scrollbar=True, no_scroll_with_mouse=True,
+            self._top_region_frame = QFrame(
+                parent=self._layout_root_frame, pos=(0, 0), width=-1, height=476,
+                frame_shape=QFrame.NoFrame, no_scrollbar=True,
+                no_scroll_with_mouse=True,
             )
+            self.top_region = self._top_region_frame.tag
             # Compatibility marker for code that still inspects the historical
             # table attribute; it no longer participates in layout.
-            self.file_panels_table = dpg.add_group(
-                parent=self.top_region, show=False)
-            self.left_parent = dpg.add_child_window(
-                parent=self.top_region, pos=(0, 0),
-                width=400, height=476, border=False,
-                no_scrollbar=True, no_scroll_with_mouse=True,
+            self._file_panels_compat_layout = QHBoxLayout(
+                parent=self._top_region_frame, show=False)
+            self.file_panels_table = self._file_panels_compat_layout.tag
+            self._left_parent_frame = QFrame(
+                parent=self._top_region_frame, pos=(0, 0), width=400, height=476,
+                frame_shape=QFrame.NoFrame, no_scrollbar=True,
+                no_scroll_with_mouse=True,
             )
-            self.right_parent = dpg.add_child_window(
-                parent=self.top_region, pos=(409, 0),
-                width=400, height=476, border=False,
-                no_scrollbar=True, no_scroll_with_mouse=True,
+            self.left_parent = self._left_parent_frame.tag
+            self._right_parent_frame = QFrame(
+                parent=self._top_region_frame, pos=(409, 0), width=400, height=476,
+                frame_shape=QFrame.NoFrame, no_scrollbar=True,
+                no_scroll_with_mouse=True,
             )
-            self.file_panel_separator = dpg.add_button(
-                parent=self.top_region, label="", pos=(404, 0),
-                width=self.SPLITTER_SIZE, height=476)
-            self.file_panel_separator_hitbox = dpg.add_button(
-                parent=self.top_region, label="", pos=(400, 0),
-                width=self.FILE_PANEL_SPLITTER_GUTTER_SIZE, height=476)
+            self.right_parent = self._right_parent_frame.tag
+            self._file_panel_splitter_handle = QSplitterHandle(
+                Qt.Horizontal, parent=self.top_region,
+                handle_width=self.FILE_PANEL_SPLITTER_GUTTER_SIZE,
+                line_width=self.SPLITTER_SIZE)
+            self._file_panel_splitter_handle.setGeometry(
+                400, 0, self.FILE_PANEL_SPLITTER_GUTTER_SIZE, 476)
+            self.file_panel_separator = self._file_panel_splitter_handle.lineTag()
+            self.file_panel_separator_hitbox = self._file_panel_splitter_handle.hitBoxTag()
 
             # Status text is owned by one fixed strip below both file lists.
             # Panels therefore do not create status children inside their own
             # resizable containers.
+            initial_local_path = safe_current_directory()
             self.left = FilePanel(
                 self.left_parent, "local", callbacks,
-                current_path=Path.cwd(),
-                initial_path_label=str(Path.cwd()),
+                current_path=initial_local_path,
+                initial_path_label=str(initial_local_path),
                 has_status=False,
+                show_hidden_files=self._show_hidden_files,
             )
             self.right = FilePanel(
                 self.right_parent, "server", callbacks,
                 current_path=PurePosixPath("/"),
                 initial_path_label="Log-in", has_status=False,
+                show_hidden_files=self._show_hidden_files,
             )
             self.panels = [self.left, self.right]
 
-            self.file_status_region = dpg.add_child_window(
-                parent=self.layout_root, pos=(0, 476), width=-1,
-                height=self.FILE_STATUS_HEIGHT, border=False,
+            self._file_status_frame = QFrame(
+                parent=self._layout_root_frame, pos=(0, 476), width=-1,
+                height=self.FILE_STATUS_HEIGHT, frame_shape=QFrame.NoFrame,
                 no_scrollbar=True, no_scroll_with_mouse=True,
             )
+            self.file_status_region = self._file_status_frame.tag
             # Use two absolutely positioned status children instead of a
             # second independent table. Their divider is updated from the real
             # Local/Server panel widths, so the Server text never drifts when
             # the upper table divider is resized.
-            self.left_status_window = dpg.add_child_window(
-                parent=self.file_status_region, pos=(0, 0), width=500,
-                height=self.FILE_STATUS_HEIGHT, border=False,
+            self._left_status_frame = QFrame(
+                parent=self._file_status_frame, pos=(0, 0), width=500,
+                height=self.FILE_STATUS_HEIGHT, frame_shape=QFrame.NoFrame,
                 no_scrollbar=True, no_scroll_with_mouse=True,
             )
-            self.right_status_window = dpg.add_child_window(
-                parent=self.file_status_region, pos=(500, 0), width=500,
-                height=self.FILE_STATUS_HEIGHT, border=False,
+            self.left_status_window = self._left_status_frame.tag
+            self._right_status_frame = QFrame(
+                parent=self._file_status_frame, pos=(500, 0), width=500,
+                height=self.FILE_STATUS_HEIGHT, frame_shape=QFrame.NoFrame,
                 no_scrollbar=True, no_scroll_with_mouse=True,
             )
-            dpg.bind_item_theme(self.file_status_region, file_status_bar_theme())
-            dpg.bind_item_theme(self.left_status_window, file_status_bar_theme())
-            dpg.bind_item_theme(self.right_status_window, file_status_bar_theme())
+            self.right_status_window = self._right_status_frame.tag
+            self._file_status_frame.setTheme(file_status_bar_theme())
+            self._left_status_frame.setTheme(file_status_bar_theme())
+            self._right_status_frame.setTheme(file_status_bar_theme())
 
-            def status_separator(parent):
-                return dpg.add_spacer(parent=parent, width=8, height=14)
+            self._left_status_layout = QHBoxLayout(parent=self._left_status_frame, spacing=0)
+            self._left_items_label = QLabel("0 items", parent=self._left_status_layout)
+            left_items = self._left_items_label.tag
+            self._left_items_label.setTheme(file_status_text_theme())
+            self._left_status_spacer = QSpacer(8, 14, parent=self._left_status_layout)
+            self._left_selected_label = QLabel("0 selected", parent=self._left_status_layout)
+            left_selected = self._left_selected_label.tag
+            self._left_selected_label.setTheme(file_status_text_theme(muted=True))
 
-            with dpg.group(parent=self.left_status_window, horizontal=True) as left_status_group:
-                left_items = dpg.add_text("0 items")
-                dpg.bind_item_theme(left_items, file_status_text_theme())
-                status_separator(left_status_group)
-                left_selected = dpg.add_text("0 selected")
-                dpg.bind_item_theme(left_selected, file_status_text_theme(muted=True))
-            with dpg.group(parent=self.right_status_window, horizontal=True) as right_status_group:
-                right_items = dpg.add_text("Not connected")
-                dpg.bind_item_theme(right_items, file_status_text_theme())
-                status_separator(right_status_group)
-                right_selected = dpg.add_text("0 selected")
-                dpg.bind_item_theme(right_selected, file_status_text_theme(muted=True))
+            self._right_status_layout = QHBoxLayout(parent=self._right_status_frame, spacing=0)
+            self._right_items_label = QLabel("Not connected", parent=self._right_status_layout)
+            right_items = self._right_items_label.tag
+            self._right_items_label.setTheme(file_status_text_theme())
+            self._right_status_spacer = QSpacer(8, 14, parent=self._right_status_layout)
+            self._right_selected_label = QLabel("0 selected", parent=self._right_status_layout)
+            right_selected = self._right_selected_label.tag
+            self._right_selected_label.setTheme(file_status_text_theme(muted=True))
             self.left.attach_external_status(left_items, left_selected)
             self.right.attach_external_status(right_items, right_selected)
 
-            self.bottom_region = dpg.add_child_window(
-                parent=self.layout_root,
-                pos=(0, 508),
-                width=-1, height=-1, border=False,
-                no_scrollbar=True, no_scroll_with_mouse=True,
+            self._bottom_region_frame = QFrame(
+                parent=self._layout_root_frame, pos=(0, 508), width=-1, height=-1,
+                frame_shape=QFrame.NoFrame, no_scrollbar=True,
+                no_scroll_with_mouse=True,
             )
+            self.bottom_region = self._bottom_region_frame.tag
             self.jobs_view = JobsView(self.bottom_region, callbacks)
             self.job_plot_windows = {}
             self.job_plot_float_windows = {}
@@ -410,12 +553,13 @@ class WinUXView(
             # transparent hitbox so it remains easy to drag.
             # Create the plot content first and the splitter controls after it
             # so the transparent grab strip stays above both lower panes.
-            self.plot_region = dpg.add_child_window(
-                parent=self.layout_root, pos=(0, 0), width=1, height=1,
-                border=False, no_scrollbar=True, no_scroll_with_mouse=True,
-                show=False,
+            self._plot_region_frame = QFrame(
+                parent=self._layout_root_frame, pos=(0, 0), width=1, height=1,
+                frame_shape=QFrame.NoFrame, no_scrollbar=True,
+                no_scroll_with_mouse=True, show=False,
             )
-            dpg.bind_item_theme(self.plot_region, self._panel_layout_theme)
+            self.plot_region = self._plot_region_frame.tag
+            self._plot_region_frame.setTheme(self._panel_layout_theme)
             self.plot_dock_manager = DockManager(
                 self.plot_region,
                 dock_area=self._plot_dock_area,
@@ -428,12 +572,13 @@ class WinUXView(
             # always docked below the shared Job Viewer / Plots workspace and
             # starts hidden on a fresh profile.  Visibility is restored from
             # the per-user settings document on subsequent launches.
-            self.console_region = dpg.add_child_window(
-                parent=self.layout_root, pos=(0, 0), width=1, height=1,
-                border=False, no_scrollbar=True, no_scroll_with_mouse=True,
-                show=self._console_dock_visible,
+            self._console_region_frame = QFrame(
+                parent=self._layout_root_frame, pos=(0, 0), width=1, height=1,
+                frame_shape=QFrame.NoFrame, no_scrollbar=True,
+                no_scroll_with_mouse=True, show=self._console_dock_visible,
             )
-            dpg.bind_item_theme(self.console_region, self._panel_layout_theme)
+            self.console_region = self._console_region_frame.tag
+            self._console_region_frame.setTheme(self._panel_layout_theme)
             self.console_dock = DockWidget(
                 self.console_region,
                 "SSH Console",
@@ -443,6 +588,9 @@ class WinUXView(
                 features=DockWidget.AllDockWidgetFeatures,
                 dock_area="bottom",
                 allowed_areas=DockWidget.BottomDockWidgetArea,
+                on_visibility_change=lambda visible: self.set_console_visible(
+                    visible, persist=True, request_login=bool(visible)),
+                visible=self._console_dock_visible,
             )
             self.console_panel = ConsoleDockPanel(
                 self, self.console_dock.content,
@@ -451,39 +599,36 @@ class WinUXView(
                 self.callbacks["console_interrupt"],
                 lambda message: self.after(
                     0, self.show_error, "SSH Console", message),
+                completion_callback=self.callbacks.get("console_complete"),
+                completion_list_callback=self.callbacks.get("console_completion_list"),
             )
+            self._build_menu()
             # QDockWidget title dragging is a host operation because the live
             # dock root must be reparented into a top-level tool window.  Keep
             # the handler global (as DPG requires for mouse drag/release) but
             # start a tear-off only while the Console title handle owns the
             # press.
-            with dpg.handler_registry() as self._console_dock_drag_registry:
-                dpg.add_mouse_drag_handler(
-                    button=dpg.mvMouseButton_Left, threshold=8.0,
-                    callback=self._on_console_dock_header_drag)
-                dpg.add_mouse_release_handler(
-                    button=dpg.mvMouseButton_Left,
-                    callback=self._on_console_dock_header_drag_release)
-            self.console_separator = dpg.add_button(
-                parent=self.layout_root, label="", pos=(0, 0), width=1,
-                height=self.CONSOLE_DOCK_SEPARATOR_SIZE,
-                show=self._console_dock_visible,
+            self._console_dock_drag_registry = (
+                QGlobalInputBinding(parent=self._qapplication)
+                .onMouseDrag(
+                    Qt.LeftButton, self._on_console_dock_header_drag, threshold=8.0)
+                .onMouseRelease(
+                    Qt.LeftButton, self._on_console_dock_header_drag_release)
+                .activate()
             )
-            self.console_separator_hitbox = dpg.add_button(
-                parent=self.layout_root, label="", pos=(0, 0), width=1,
-                height=self.CONSOLE_DOCK_SPLITTER_GUTTER_SIZE,
-                show=self._console_dock_visible,
-            )
-            self.job_plot_separator = dpg.add_button(
-                parent=self.layout_root, label="", pos=(0, 0),
-                width=self.PLOT_DOCK_SEPARATOR_SIZE, height=1, show=False,
-            )
-            self.job_plot_separator_hitbox = dpg.add_button(
-                parent=self.layout_root, label="", pos=(0, 0),
-                width=(self.PLOT_DOCK_SEPARATOR_SIZE
-                       + 2 * self.SPLITTER_HIT_PADDING),
-                height=1, show=False,
-            )
+            self._console_splitter_handle = QSplitterHandle(
+                Qt.Vertical, parent=self.layout_root,
+                handle_width=self.CONSOLE_DOCK_SPLITTER_GUTTER_SIZE,
+                line_width=self.CONSOLE_DOCK_SEPARATOR_SIZE,
+                visible=self._console_dock_visible)
+            self.console_separator = self._console_splitter_handle.lineTag()
+            self.console_separator_hitbox = self._console_splitter_handle.hitBoxTag()
+            self._job_plot_splitter_handle = QSplitterHandle(
+                Qt.Horizontal, parent=self.layout_root,
+                handle_width=self.PLOT_DOCK_SEPARATOR_SIZE,
+                line_width=self.SPLITTER_SIZE, visible=False)
+            self.job_plot_separator = self._job_plot_splitter_handle.lineTag()
+            self.job_plot_separator_hitbox = self._job_plot_splitter_handle.hitBoxTag()
 
             # File/Job Viewer splitter gets its own real gutter instead of
             # overlapping the Job Viewer header with an invisible 37px halo.
@@ -494,16 +639,20 @@ class WinUXView(
                 splitter_gutter_y
                 + (self.FILE_JOB_SPLITTER_GUTTER_SIZE - self.SPLITTER_SIZE) // 2
             )
-            self.horizontal_splitter = dpg.add_button(
-                parent=self.layout_root, label="",
-                # The first dynamic layout pass will replace this position.
-                pos=(0, splitter_line_y),
-                width=-1, height=self.SPLITTER_SIZE,
-            )
-            self.horizontal_splitter_hitbox = dpg.add_button(
-                parent=self.layout_root, label="",
-                pos=(0, splitter_gutter_y),
-                width=-1, height=self.FILE_JOB_SPLITTER_GUTTER_SIZE,
+            self._horizontal_splitter_handle = QSplitterHandle(
+                Qt.Vertical, parent=self.layout_root,
+                handle_width=self.FILE_JOB_SPLITTER_GUTTER_SIZE,
+                line_width=self.SPLITTER_SIZE)
+            # The first dynamic layout pass will replace this geometry.
+            self._horizontal_splitter_handle.setGeometry(
+                0, splitter_gutter_y, -1, self.FILE_JOB_SPLITTER_GUTTER_SIZE)
+            self.horizontal_splitter = self._horizontal_splitter_handle.lineTag()
+            self.horizontal_splitter_hitbox = self._horizontal_splitter_handle.hitBoxTag()
+            self._horizontal_splitter_handlers = (
+                QItemInputBinding(
+                    self.horizontal_splitter_hitbox, parent=self._main_window)
+                .onClick(Qt.LeftButton, self._on_horizontal_splitter_pressed)
+                .activate()
             )
             # Retain the old attribute for callers created against earlier
             # builds while using the orientation-correct name internally.
@@ -511,17 +660,17 @@ class WinUXView(
             # Shared QSplitter chrome: one painted pixel and a separate
             # transparent grab gutter.  Hover/drag feedback changes only the
             # line colour, never the layout thickness.
-            self._splitter_theme = splitter_theme(dpg, active=False)
-            self._plot_splitter_hover_theme = splitter_theme(dpg, active=True)
+            self._splitter_theme = splitter_theme(active=False)
+            self._plot_splitter_hover_theme = splitter_theme(active=True)
             for item in (self.horizontal_splitter, self.file_panel_separator,
                          self.job_plot_separator, self.console_separator):
-                dpg.bind_item_theme(item, self._splitter_theme)
-            self._splitter_hitbox_theme = splitter_hitbox_theme(dpg)
+                QRetainedItem(item).setTheme(self._splitter_theme)
+            self._splitter_hitbox_theme = splitter_hitbox_theme()
             for hitbox in (self.horizontal_splitter_hitbox,
                            self.file_panel_separator_hitbox,
                            self.job_plot_separator_hitbox,
                            self.console_separator_hitbox):
-                dpg.bind_item_theme(hitbox, self._splitter_hitbox_theme)
+                QRetainedItem(hitbox).setTheme(self._splitter_hitbox_theme)
 
             # Dock feedback is rendered by the shared viewport-front
             # DockDropPreview.  Keep compatibility attributes for integrations
@@ -552,8 +701,8 @@ class WinUXView(
             self.plot_region,
             self.console_region,
         ):
-            dpg.bind_item_theme(item, self._panel_layout_theme)
-        dpg.bind_item_theme("winux_primary", self._app_theme)
+            QRetainedItem(item).setTheme(self._panel_layout_theme)
+        self._main_window.setTheme(self._app_theme)
 
         # Do not let the native X button terminate the render loop before the
         # controller has shown and resolved a pending-schedule warning.
@@ -572,32 +721,58 @@ class WinUXView(
                 large_icon=str(app_icon),
             )
         try:
-            dpg.create_viewport(**viewport_options)
+            self._gui_runtime.createViewport(**viewport_options)
         except TypeError:
             viewport_options.pop("small_icon", None)
             viewport_options.pop("large_icon", None)
-            dpg.create_viewport(**viewport_options)
-        dpg.setup_dearpygui()
-        dpg.set_primary_window("winux_primary", True)
-        dpg.set_exit_callback(self._request_close)
-        dpg.set_viewport_resize_callback(self._on_viewport_resize)
+            self._gui_runtime.createViewport(**viewport_options)
+        self._gui_runtime.setup()
+        self._gui_runtime.setPrimaryWindow("winux_primary", True)
+        self._gui_runtime.setExitCallback(self._request_close)
+        self._gui_runtime.setViewportResizeCallback(self._on_viewport_resize)
         ExplorerListView._external_cursor_provider = (
             self._splitter_native_cursor_provider)
 
         # Start hang detection only after native/Dear PyGui construction has
-        # completed.  Slow first-time imports must not be reported as a UI hang.
-        self._watchdog = UIHangWatchdog()
-        self._watchdog.add_snapshot_provider(
-            "ui_dispatcher", self._dispatcher.snapshot)
+        # completed.  It is diagnostics only: thread creation/security-policy
+        # failures must never prevent the main viewport from opening.
+        try:
+            self._watchdog = UIHangWatchdog()
+            self._watchdog.add_snapshot_provider(
+                "ui_dispatcher", self._dispatcher.snapshot)
+        except Exception:
+            self._watchdog = None
+            log_exception(
+                "UI hang watchdog could not start",
+                sys.exc_info(), fatal=False)
 
-        # Start floating-dialog workers as soon as the main DPG context is
-        # ready.  The old path waited until after the viewport had already been
-        # shown and rendered two frames, so an early Settings/Login/etc. click
-        # frequently missed the warm pool and paid a full ``abaqus python``
-        # process launch.  Preparation is asynchronous and never blocks this
-        # constructor or the main UI thread.
-        from .dialogs.prewarm_pool import start_dialog_prewarm
-        start_dialog_prewarm(self)
+        # One explicitly retained native transfer window, prepared after the
+        # main UI is usable. No filesystem/network enumeration is performed.
+        if self._native_dialogs:
+            # Build the two reference tools hidden before the main viewport is
+            # exposed. Menu clicks then only show retained native widgets.
+            try:
+                self._prepare_native_reference_tools()
+            except Exception:
+                # Optional tool preparation must not prevent the file/job
+                # workspace from opening. Its normal menu route can retry.
+                log_exception("Native reference tool preparation failed during startup", sys.exc_info(), fatal=False)
+        self.after(1200, self._prewarm_transfer_center)
+        # Warm Python dialog classes only after the main viewport is usable.
+        # One import is resolved per GUI turn so first-click latency is paid
+        # during idle time without a startup import burst or extra thread/process.
+        self.after(1450, self._prewarm_inprocess_dialog_imports)
+        self.after(1750, self._prewarm_retained_dialog_shells)
+
+    def _prepare_native_reference_tools(self):
+        from .dialogs.native_reference_tools import ReferenceChartDialog, PlotDigitizerDialog
+        library = PlotDockingMixin._get_reference_chart_library(self)
+        # Preconstruct only the bounded empty editor shell. Restoring a saved
+        # dataset belongs to its menu session, never the main-window constructor.
+        self._reference_chart_dialog = ReferenceChartDialog(self, [], lambda _result: None)
+        self._reference_chart_dialog.hide()
+        self._plot_digitizer_dialog = PlotDigitizerDialog(self, reference_library=library)
+        self._plot_digitizer_dialog.hide()
 
 
     def _find_main_viewport_hwnd(self):
@@ -781,104 +956,125 @@ class WinUXView(
 
 
     def _build_menu(self):
-        """Build native roots with icons on the command items only."""
-        with dpg.menu_bar() as menu_bar:
-            with dpg.menu(label="File") as file_menu:
-                self._add_icon_menu_item(
-                    file_menu, "Log-In...", "Login", self.show_login)
-                self._add_icon_menu_item(
-                    file_menu, "Site Manager...", "Login",
-                    lambda: self.callbacks["site_manager"]())
-                self._add_icon_menu_item(
-                    file_menu, "Settings...", "Settings", self.show_settings)
-                dpg.add_separator(parent=file_menu)
-                self._add_icon_menu_item(
-                    file_menu, "Exit", "Exit", self._request_close)
+        """Build the application QMenuBar using DearUIQt popup ownership.
 
-            with dpg.menu(label="Bookmarks") as bookmarks_menu:
-                self._add_icon_menu_item(
-                    bookmarks_menu, "Add Local Folder", "Folder",
-                    lambda: self.callbacks["bookmark_command"]("add_local"))
-                self._add_icon_menu_item(
-                    bookmarks_menu, "Add Server Folder", "Folder",
-                    lambda: self.callbacks["bookmark_command"]("add_server"))
-                dpg.add_separator(parent=bookmarks_menu)
-                self._add_icon_menu_item(
-                    bookmarks_menu, "Manage Bookmarks...", "Open_Folder",
-                    lambda: self.callbacks["bookmark_command"]("manage"))
+        Dear PyGui's native ``dpg.menu`` popup is visually correct, but it is
+        invisible to DearUIQt's application pointer grab. Explorer and splitter
+        code intentionally perform geometry-based/global pointer polling, so a
+        native menu can appear above them while they still react to the same
+        mouse position.  A retained QMenuBar/QMenu stack gives the menu Qt-like
+        popup semantics: while a menu is open the application body is logically
+        pointer-blocked by QApplication/input_gate without a visual overlay.
+        """
+        menu_bar = getattr(self, "_menu_bar_wrapper", None)
+        if menu_bar is None:
+            menu_bar = QMenuBar(
+                parent=getattr(self, "_main_window", None), height=20)
+            self._menu_bar_wrapper = menu_bar
 
-            with dpg.menu(label="Commands") as commands_menu:
-                self._add_icon_menu_item(
-                    commands_menu, "Synchronize Preview...", "Refresh",
-                    lambda: self.callbacks["sync_preview"]())
+        def action(label, icon_name, callback, *, checkable=False, checked=False):
+            item = QAction(
+                label, menu_bar, checkable=bool(checkable), checked=bool(checked))
+            texture = ResourceTextures.get(icon_name) if icon_name else None
+            if texture:
+                item.setIcon(texture)
+            if checkable:
+                item.toggled.connect(
+                    lambda value, cb=callback: cb(bool(value)))
+            else:
+                item.triggered.connect(
+                    lambda _checked=False, cb=callback: cb())
+            return item
 
-            with dpg.menu(label="View") as view_menu:
-                self.console_menu_item = self._add_icon_toggle_menu_item(
-                    view_menu, "Console", "CommandWindow",
-                    self._console_dock_visible, self._console_menu_toggled)
-                self._add_icon_menu_item(
-                    view_menu, "Transfer Center", "Download",
-                    self.show_transfer_center)
-                dpg.add_separator(parent=view_menu)
-                self._add_icon_menu_item(
-                    view_menu, "Job Schedule", "JobViewer",
-                    self.show_job_schedule)
+        separator = lambda key: {
+            "id": "separator_{}".format(key), "label": "---",
+            "separator": True, "action": "separator_{}".format(key),
+        }
 
-            with dpg.menu(label="Help") as help_menu:
-                self._add_icon_menu_item(
-                    help_menu, "Manual", "Question", self.show_manual)
-                self._add_icon_menu_item(
-                    help_menu, "Diagnostics...", "Information",
-                    self.show_diagnostics)
-                dpg.add_separator(parent=help_menu)
-                self._add_icon_menu_item(
-                    help_menu, "About Winux", "Information",
-                    self.show_about)
-        # Dear ImGui owns the menus, but explicitly restore the roomy WinUx/
-        # WinSCP-era density.  Leaving this unbound inherits the app-wide compact
-        # ItemSpacing and produces the cramped "FileBookmarksCommands" look.
-        menu_theme = resource_menu_theme()
-        dpg.bind_item_theme(menu_bar, menu_theme)
-        for root_menu in (file_menu, bookmarks_menu, commands_menu, view_menu, help_menu):
-            dpg.bind_item_theme(root_menu, menu_theme)
-        return menu_bar
+        menu_bar.addMenu("File", [
+            action("Log-In...", "Login", self.show_login),
+            action("Site Manager...", "Login",
+                   lambda: self.callbacks["site_manager"]()),
+            action("Settings...", "Settings", self.show_settings),
+            separator("file_1"),
+            action("Exit", "Exit", self._request_close),
+        ])
+
+        menu_bar.addMenu("Bookmarks", [
+            action("Add Local Folder", "Folder",
+                   lambda: self.callbacks["bookmark_command"]("add_local")),
+            action("Add Server Folder", "Folder",
+                   lambda: self.callbacks["bookmark_command"]("add_server")),
+            separator("bookmarks_1"),
+            action("Manage Bookmarks...", "Open_Folder",
+                   lambda: self.callbacks["bookmark_command"]("manage")),
+        ])
+
+        menu_bar.addMenu("Commands", [
+            action("Synchronize Preview...", "Refresh",
+                   lambda: self.callbacks["sync_preview"]()),
+        ])
+
+        menu_bar.addMenu("Reference", [
+            action("Chart...", "JobViewer", self._show_reference_chart_dialog),
+            action("Plot Digitizer...", "JobViewer",
+                   self._show_plot_digitizer_dialog),
+        ])
+
+        # QDockWidget owns its persistent toggleViewAction(). Reuse that exact
+        # QAction in View instead of mirroring dock visibility in a second
+        # action, matching QMainWindow/QDockWidget ownership semantics.
+        console_action = self.console_dock.toggleViewAction()
+        console_action.setText("Console")
+        console_texture = ResourceTextures.get("CommandWindow")
+        if console_texture:
+            console_action.setIcon(console_texture)
+        self.console_menu_item = console_action
+        menu_bar.addMenu("View", [
+            console_action,
+            action("Transfer Center", "Download", self.show_transfer_center),
+            separator("view_1"),
+            action("Job Schedule", "JobViewer", self.show_job_schedule),
+        ])
+
+        menu_bar.addMenu("Help", [
+            action("Manual", "Question", self.show_manual),
+            action("Diagnostics...", "Information", self.show_diagnostics),
+            separator("help_1"),
+            action("About Winux", "Information", self.show_about),
+        ])
+        return menu_bar.tag
 
     @staticmethod
     def _add_icon_menu_item(parent, label, icon_name, callback):
         """Add one fixed-width menu command with a context-menu-sized icon."""
-        with dpg.group(
-                parent=parent, horizontal=True, horizontal_spacing=7):
-            texture = ResourceTextures.get(icon_name)
-            if texture:
-                dpg.add_image(
-                    texture, width=18, height=18, track_offset=0.5)
-            else:
-                dpg.add_spacer(width=18, height=18)
-            # A native menu item sizes itself from its content over successive
-            # frames when it shares a row with another widget. An explicitly
-            # sized selectable gives the popup its final width immediately.
-            return dpg.add_selectable(
-                label=label,
-                width=188,
-                callback=WinUXView._run_icon_menu_item,
-                user_data=callback,
-            )
+        row = QHBoxLayout(parent=parent, spacing=7)
+        texture = ResourceTextures.get(icon_name)
+        if texture:
+            QImageView(texture, parent=row, width=18, height=18)
+        else:
+            QSpacer(width=18, height=18, parent=row)
+        button = QToolButton(
+            label, parent=row, width=188, height=23, auto_raise=True)
+        button.clicked.connect(
+            lambda: callback() if callable(callback) else None)
+        return button.tag
 
     @staticmethod
     def _add_icon_toggle_menu_item(parent, label, icon_name, checked, callback):
-        with dpg.group(
-                parent=parent, horizontal=True, horizontal_spacing=7):
-            texture = ResourceTextures.get(icon_name)
-            if texture:
-                dpg.add_image(
-                    texture, width=18, height=18, track_offset=0.5)
-            else:
-                dpg.add_spacer(width=18, height=18)
-            return dpg.add_selectable(
-                label=label, width=188, default_value=bool(checked),
-                callback=WinUXView._run_icon_toggle_menu_item,
-                user_data=callback,
-            )
+        row = QHBoxLayout(parent=parent, spacing=7)
+        texture = ResourceTextures.get(icon_name)
+        if texture:
+            QImageView(texture, parent=row, width=18, height=18)
+        else:
+            QSpacer(width=18, height=18, parent=row)
+        button = QToolButton(
+            label, parent=row, width=188, height=23, auto_raise=True)
+        button.setCheckable(True)
+        button.setChecked(bool(checked))
+        button.toggled.connect(
+            lambda value: callback(bool(value)) if callable(callback) else None)
+        return button.tag
 
     @staticmethod
     def _run_icon_toggle_menu_item(sender=None, app_data=None, user_data=None):
@@ -887,11 +1083,11 @@ class WinUXView(
 
     @staticmethod
     def _run_icon_menu_item(sender=None, app_data=None, user_data=None):
-        # Selectables close menu popups by default. Reset their stored state so
-        # the command is not still highlighted when the menu is opened again.
+        # Legacy retained commands may preserve a selected value after a popup
+        # closes. Keep the reset behind DearUIQt rather than the renderer API.
         if sender is not None:
             try:
-                dpg.set_value(sender, False)
+                QRetainedItem(sender).setValue(False)
             except Exception:
                 pass
         if callable(user_data):
@@ -918,14 +1114,14 @@ class WinUXView(
     def run(self):
         log_event("Dear PyGui viewport startup began")
         try:
-            dpg.show_viewport()
+            self._gui_runtime.show()
             log_event("Dear PyGui viewport shown")
 
             # Dear PyGui does not know the final native client/content
             # dimensions until at least one frame has been rendered. Applying
             # the layout before that first frame uses provisional sizes.
-            if dpg.is_dearpygui_running():
-                dpg.render_dearpygui_frame()
+            if self._gui_runtime.isRunning():
+                self._gui_runtime.renderFrame()
             log_event("Dear PyGui first frame rendered")
 
             self._pending_viewport_size = None
@@ -933,14 +1129,24 @@ class WinUXView(
             self._layout_dirty = True
             self._apply_split_layout(force=True)
 
-            # Commit the fitted dimensions before normal event processing.
-            if dpg.is_dearpygui_running():
-                dpg.render_dearpygui_frame()
+            # Commit fitted dimensions before entering normal event processing.
+            if self._gui_runtime.isRunning():
+                self._gui_runtime.renderFrame()
 
             log_event("Dear PyGui render loop started")
-            # Floating-dialog prewarm starts during view construction, before
-            # the first visible interaction can request a dialog.
-            while dpg.is_dearpygui_running() and self._alive:
+            # Querying the native context can itself fail if GLFW/DPG was torn
+            # down asynchronously by the host. Treat that as an orderly loop
+            # termination instead of letting a Python exception escape run().
+            while self._alive:
+                try:
+                    running = bool(self._gui_runtime.isRunning())
+                except Exception:
+                    log_exception(
+                        "Dear PyGui running-state query failed",
+                        sys.exc_info(), fatal=False)
+                    break
+                if not running:
+                    break
                 self.update()
 
             reason = (
@@ -955,8 +1161,8 @@ class WinUXView(
             self._dispatcher.close()
             self._destroy_components()
             try:
-                if dpg.is_dearpygui_running():
-                    dpg.stop_dearpygui()
+                if self._gui_runtime.isRunning():
+                    self._gui_runtime.stop()
             except Exception:
                 log_exception(
                     "Failed to stop Dear PyGui during cleanup",
@@ -978,7 +1184,7 @@ class WinUXView(
                     fatal=False,
                 )
             try:
-                dpg.destroy_context()
+                self._gui_runtime.destroy()
                 log_event("Dear PyGui context destroyed")
             except Exception:
                 log_exception(
@@ -990,92 +1196,172 @@ class WinUXView(
     def mainloop(self):
         self.run()
 
+    def apply_general_preferences(self, values=None):
+        values = self._general_preferences.load() if values is None else values
+        self._show_hidden_files = bool(values.get("show_hidden_files", False))
+        for panel in self.panels:
+            panel.set_show_hidden_files(self._show_hidden_files)
+
+    def _safe_frame_step(self, name, callback, *args, **kwargs):
+        """Run one non-critical per-frame UI step without killing the app.
+
+        Docking, splitters, cursor feedback and retained-list geometry all
+        reference items whose lifetime can end between callbacks.  A single
+        stale tag should degrade one interaction, not terminate WinUx.  Errors
+        are retried on later frames and logged at most once every 15 seconds
+        per step to avoid a failing optional visual path flooding the logs.
+        """
+        default = kwargs.pop("default", None)
+        try:
+            result = callback(*args, **kwargs)
+        except Exception:
+            now = time.monotonic()
+            state = self._frame_step_errors.get(name)
+            last_log = state[0] if state else 0.0
+            failures = (state[1] if state else 0) + 1
+            if not state or now - last_log >= 15.0:
+                log_exception(
+                    "Non-fatal UI frame step failed: {}".format(name),
+                    sys.exc_info(), fatal=False)
+                last_log = now
+            self._frame_step_errors[name] = (last_log, failures)
+            return default
+        else:
+            self._frame_step_errors.pop(name, None)
+            return result
+
     def update(self):
         if self._watchdog is not None:
-            self._watchdog.beat()
+            self._safe_frame_step("watchdog heartbeat", self._watchdog.beat)
 
-        # Native dialogs do not belong to Dear PyGui's item tree.  Treat them
-        # as a real Qt foreground surface: a modal blocks the complete parent;
-        # a modeless/tool window blocks the covered screen region.  Clear any
-        # DPG pointer grab that was active before the native window appeared.
-        native_input_blocked = native_background_input_blocked()
+        # Native dialogs do not belong to Dear PyGui's item tree. Treat them
+        # as a real Qt foreground surface, but do not let a transient native
+        # focus/query failure terminate the entire render loop.
+        native_input_blocked = bool(self._safe_frame_step(
+            "native input gate", native_background_input_blocked,
+            default=False))
         if native_input_blocked:
-            release_pointer_input()
-            self._drain_dpg_callbacks(discard=True)
+            self._safe_frame_step(
+                "cancel splitter interactions", self._cancel_splitter_interactions)
+            self._safe_frame_step(
+                "release pointer input", release_pointer_input)
+            self._safe_frame_step(
+                "discard blocked DPG callbacks", self._drain_dpg_callbacks,
+                True)
         else:
             # Splitter arbitration must happen before Dear PyGui's global
             # ListView callbacks are drained; otherwise the same physical press
             # can become both a divider resize and a file drag/drop.
-            self._pre_dispatch_splitter_input()
-            self._drain_dpg_callbacks()
-            self._update_file_panel_splitter_input()
+            self._safe_frame_step(
+                "pre-dispatch splitter input", self._pre_dispatch_splitter_input)
+            self._safe_frame_step(
+                "DPG callback dispatch", self._drain_dpg_callbacks)
+            self._safe_frame_step(
+                "file panel splitter input", self._update_file_panel_splitter_input)
         if not self._alive:
             return
         if self._console_native_wndproc_callback is None:
-            self._install_console_character_hook()
-        self._drain_queue()
+            self._safe_frame_step(
+                "console character hook", self._install_console_character_hook)
+        self._safe_frame_step("UI dispatcher drain", self._drain_queue)
         if not self._alive:
             return
         if self._startup_layout_frames > 0:
             self._startup_layout_frames -= 1
             self._layout_dirty = True
-            self._apply_split_layout(force=True)
+            self._safe_frame_step(
+                "startup split layout", self._apply_split_layout, force=True)
         elif self._layout_dirty:
-            self._apply_split_layout()
+            self._safe_frame_step("split layout", self._apply_split_layout)
         if not native_input_blocked:
             # QTabBar-like drag/reorder must claim the pointer before splitters
             # or Explorer panes poll global mouse state, otherwise a tab tear-
             # off can simultaneously resize/select widgets underneath it.
             dock_manager = getattr(self, "plot_dock_manager", None)
             if dock_manager is not None:
-                dock_manager.update_interaction()
-            # Border/corner resizing claims the pointer before splitters poll
-            # the global mouse state, matching native Qt mouse-grab behaviour.
-            self._update_floating_plot_resize_interaction()
-            self._update_floating_console_resize_interaction()
-            self._update_horizontal_splitter_input()
-            self._update_job_plot_splitter_input()
-            self._update_console_splitter_input()
-            self._update_floating_plot_docking()
-            self._update_floating_console_docking()
+                self._safe_frame_step(
+                    "dock manager interaction", dock_manager.update_interaction)
+            # All of these paths are interaction polish around transient DPG
+            # items.  A stale tag after close/dock/resize is recoverable on the
+            # next frame and must not be fatal to the application.
+            for name, callback in (
+                ("floating plot resize", self._update_floating_plot_resize_interaction),
+                ("floating console resize", self._update_floating_console_resize_interaction),
+                ("horizontal splitter input", self._update_horizontal_splitter_input),
+                ("job plot splitter input", self._update_job_plot_splitter_input),
+                ("console splitter input", self._update_console_splitter_input),
+                ("floating plot docking", self._update_floating_plot_docking),
+                ("floating console docking", self._update_floating_console_docking),
+            ):
+                self._safe_frame_step(name, callback)
             # Inline rename focus/selection cannot depend on per-ListView frame
             # callbacks: Dear PyGui provides only one callback slot per frame.
-            for panel in self.panels:
-                panel.listview._process_inline_rename_focus()
-        self._sync_job_plot_windows()
-        self._sync_horizontal_panel_divider()
-        if dpg.is_dearpygui_running():
+            for index, panel in enumerate(tuple(self.panels)):
+                self._safe_frame_step(
+                    "inline rename focus {}".format(index),
+                    panel.listview._process_inline_rename_focus)
+        self._safe_frame_step("job plot window sync", self._sync_job_plot_windows)
+        self._safe_frame_step(
+            "horizontal panel divider sync", self._sync_horizontal_panel_divider)
+
+        # Rendering itself is intentionally still a hard boundary. If native
+        # Dear PyGui cannot render a frame, continuing to call into that context
+        # can cause an access violation; let the outer crash logger own that
+        # exceptional case instead of spinning on an invalid context.
+        running = False
+        try:
+            running = bool(self._gui_runtime.isRunning())
+        except Exception:
+            log_exception(
+                "Dear PyGui running-state query failed during frame",
+                sys.exc_info(), fatal=False)
+            self._alive = False
+        if running:
             self._rendering = True
             try:
-                dpg.render_dearpygui_frame()
+                self._gui_runtime.renderFrame()
             finally:
                 self._rendering = False
                 self._render_generation += 1
             # Use freshly rendered geometry and service deferred layouts here.
-            # DPG only has one frame-callback slot: a replaced callback must
-            # not leave column/canvas sizes stale and hide overflow scrollers.
-            for listview in [panel.listview for panel in self.panels] + [self.jobs_view.listview]:
-                if listview._resize_layout_pending:
-                    listview._layout_all()
+            # Stale list/scroller resources can be recreated next frame, so
+            # isolate them from the native render-loop lifetime.
+            listviews = [panel.listview for panel in tuple(self.panels)]
+            jobs_view = getattr(getattr(self, "jobs_view", None), "listview", None)
+            if jobs_view is not None:
+                listviews.append(jobs_view)
+            for index, listview in enumerate(listviews):
+                if getattr(listview, "_resize_layout_pending", False):
+                    self._safe_frame_step(
+                        "list layout {}".format(index), listview._layout_all)
                 overlay = getattr(listview, "_scroller_arrow_overlay", None)
                 if overlay is not None:
-                    overlay.update()
-            self._drain_after_render_callbacks()
+                    self._safe_frame_step(
+                        "scroller overlay {}".format(index), overlay.update)
+            self._safe_frame_step(
+                "after-render callbacks", self._drain_after_render_callbacks)
         # GLFW may restore its arrow cursor while rendering. Apply splitter
         # feedback only when Dear PyGui owns pointer input; otherwise the
         # foreground native dialog is authoritative for cursor feedback.
         if not native_input_blocked:
-            self._update_file_panel_splitter_cursor()
-            self._update_horizontal_splitter_cursor()
-            self._update_job_plot_splitter_cursor()
-            self._update_console_splitter_cursor()
-            self._apply_floating_plot_resize_cursor()
+            for name, callback in (
+                ("file splitter cursor", self._update_file_panel_splitter_cursor),
+                ("horizontal splitter cursor", self._update_horizontal_splitter_cursor),
+                ("job plot splitter cursor", self._update_job_plot_splitter_cursor),
+                ("console splitter cursor", self._update_console_splitter_cursor),
+                ("floating plot resize cursor", self._apply_floating_plot_resize_cursor),
+            ):
+                self._safe_frame_step(name, callback)
         if self._watchdog is not None:
-            self._watchdog.beat()
+            self._safe_frame_step("watchdog heartbeat", self._watchdog.beat)
 
 
     def after(self, delay, callback, *args):
         return self._dispatcher.after(delay, callback, *args)
+
+    def after_cancel(self, token):
+        """Cancel a delayed GUI callback, matching Qt/Tk host scheduler APIs."""
+        return self._dispatcher.after_cancel(token)
 
     def after_render(self, callback, *args):
         """Run a callback after at least one future Dear PyGui frame.
@@ -1097,15 +1383,9 @@ class WinUXView(
     def _drain_after_render_callbacks(self):
         if not self._after_render_callbacks:
             return
-        ready = []
-        pending = []
-        for generation, callback, args in self._after_render_callbacks:
-            if generation <= self._render_generation:
-                ready.append((callback, args))
-            else:
-                pending.append((generation, callback, args))
-        self._after_render_callbacks = pending
-        for callback, args in ready:
+        while (self._after_render_callbacks and
+               self._after_render_callbacks[0][0] <= self._render_generation):
+            _generation, callback, args = self._after_render_callbacks.popleft()
             try:
                 callback(*args)
             except Exception:
@@ -1133,26 +1413,74 @@ class WinUXView(
         native input gate owns the pointer, drop those background callbacks
         rather than replaying them after the dialog closes.
         """
-        queued = dpg.get_callback_queue() or ()
-        if discard:
-            self._dpg_callbacks.clear()
+        try:
+            queued = self._gui_runtime.callbackQueue() or ()
+        except Exception:
+            # Context teardown can race a final callback-queue poll. Missing one
+            # batch during shutdown is safer than terminating the application.
+            log_exception(
+                "Dear PyGui callback queue retrieval failed",
+                sys.exc_info(), fatal=False)
             return
         self._dpg_callbacks.extend(queued)
+        if discard:
+            self._preserve_native_close_requests()
+            self._dpg_callbacks.clear()
+            return
         # A shared deque permits a blocking modal to pump input recursively
         # without replaying the outer callback batch or starving its buttons.
+        # Bound callback execution per frame: a burst of redraw/hover callbacks
+        # must not delay frame presentation or an incoming dialog interaction.
+        # The unprocessed FIFO tail is retained for the next rendered frame.
+        from time import monotonic as _monotonic
+        drain_started = _monotonic()
+        processed = 0
         while self._dpg_callbacks and self._alive:
+            if processed >= 256 or (processed and _monotonic() - drain_started >= 0.006):
+                break
             # A callback can itself open a native modal. Stop immediately and
             # discard the remainder of the same physical input batch.
             native_gate = globals().get("native_background_input_blocked")
-            if callable(native_gate) and native_gate():
+            blocked = False
+            if callable(native_gate):
+                try:
+                    blocked = bool(native_gate())
+                except Exception:
+                    log_exception(
+                        "Native input gate query failed while draining callbacks",
+                        sys.exc_info(), fatal=False)
+            if blocked:
+                self._preserve_native_close_requests()
                 self._dpg_callbacks.clear()
                 break
             job = self._dpg_callbacks.popleft()
+            processed += 1
             try:
-                invoke_callback_job(job)
+                invoker = globals().get("invoke_callback_job")
+                if callable(invoker):
+                    invoker(job)
+                else:
+                    # Compatibility/failsafe for isolated callback-pump tests
+                    # or a partially imported runtime. The normal application
+                    # always uses the bounded safe invoker above.
+                    runner = getattr(self._gui_runtime.backend, "run_callbacks", None)
+                    if callable(runner):
+                        runner([job])
             except Exception:
                 callback = job[0] if isinstance(job, (tuple, list)) and job else None
                 self._handle_ui_callback_error(callback, sys.exc_info())
+
+    def _preserve_native_close_requests(self):
+        """Keep OS Close events when dropping stale background pointer input.
+
+        DPG puts its viewport-exit callback in the same queue as widget mouse
+        handlers. The post-Esc modal release guard must consume the latter, but
+        dropping WM_CLOSE means the user gets no confirmation at all. Marshal
+        one close request onto the independent UI dispatcher instead.
+        """
+        if any(isinstance(job, (tuple, list)) and job
+               and job[0] == self._request_close for job in self._dpg_callbacks):
+            self.after(0, self._request_close)
 
     def _handle_ui_callback_error(self, callback, exc_info):
         callback_name = getattr(
@@ -1168,12 +1496,14 @@ class WinUXView(
         try:
             self.show_error("WinUX", str(exc_info[1]))
         except Exception:
+            # Error reporting is best-effort. A broken/closing dialog backend
+            # must never turn an already-contained callback exception into an
+            # application-ending second exception.
             log_exception(
                 "Failed to display a UI callback error",
                 sys.exc_info(),
-                fatal=True,
+                fatal=False,
             )
-            raise
 
     def protocol(self, name, callback=None):
         if name == "WM_DELETE_WINDOW":
@@ -1202,7 +1532,7 @@ class WinUXView(
         """Make Close instantaneous and leave heavyweight teardown later.
 
         This method intentionally does *not* call ``dpg.stop_dearpygui`` or
-        ``dpg.destroy_context``.  Calling those APIs while the UI dispatcher is
+        the renderer context-destroy API.  Calling those APIs while the UI dispatcher is
         inside a callback has produced SMAPython/GLFW deadlocks on Windows.
         The normal render-loop ``finally`` performs graceful teardown when the
         process is embedded; standalone WinUX is terminated by the controller
@@ -1224,6 +1554,18 @@ class WinUXView(
 
         from .dialogs.floating_dialog import close_floating_dialogs
         close_floating_dialogs(self)
+        # Same-process dialogs must be terminally deleted while the Dear PyGui
+        # context and QApplication dispatcher are still alive. Retained tools
+        # normally hide on Close; application shutdown is their one hard delete.
+        from .ui.hosting.inprocess_dialog import close_inprocess_dialogs
+        close_inprocess_dialogs(self)
+        application = getattr(self, "_qapplication", None)
+        if application is not None:
+            try:
+                application.delete()
+            except Exception:
+                pass
+            self._qapplication = None
         # Process-isolated windows are closed without waiting on the render thread.
         for name in ("login_dialog",
                      "transfer_center_dialog", "server_notepad_dialog"):
@@ -1251,8 +1593,8 @@ class WinUXView(
         # then stop DPG only when control is outside a render callback.
         self.request_shutdown()
         try:
-            if not self._rendering and dpg.is_dearpygui_running():
-                dpg.stop_dearpygui()
+            if not self._rendering and self._gui_runtime.isRunning():
+                self._gui_runtime.stop()
         except Exception:
             pass
 
@@ -1362,18 +1704,35 @@ class WinUXView(
         self.right.set_disconnected()
 
     def display_server_directory(
-            self, path, items, host, reset_history=False, **kwargs):
+            self, path, items, host, reset_history=False, record_history=True, **kwargs):
+        same_directory = (not reset_history
+                          and path == self.right.current_path
+                          and str(host) == self.right.status_prefix)
         if reset_history:
             self.right.history = []
             self.right.history_index = -1
         self.right.status_prefix = str(host)
-        self.right.display(path, items)
+        if same_directory:
+            self.right.refresh_directory(path, items)
+            # A no-op snapshot must also replace the navigation "Loading..."
+            # message without touching rows, selection or the scroll owner.
+            if self.right.has_status:
+                self.right._update_item_status()
+        else:
+            self.right.display(path, items, record_history=record_history)
 
     def display_jobs(self, jobs):
         self.jobs_view.display(jobs)
         dialog = getattr(self, "job_manager_dialog", None)
         if dialog is not None:
             dialog.job_view_updated(jobs)
+
+    def display_job_poll_error(self, error):
+        dialog = getattr(self, "job_manager_dialog", None)
+        if dialog is not None:
+            callback = getattr(dialog, "job_view_failed", None)
+            if callable(callback):
+                callback(error)
 
     def selected_job_values(self):
         return self.jobs_view.selected_values()
@@ -1403,14 +1762,108 @@ class WinUXView(
         return self.login_dialog
 
     def show_transfer_progress(self, operation, cancel_event, items=None):
-        center = self.show_transfer_center()
+        center = self._get_transfer_center()
         return center.add_task(operation, cancel_event, items=items)
 
-    def show_transfer_center(self):
+    def _get_transfer_center(self):
         center = getattr(self, "transfer_center_dialog", None)
         if center is None or not center.winfo_exists():
             center = _dialog_type("TransferCenterDialog")(self)
             self.transfer_center_dialog = center
+        return center
+
+    def _prewarm_transfer_center(self):
+        """Prepare Transfer Center during an idle turn without process startup.
+
+        The normal path builds one retained in-process Qt-style tool and hides
+        it. Legacy process-host mode keeps its historical bounded prewarm pool.
+        """
+        if not self.winfo_exists() or getattr(self, "_floating_focus_suppressed", False):
+            return
+        if _use_inprocess_dialogs():
+            # Build the retained widget tree during an idle UI turn. This pays
+            # no process/IPC cost and makes the first explicit show a constant-
+            # time visibility/activation transaction.
+            self._get_transfer_center().hide()
+            return
+        try:
+            from .ui.hosting.host import dialog_host_manager
+            dialog_host_manager(self).refill()
+        except Exception:
+            # Idle preparation is optional and must never affect the main HWND.
+            log_exception("Could not refill the floating dialog host pool", sys.exc_info())
+
+    def _prewarm_inprocess_dialog_imports(self, index=0):
+        """Incrementally resolve normal dialog classes during GUI idle time.
+
+        This is intentionally import-only: retained heavy tools decide their own
+        preconstruction policy, while transient dialogs still allocate widgets
+        only when requested. No worker, subprocess or secondary event loop is
+        created.
+        """
+        if not self.winfo_exists() or not _use_inprocess_dialogs():
+            return False
+        names = (
+            # Resolving one transient class imports the shared transient module
+            # and therefore warms Login/Job/Edit/file selectors/ODB/progress.
+            "BlockingDialog",
+            "SettingsDialog",
+            "JobScheduleDialog",
+            "BookmarksDialog",
+            "SiteManagerDialog",
+            "SyncPreviewDialog",
+            "DiagnosticsDialog",
+            "TransferCenterDialog",
+        )
+        index = max(0, int(index or 0))
+        if index >= len(names):
+            return True
+        try:
+            _dialog_type(names[index])
+        except Exception:
+            # Warmup is speculative; the normal click path remains authoritative.
+            log_exception(
+                "Could not warm in-process dialog {}".format(names[index]),
+                sys.exc_info(), fatal=False)
+        if index + 1 < len(names) and self.winfo_exists():
+            self.after(24, self._prewarm_inprocess_dialog_imports, index + 1)
+        return True
+
+    def _prewarm_retained_dialog_shells(self, index=0):
+        """Build common argument-free retained shells during idle turns.
+
+        The shell remains hidden and shares QApplication's one GUI event loop.
+        Settings page I/O keeps using its existing QThreadPool bridge, while no
+        native dialog process or secondary renderer is created.
+        """
+        if not self.winfo_exists() or not _use_inprocess_dialogs():
+            return False
+        specs = (
+            ("settings_dialog", "SettingsDialog"),
+            ("diagnostics_dialog", "DiagnosticsDialog"),
+        )
+        index = max(0, int(index or 0))
+        if index >= len(specs):
+            return True
+        attribute, class_name = specs[index]
+        current = getattr(self, attribute, None)
+        if current is None or not current.winfo_exists():
+            try:
+                current = _dialog_type(class_name)(self)
+                setattr(self, attribute, current)
+                current.hide()
+            except Exception:
+                # Keep idle warmup optional; the normal menu path can retry.
+                setattr(self, attribute, None)
+                log_exception(
+                    "Could not prewarm retained {}".format(class_name),
+                    sys.exc_info(), fatal=False)
+        if index + 1 < len(specs) and self.winfo_exists():
+            self.after(80, self._prewarm_retained_dialog_shells, index + 1)
+        return True
+
+    def show_transfer_center(self):
+        center = self._get_transfer_center()
         center.show()
         return center
 
@@ -1500,22 +1953,51 @@ class WinUXView(
                 primary_text = "Exit"
             else:
                 primary_text = "OK"
-        current = getattr(self, "_async_confirm_dialog", None)
-        if current is not None and current.winfo_exists():
-            current.lift()
-            return current
+        requests = getattr(self, "_async_confirm_requests", None)
+        if requests is None:
+            requests = self._async_confirm_requests = deque()
+        requests.append((title, message, callback, primary_text, secondary_text, intent))
+        return self._drain_async_confirm_requests()
+
+    def _drain_async_confirm_requests(self):
+        """Serialize confirmations without dropping another action's callback."""
+        if getattr(self, "_async_confirm_active", None) is not None:
+            current = getattr(self, "_async_confirm_dialog", None)
+            if current is not None and current.winfo_exists():
+                current.lift()
+            return None
+        requests = getattr(self, "_async_confirm_requests", None)
+        if not requests or not getattr(self, "_alive", True):
+            return None
+        title, message, callback, primary_text, secondary_text, intent = requests.popleft()
+        token = self._async_confirm_active = object()
 
         def completed(value):
+            if self._async_confirm_active is not token:
+                return
+            self._async_confirm_active = None
             self._async_confirm_dialog = None
-            callback(value)
+            try:
+                callback(value)
+            finally:
+                # ResultDialog completes after the old host's idle ACK. Start
+                # the next request on a fresh UI turn, not inside teardown.
+                self.after(0, self._drain_async_confirm_requests)
 
-        dialog = _dialog_type("BlockingDialog")(
-            self, title, message, "confirm", on_result=completed,
-            primary_text=primary_text,
-            secondary_text=secondary_text,
-            intent=intent)
-        self._async_confirm_dialog = dialog
-        dialog.lift()
+        try:
+            dialog = _dialog_type("BlockingDialog")(
+                self, title, message, "confirm", on_result=completed,
+                primary_text=primary_text,
+                secondary_text=secondary_text,
+                intent=intent)
+            self._async_confirm_dialog = dialog
+            dialog.lift()
+        except Exception:
+            self._async_confirm_active = None
+            self._async_confirm_dialog = None
+            self.after(0, callback, False)
+            self.after(0, self._drain_async_confirm_requests)
+            raise
         return dialog
 
     def _show_message_dialog(self, title, message, intent="info"):
@@ -1556,7 +2038,7 @@ class WinUXView(
         return dialog
 
     def show_local_folder_dialog(self, initial, on_selected):
-        """Open the Dear ImGui local-folder browser as a real floating dialog."""
+        """Open the local-folder browser on the shared QApplication event loop."""
         dialog = getattr(self, "_local_folder_dialog", None)
         if dialog is not None and dialog.winfo_exists():
             dialog.lift()
@@ -1596,12 +2078,13 @@ class WinUXView(
             dialog.lift()
             return dialog
         self.settings_dialog = _dialog_type("SettingsDialog")(self)
+        self.settings_dialog.show()
         return self.settings_dialog
 
     def show_bookmarks(self, entries, on_open, on_remove, on_rename):
         dialog = getattr(self, "bookmarks_dialog", None)
         if dialog is not None and dialog.winfo_exists():
-            dialog.refresh(entries)
+            dialog.refresh(entries, on_open, on_remove, on_rename)
             dialog.lift()
             return dialog
         self.bookmarks_dialog = _dialog_type("BookmarksDialog")(
@@ -1612,7 +2095,7 @@ class WinUXView(
     def show_site_manager(self, sites, on_save, on_delete, on_connect):
         dialog = getattr(self, "site_manager_dialog", None)
         if dialog is not None and dialog.winfo_exists():
-            dialog.refresh(sites)
+            dialog.refresh(sites, on_save=on_save, on_delete=on_delete, on_connect=on_connect)
             dialog.lift()
             return dialog
         self.site_manager_dialog = _dialog_type("SiteManagerDialog")(
@@ -1624,7 +2107,7 @@ class WinUXView(
             self, rows, local_path, server_path, on_refresh, on_transfer):
         dialog = getattr(self, "sync_preview_dialog", None)
         if dialog is not None and dialog.winfo_exists():
-            dialog.refresh(rows, local_path, server_path)
+            dialog.refresh(rows, local_path, server_path, on_refresh, on_transfer)
             dialog.lift()
             return dialog
         self.sync_preview_dialog = _dialog_type("SyncPreviewDialog")(
@@ -1635,22 +2118,30 @@ class WinUXView(
     def show_diagnostics(self):
         dialog = getattr(self, "diagnostics_dialog", None)
         if dialog is not None and dialog.winfo_exists():
+            dialog.refresh()
             dialog.lift()
             return dialog
         self.diagnostics_dialog = _dialog_type("DiagnosticsDialog")(self)
+        self.diagnostics_dialog.show()
         return self.diagnostics_dialog
 
 
     def show_job_schedule(self):
         dialog = getattr(self, "job_schedule_dialog", None)
         if dialog is not None and dialog.winfo_exists():
-            dialog.refresh()
+            # Hidden retained Job Schedule refreshes from showEvent().  Avoid a
+            # second provider call on the same reopen transaction; an already
+            # visible tool still refreshes explicitly when selected from View.
+            was_visible = bool(getattr(dialog, "isVisible", lambda: True)())
             dialog.lift()
+            if was_visible:
+                dialog.refresh()
             return dialog
         self.job_schedule_dialog = _dialog_type("JobScheduleDialog")(
             self, self.callbacks["job_schedule"],
             self.callbacks["job_schedule_command"],
         )
+        self.job_schedule_dialog.show()
         return self.job_schedule_dialog
 
     def edit_job(self, values, settings=None, callback=None):

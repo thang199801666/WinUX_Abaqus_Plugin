@@ -99,6 +99,72 @@ class PlotAbaqusReleaseOrderTests(unittest.TestCase):
         self.assertEqual(self.resolve(), "abq2025")
         self.assertEqual(self.probes, ["abq2026", "abq2025"])
 
+    def test_commands_directory_is_used_when_not_on_path(self):
+        root = "/opt/ohpc/pub/apps/simulia/abaqus/Commands/"
+        self.installed = [root + "abq2020", root + "abq2025",
+                          root + "abq2026", root + "abaqus"]
+        self.compatible = root + "abq2025"
+        self.assertEqual(self.resolve(), self.compatible)
+        self.assertEqual(self.probes, [root + "abq2026", root + "abq2025"])
+        discovery = shlex.split(self.model._exec_client.call_args_list[0].args[1])[-1]
+        self.assertIn(root.rstrip("/"), discovery)
+        self.assertIn('[ -x "$_winux_file" ]', discovery)
+        self.assertNotIn("readlink", discovery)
+
+    def test_discovered_new_release_is_not_lost_by_builtin_filter(self):
+        root = "/opt/ohpc/pub/apps/simulia/abaqus/Commands/"
+        self.installed = [root + "abq2026", root + "abq2027"]
+        self.compatible = root + "abq2027"
+        self.assertEqual(self.resolve(), self.compatible)
+        self.assertEqual(self.probes, [root + "abq2027"])
+
+    def test_directory_scan_does_not_add_qcheck_or_shell_metacharacters(self):
+        root = "/opt/ohpc/pub/apps/simulia/abaqus/Commands/"
+        self.installed = [root + "qcheck", root + "abq2028;exit", root + "abq2026"]
+        self.compatible = root + "abq2026"
+        self.assertEqual(self.resolve(), self.compatible)
+        self.assertEqual(self.probes, [root + "abq2026"])
+
+    def test_path_launchers_do_not_get_duplicate_directory_probes(self):
+        root = "/opt/ohpc/pub/apps/simulia/abaqus/Commands/"
+        self.installed = ["abq2026", "abq2025", root + "abq2026", root + "abq2025"]
+        self.assertEqual(self.resolve(), "abq2025")
+        self.assertEqual(self.probes, ["abq2026", "abq2025"])
+
+    def test_check_odb_also_accepts_commands_directory_launchers(self):
+        root = "/opt/ohpc/pub/apps/simulia/abaqus/Commands/"
+        self.installed = [root + "abq2026", root + "abq2025"]
+        self.compatible = root + "abq2025"
+        result = self.model._resolve_abaqus_for_odb_on(
+            object(), "/scratch/job.odb", ["abq2026", "abq2025"])
+        self.assertEqual(result, self.compatible)
+        self.assertEqual(self.probes, [root + "abq2026", root + "abq2025"])
+
+    def test_check_odb_default_order_ignores_older_preference_and_hints(self):
+        identity = ("cluster", "tester")
+        self.model._odb_abaqus_command_cache[identity + ("/scratch/job.odb",)] = "abq2023"
+        self.model._odb_abaqus_directory_hint_cache[identity + ("/scratch",)] = "abq2023"
+        self.model._odb_abaqus_host_hint_cache[identity] = "abq2023"
+        result = self.model._resolve_abaqus_for_odb_on(
+            object(), "/scratch/job.odb", ["abq2023", "abaqus", "abq2026"])
+        self.assertEqual(result, "abq2025")
+        self.assertEqual(self.probes, ["abq2026", "abq2025"])
+        for call in self.model._exec_client.call_args_list:
+            if " python -c " in call.args[1]:
+                self.assertIn("from odbAccess import", call.args[1])
+
+    def test_legacy_false_flag_cannot_promote_older_release(self):
+        result = self.model._resolve_abaqus_for_odb_on(
+            object(), "/scratch/job.odb", ["abq2023", "abq2026"],
+            newest_first=False)
+        self.assertEqual(result, "abq2025")
+        self.assertEqual(self.probes, ["abq2026", "abq2025"])
+
+    def test_explicit_launcher_parent_is_scanned_for_other_releases(self):
+        script = self.model._abaqus_discovery_script(["/opt/site/Commands/abq2025"])
+        self.assertIn("/opt/site/Commands", script)
+        self.assertIn('/abq20*', script)
+
     def test_all_failures_report_the_order_used(self):
         self.compatible = None
         with self.assertRaisesRegex(RuntimeError, "Tried: abq2026, abq2025, abq2023, abaqus"):

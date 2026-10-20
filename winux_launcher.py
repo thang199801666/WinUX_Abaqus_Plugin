@@ -6,6 +6,7 @@ import datetime
 import os
 import subprocess
 import tempfile
+import time
 
 from winux_updater import DEFAULT_NETWORK_PROJECT_DIR
 from winux_installation_state import resolve_active_installation
@@ -23,6 +24,14 @@ def _is_project_dir(path):
             os.path.join(os.path.abspath(path), "WinUx", "__main__.py")
         )
     )
+
+
+def _safe_getcwd(fallback=None):
+    """Return cwd without letting a deleted/disconnected folder break launch."""
+    try:
+        return os.getcwd()
+    except (OSError, RuntimeError):
+        return os.path.abspath(fallback or os.path.dirname(__file__))
 
 
 def _bundled_project_dir():
@@ -68,7 +77,7 @@ def resolve_project_dir(value=None, environ=None):
         bundled,
         environ.get("WINUX_APP_DIR") or environ.get("WIXUX_APP_DIR"),
         source_checkout,
-        os.getcwd(),
+        _safe_getcwd(plugin_dir),
     )
     for candidate in candidates:
         if _is_project_dir(candidate):
@@ -216,36 +225,25 @@ def _running_processes():
     return list(candidates)
 
 
+
 def launch_winux(project_dir=None, abaqus_command=None, popen_factory=None, update_checker=None,
                  existing_pid=None, install_update=False):
     """Launch WinUx without blocking Abaqus/CAE.
 
     Returns ``(process, started)``. A new bootstrap child is started for every
     invocation so every Plug-ins > WinUx activation performs a version check.
-    The child itself suppresses duplicate WinUx application instances after the
-    check when an existing local instance is still running.
+    No startup splash/loading window is created.
     """
     global _ACTIVE_PROCESS, _ACTIVE_PROCESSES
 
+    launch_started_at = time.time()
     explicit_project_dir = project_dir is not None
     project_dir = resolve_project_dir(project_dir)
 
-    # IMPORTANT: never run update dialogs or file synchronization inside the
-    # Abaqus/CAE process.  The child ``abaqus python run_winux.py`` process
-    # owns the complete update flow.  This lets the FOX event loop return
-    # immediately, so closing/cancelling WinUx dialogs can never leave the
-    # Abaqus main window disabled or blocked.
-    #
-    # ``update_checker`` is retained only for source/API compatibility with
-    # older callers; update checks are intentionally not executed here.
+    # Update dialogs and file synchronization remain in the child process so
+    # the Abaqus/CAE FOX event loop is never blocked.
     del update_checker
 
-    # Version checking is mandatory on every menu activation.  Never return
-    # early just because a previous WinUx child is still running.  Instead pass
-    # the oldest live child PID to the new bootstrap process.  After checking
-    # the server version, that child either exits (no update / Cancel) or closes
-    # the existing WinUx instance immediately before installing an accepted
-    # update.
     running_before_launch = _running_processes()
     existing_process = running_before_launch[0] if running_before_launch else None
 
@@ -255,9 +253,15 @@ def launch_winux(project_dir=None, abaqus_command=None, popen_factory=None, upda
     )
     if install_update:
         command.append("--install-update")
+
     log_path = _log_path()
     environment = _launch_environment(project_dir)
     environment["WINUX_LAUNCH_LOG"] = log_path
+    # Explicitly scrub legacy splash variables inherited from a parent shell or
+    # previous hotfix. This guarantees normal startup even on upgraded installs.
+    environment.pop("WINUX_STARTUP_SIGNAL_FILE", None)
+    environment.pop("WINUX_STARTUP_SPLASH_TOKEN", None)
+
     if install_update:
         environment.pop("WINUX_SKIP_UPDATE", None)
         environment["WINUX_UPDATE_FROM_APP"] = "1"
@@ -269,9 +273,8 @@ def launch_winux(project_dir=None, abaqus_command=None, popen_factory=None, upda
         except Exception:
             pass
     if explicit_project_dir and not install_update:
-        # Explicit development/test checkouts preserve the historical behavior:
-        # they are launched as-is and never auto-updated from the shared S: source.
         environment["WINUX_SKIP_UPDATE"] = "1"
+
     process_command = _command_for_subprocess(command, environment)
     popen_factory = popen_factory or subprocess.Popen
 
@@ -295,12 +298,15 @@ def launch_winux(project_dir=None, abaqus_command=None, popen_factory=None, upda
             " ".join(command),
         )
         log_handle.write(header.encode("utf-8"))
+        try:
+            elapsed = max(0.0, time.time() - launch_started_at)
+            log_handle.write(
+                ("[parent timings] pre-spawn={0:.3f}s\n".format(elapsed)).encode("utf-8")
+            )
+        except Exception:
+            pass
         log_handle.flush()
-        # Do not start cmd.exe/abaqus with the WinUx deployment itself as the
-        # working directory. On Windows a process CWD can prevent the updater
-        # child from renaming/swapping that directory even after the Python
-        # script changes its own CWD. The runner uses an absolute path and
-        # WINUX_APP_DIR, so the deployment parent is the safe launch CWD.
+
         launch_cwd = os.path.dirname(project_dir) or tempfile.gettempdir()
         _ACTIVE_PROCESS = popen_factory(
             process_command,

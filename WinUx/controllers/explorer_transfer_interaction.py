@@ -23,6 +23,11 @@ class ExplorerTransferInteractionMixin:
         self._drag_target_point = None
         for panel in self.view.panels:
             panel.clear_external_drop_highlight()
+        prepare = getattr(self.view, "_prewarm_transfer_center", None)
+        if callable(prepare):
+            # Very early drags may precede the idle warm-up. Start the same
+            # hidden instance during the gesture, not after the drop/network I/O.
+            self.view.after(0, prepare)
 
     def external_drop_missed(self, target_panel):
         """Show a concise hint when an Explorer drop misses a file pane."""
@@ -83,6 +88,8 @@ class ExplorerTransferInteractionMixin:
 
         def worker():
             try:
+                if any(not path.exists() for path in sources):
+                    raise FileNotFoundError("Dropped file is no longer available")
                 self.model.transfer(
                     list(sources), Path(destination), move=False)
             except Exception as exc:
@@ -113,10 +120,6 @@ class ExplorerTransferInteractionMixin:
         if not paths:
             return
         sources = [Path(path) for path in paths]
-        invalid = [path for path in sources if not path.exists()]
-        if invalid:
-            target_panel.status.set("Dropped file is no longer available")
-            return
 
         destination = target_panel.current_path
         if x is not None and y is not None:
@@ -230,6 +233,16 @@ class ExplorerTransferInteractionMixin:
         self._drag_target_panel = None
         self._drag_target_destination = None
         self._drag_target_point = None
+
+        # Explorer semantics: dropping a selection back into the same folder
+        # is a silent no-op.  The destination has already been classified as
+        # invalid by drop_is_valid(), so do not enqueue transfer work merely to
+        # show an "invalid destination" warning.  Explicit Copy/Paste remains
+        # separate and is still allowed to create an Explorer-style duplicate.
+        if (target_panel is source_panel
+                and not self._drop_is_valid(
+                    source_panel, target_panel, list(raw_sources), destination)):
+            return
 
         self.view.after(
             0,

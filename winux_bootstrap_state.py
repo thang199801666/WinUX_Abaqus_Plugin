@@ -28,6 +28,7 @@ BOOTSTRAP_FILES = (
     "winux_bootstrap_state.py",
     "winux_health_check.py",
     "run_winux.py",
+    "update_manifest.json",
     "VERSION",
 )
 REQUIRED_BOOTSTRAP_FILES = (

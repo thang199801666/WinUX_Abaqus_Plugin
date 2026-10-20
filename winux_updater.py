@@ -563,6 +563,9 @@ def _log(message, environ=None):
 def _message_box(title, message, flags):
     if os.name != "nt":
         return 1
+    if os.environ.get("WINUX_HEADLESS") == "1":
+        # Automated/test environments must never surface a modal dialog.
+        return 1
     try:
         import ctypes
         return ctypes.windll.user32.MessageBoxW(None, _text(message), _text(title), flags)

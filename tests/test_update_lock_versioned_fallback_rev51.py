@@ -20,7 +20,7 @@ def test_prefer_bundled_runtime_does_not_require_legacy_install_mode(tmp_path, m
     assert resolved == str(bundled.resolve())
 
 
-def test_windows_legacy_sharing_violation_falls_back_to_versioned(monkeypatch):
+def test_windows_legacy_sharing_violation_falls_back_to_versioned(tmp_path, monkeypatch):
     class SharingViolation(OSError):
         winerror = 32
         errno = 13
@@ -39,6 +39,7 @@ def test_windows_legacy_sharing_violation_falls_back_to_versioned(monkeypatch):
     result = winux_updater._default_sync(
         r"C:\\stage", r"C:\\Users\\user\\abaqus_plugins\\WinUx",
         environ={"LOCALAPPDATA": r"C:\\Users\\user\\AppData\\Local"},
+        settings_path=str(tmp_path / "settings.json"),
         source_label="GitHub Releases",
     )
 

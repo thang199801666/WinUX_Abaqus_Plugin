@@ -31,6 +31,15 @@ class UpdatePreferences:
         self._store = JsonPreferenceStore("settings.json", root=root)
         self.path = self._store.path
 
+    @classmethod
+    def defaults(cls):
+        return {
+            "provider": cls.DEFAULT_PROVIDER,
+            "channel": cls.DEFAULT_CHANNEL,
+            "github_repository": update_preferences({}, environ={})["github_repository"] or "",
+            "legacy_source": "",
+        }
+
     @staticmethod
     def _repository(value):
         value = str(value or "").strip().strip("/")

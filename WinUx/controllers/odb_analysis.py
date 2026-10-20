@@ -4,7 +4,7 @@ from pathlib import Path
 from copy import deepcopy
 import json
 
-from ..abaqus_version_preferences import AbaqusVersionPreferences
+from ..preferences.abaqus_versions import AbaqusVersionPreferences
 from ..services.odb_extract import build_combined_curves
 from ..services.odb_check import check_local_odb
 from ..runtime.operation_context import OperationContext

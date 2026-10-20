@@ -33,6 +33,33 @@ def _read_bundled_version():
         return ""
 
 
+def _package_revision(directory):
+    try:
+        path = os.path.join(os.path.abspath(directory), "update_manifest.json")
+        with open(path, "r") as handle:
+            value = json.load(handle)
+        return int(value.get("package_revision", -1))
+    except Exception:
+        return -1
+
+
+def _prefer_bundled_hotfix(active_version, active_dir=None):
+    bundled_version = _read_bundled_version()
+    bundled_key = _release_key(bundled_version)
+    active_key = _release_key(active_version)
+    if bundled_key is None or active_key is None:
+        return False
+    width = max(len(bundled_key), len(active_key))
+    bundled_key = bundled_key + (0,) * (width - len(bundled_key))
+    active_key = active_key + (0,) * (width - len(active_key))
+    if bundled_key > active_key:
+        return True
+    if bundled_key < active_key:
+        return False
+    bundled_dir = os.path.dirname(os.path.abspath(__file__))
+    return _package_revision(bundled_dir) > _package_revision(active_dir or "")
+
+
 def _release_key(value):
     """Best-effort Python-2/3-compatible release tuple for bootstrap ordering."""
     try:
@@ -78,16 +105,17 @@ def _activate_self_updated_bootstrap():
     versions = []
     active = str(state.get("active_version") or "").strip()
     # A manually deployed/newer bundled build must not be shadowed by an older
-    # immutable bootstrap in LocalAppData. This is especially important for
-    # hotfix packages: otherwise child dialogs continue executing the stale
-    # runtime even after the plug-in folder has been replaced.
-    if active and _bundled_is_newer_than(active):
+    # immutable bootstrap in LocalAppData. Compare package revision as well as
+    # VERSION so same-version hotfixes take effect immediately.
+    active_candidate = None
+    if active:
+        safe_active = "".join(ch if ch.isalnum() or ch in "._+-" else "_" for ch in active)
+        active_candidate = os.path.join(root, "versions", safe_active)
+    if active and _prefer_bundled_hotfix(active, active_candidate):
         os.environ["WINUX_BOOTSTRAP_MODE"] = "bundled"
         # Runtime selection and install strategy are intentionally independent.
         # A newer bundled hotfix should win over a stale immutable runtime, but
         # must NOT force the updater back to the legacy in-place directory swap.
-        # The legacy swap renames the live plug-in directory and is vulnerable
-        # to WinError 32 when any Abaqus/WinUx helper still has a file open.
         os.environ["WINUX_PREFER_BUNDLED_RUNTIME"] = "1"
         return None
     if active:
@@ -117,6 +145,7 @@ def _activate_self_updated_bootstrap():
 _activate_self_updated_bootstrap()
 
 from winux_launcher import launch_winux, resolve_project_dir
+
 
 
 def _plugin_version():
@@ -156,15 +185,18 @@ class WinUxMenuTarget(FXObject):
 
     def onCmdLaunch(self, sender, selector, data):
         del sender, selector, data
-        main_window = getAFXApp().getAFXMainWindow()
+        # Launch WinUx out-of-process and return control to Abaqus/CAE
+        # immediately. No startup splash or modal loading UI is created.
         try:
             _process, started = launch_winux()
             if not started:
+                main_window = getAFXApp().getAFXMainWindow()
                 showAFXInformationDialog(
                     main_window,
                     "WinUx is already running from this Abaqus/CAE session.",
                 )
         except Exception as exc:
+            main_window = getAFXApp().getAFXMainWindow()
             showAFXErrorDialog(
                 main_window,
                 "WinUx could not start.\n\n{}".format(exc),

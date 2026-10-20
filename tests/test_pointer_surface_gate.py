@@ -2,19 +2,19 @@ from pathlib import Path
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-GATE = ROOT / "WinUx" / "components" / "interaction_gate.py"
-EXPLORER = ROOT / "WinUx" / "components" / "explorer_list_view.py"
-EXPLORER_CONTEXT = ROOT / "WinUx" / "components" / "explorer_context_menu.py"
-EXPLORER_POINTER = ROOT / "WinUx" / "components" / "explorer_pointer_capture.py"
-EXPLORER_DISPATCH = ROOT / "WinUx" / "components" / "explorer_pointer_dispatch.py"
-EXPLORER_HIT = ROOT / "WinUx" / "components" / "explorer_hit_testing.py"
-EXPLORER_RENDER = ROOT / "WinUx" / "components" / "explorer_rendering.py"
-DOCK = ROOT / "WinUx" / "components" / "dock_widget.py"
-TOOLBAR = ROOT / "WinUx" / "components" / "toolbar.py"
-COMBO = ROOT / "WinUx" / "components" / "qt_combo_box.py"
-RENAME = ROOT / "WinUx" / "components" / "explorer_rename_textbox.py"
+GATE = ROOT / "WinUx" / "ui" / "framework" / "input_gate.py"
+EXPLORER = ROOT / "WinUx" / "ui" / "components" / "explorer_list_view.py"
+EXPLORER_CONTEXT = ROOT / "WinUx" / "ui" / "components" / "explorer_context_menu.py"
+EXPLORER_POINTER = ROOT / "WinUx" / "ui" / "components" / "explorer_pointer_capture.py"
+EXPLORER_DISPATCH = ROOT / "WinUx" / "ui" / "components" / "explorer_pointer_dispatch.py"
+EXPLORER_HIT = ROOT / "WinUx" / "ui" / "components" / "explorer_hit_testing.py"
+EXPLORER_RENDER = ROOT / "WinUx" / "ui" / "components" / "explorer_rendering.py"
+DOCK = ROOT / "DearUIQt/docking/dock_widget.py"
+TOOLBAR = ROOT / "WinUx" / "ui" / "components" / "toolbar.py"
+COMBO = ROOT / "WinUx" / "ui" / "framework" / "qt" / "combo_box.py"
+RENAME = ROOT / "WinUx" / "ui" / "components" / "explorer_rename_textbox.py"
 VIEW = ROOT / "WinUx" / "view.py"
-SPLITTER_LAYOUT = ROOT / "WinUx" / "ui" / "splitter_layout.py"
+SPLITTER_LAYOUT = ROOT / "WinUx" / "ui" / "behaviors" / "splitter_behavior.py"
 VIEW_RUNTIME_SOURCE = VIEW.read_text(encoding="utf-8") + "\n" + SPLITTER_LAYOUT.read_text(encoding="utf-8")
 
 
@@ -65,7 +65,8 @@ class PointerSurfaceGateRegressionTests(unittest.TestCase):
         # BeginCombo popup.  It therefore must not register a second custom
         # pointer-protected child overlay.
         self.assertIn("self.button = dpg.add_combo(", combo)
-        self.assertIn("no_preview=True", combo)
+        self.assertIn("no_preview=False", combo)
+        self.assertIn('dpg.set_value(self.button, "")', combo)
         self.assertNotIn("self._popup = dpg.add_child_window(", combo)
         self.assertNotIn("register_pointer_protected_item(self._popup)", combo)
         self.assertIn("register_pointer_protected_item(self.window_tag)", rename)
@@ -75,7 +76,7 @@ class PointerSurfaceGateRegressionTests(unittest.TestCase):
         view = VIEW_RUNTIME_SOURCE
         self.assertIn("def header_pointer_hit_test(self, separator_only=False):", hit_testing)
         self.assertIn("def _job_view_header_owns_pointer(self, separator_only=False):", view)
-        self.assertIn("if self._job_view_header_owns_pointer():\n            return", view)
+        self.assertIn("if self._job_view_header_owns_pointer() and not active:\n            return", view)
         self.assertIn("not getattr(self, \"_horizontal_splitter_dragging\", False)", view)
         self.assertIn("and self._job_view_header_owns_pointer()", view)
 

@@ -38,9 +38,14 @@ class TransferStabilityTests(unittest.TestCase):
 
     def test_shutdown_breaks_the_single_transport_socket(self):
         source = (ROOT / "WinUx" / "server_model.py").read_text(encoding="utf-8")
-        self.assertIn("break_client_socket(client)", source)
+        self.assertIn("interrupt_client_socket(client)", source)
+        self.assertIn("raw_socket.shutdown(socket.SHUT_RDWR)", source)
+        # Windows must not close the WinSock handle on the render thread:
+        # Paramiko's concurrent recv() otherwise reports WSAENOTSOCK/10038.
+        interrupt = source[source.index("        def interrupt_client_socket"):source.index("        transport, raw_socket = interrupt_client_socket(client)")]
+        self.assertNotIn("raw_socket.close()", interrupt)
         self.assertNotIn("self._auxiliary_clients", source)
-        self.assertIn("one transport", source)
+        self.assertIn("one authenticated SSH transport", source)
 
     def test_reconnect_refresh_reuses_async_navigation(self):
         facade = (ROOT / "WinUx" / "controller.py").read_text(encoding="utf-8")

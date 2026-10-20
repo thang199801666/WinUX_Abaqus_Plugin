@@ -11,8 +11,8 @@ import time
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import WinUx  # Set up the bundled native backend before importing Dear PyGui.
 import dearpygui.dearpygui as dpg
-from WinUx.components.explorer_list_view import ExplorerListView, ListViewItem
-from WinUx.components.shared_scroller import SharedScrollerMetrics, SharedScrollerPalette
+from WinUx.ui.components.explorer_list_view import ExplorerListView, ListViewItem
+from WinUx.ui.components.shared_scroller import SharedScrollerMetrics, SharedScrollerPalette
 
 
 def main():

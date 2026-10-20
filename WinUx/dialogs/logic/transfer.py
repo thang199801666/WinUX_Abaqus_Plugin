@@ -33,7 +33,7 @@ class TransferItemRow:
     def set_status(self, state, label):
         self.state = state
         if self.exists():
-            self.task.center.update_row(self.row_id, status=str(label))
+            self.task.center.update_row(self.row_id, status=str(label), state=self.state)
 
     def update_progress(self, current_done, current_total):
         if not self.exists():
@@ -84,6 +84,7 @@ class TransferItemRow:
             ratio=ratio,
             statistics=statistics,
             status=status,
+            state="finalizing" if ratio >= 1.0 else "running",
         )
         self.state = "finalizing" if ratio >= 1.0 else "running"
 
@@ -95,9 +96,10 @@ class TransferItemRow:
             self.row_id,
             ratio=1.0,
             status="Completed",
-            statistics="Completed",
+            statistics="",
             action="Done",
             action_enabled=False,
+            state="completed",
         )
 
     def finish(self, cancelled=False):
@@ -107,7 +109,8 @@ class TransferItemRow:
             self.state = "cancelled"
             self.task.center.update_row(
                 self.row_id,
-                status="Cancelled", action="Dismiss", action_enabled=True)
+                status="Cancelled", action="Dismiss", action_enabled=True,
+                state="cancelled")
         elif not cancelled:
             self.mark_completed()
 
@@ -118,7 +121,8 @@ class TransferItemRow:
         self.task.center.update_row(
             self.row_id,
             status="Failed", statistics=str(message),
-            action="Dismiss", action_enabled=True)
+            action="Dismiss", action_enabled=True,
+            state="failed")
 
     def destroy(self):
         self.task.center._row_to_task.pop(self.row_id, None)
@@ -164,6 +168,14 @@ class TransferTaskHandle:
 
     def winfo_exists(self):
         return any(row.exists() for row in self.rows)
+
+    def set_preparing(self, message):
+        """Show preflight work while cancellation is already available."""
+        if self.state != "running":
+            return
+        for row in self.rows:
+            if row.exists() and row.state == "queued":
+                row.set_status("queued", message)
 
     def _row_for_name(self, name):
         name = str(name or "Preparing...")
@@ -247,11 +259,12 @@ class TransferTaskHandle:
                 self.center.update_row(
                     row.row_id,
                     status="Not started", action="Dismiss",
-                    action_enabled=True)
+                    action_enabled=True, state="skipped")
             else:
                 self.center.update_row(
                     row.row_id,
-                    action="Dismiss", action_enabled=True)
+                    action="Dismiss", action_enabled=True,
+                    state=row.state)
         self.center.task_failed(self)
 
     def cancel(self, *_args):
@@ -265,7 +278,8 @@ class TransferTaskHandle:
             row.state = "cancelling"
             self.center.update_row(
                 row.row_id,
-                status="Cancelling...", action_enabled=False)
+                status="Cancelling...", action_enabled=False,
+                state="cancelling")
 
 
 class TransferCenterLogic:
@@ -406,4 +420,5 @@ class TransferCenterLogic:
                     continue
                 row.state = "cancelling"
                 self.update_row(
-                    row.row_id, status="Cancelling...", action_enabled=False)
+                    row.row_id, status="Cancelling...", action_enabled=False,
+                    state="cancelling")

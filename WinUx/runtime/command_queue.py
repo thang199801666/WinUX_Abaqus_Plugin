@@ -30,6 +30,14 @@ class LatestCommandQueue(queue.Queue):
             self.unfinished_tasks += 1
             self.not_empty.notify()
 
+
+    def mutate_pending(self, callback):
+        """Mutate queued command payloads in place under the queue lock."""
+        with self.mutex:
+            for item in self.queue:
+                value = item.value if isinstance(item, _Latest) else item
+                callback(value)
+
     def _put(self, item):
         if not isinstance(item, _Latest):
             self._latest.clear()

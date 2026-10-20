@@ -36,8 +36,8 @@ from tkinter import ttk
 _PACKAGE_PARENT = Path(__file__).resolve().parents[2]
 if str(_PACKAGE_PARENT) not in sys.path:
     sys.path.insert(0, str(_PACKAGE_PARENT))
-from WinUx.components.server_notepad_tabs import _ToolTip, _EditorTabStrip
-from WinUx.components.shared_scroller import (
+from WinUx.ui.components.server_notepad_tabs import _ToolTip, _EditorTabStrip
+from DearUIQt.interop import (
     configure_ttk_scroller_styles, make_ttk_scroller,
 )
 from WinUx.dialogs.modern import (

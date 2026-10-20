@@ -5,7 +5,7 @@ import os
 from types import SimpleNamespace
 import unittest
 
-from WinUx.components.explorer_native_hook import ExplorerNativeHook
+from WinUx.ui.components.explorer_native_hook import ExplorerNativeHook
 
 
 @unittest.skipUnless(os.name == "nt", "requires Win32")

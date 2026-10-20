@@ -416,8 +416,12 @@ def main():
             try:
                 odb = _open_odb(path)
             except Exception as exc:
-                _emit({"type": "status", "state": "waiting", "message": str(exc)})
-                command = _read_command(policy.current)
+                # An ODB may exist while Abaqus is still writing its headers.
+                # Do not stop permanently, or back off for a full minute;
+                # keep retrying read-only with a bounded pause until it opens.
+                _emit({"type": "status", "state": "waiting",
+                       "message": "ODB not ready; retrying: " + str(exc)})
+                command = _read_command(min(5.0, policy.current))
                 if command and command.get("cmd") == "stop":
                     return
                 if command and command.get("cmd") == "select":

@@ -3,8 +3,8 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTEXT = ROOT / "WinUx" / "components" / "explorer_context_menu.py"
-FACADE = ROOT / "WinUx" / "components" / "explorer_list_view.py"
+CONTEXT = ROOT / "WinUx" / "ui" / "components" / "explorer_context_menu.py"
+FACADE = ROOT / "WinUx" / "ui" / "components" / "explorer_list_view.py"
 
 
 class ContextMenuSubmenuArrowTests(unittest.TestCase):

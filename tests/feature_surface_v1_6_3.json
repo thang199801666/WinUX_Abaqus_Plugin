@@ -644,7 +644,9 @@
         "_hide_context_menus": {
           "async": false,
           "kwarg": null,
-          "kwonly": [],
+          "kwonly": [
+            "consume_pointer"
+          ],
           "positional": [
             "self"
           ],
@@ -1128,6 +1130,7 @@
           "kwarg": null,
           "kwonly": [],
           "positional": [
+            "self",
             "tag",
             "point"
           ],
@@ -2260,7 +2263,12 @@
             "modal",
             "resizable",
             "visible",
-            "owner_hwnd"
+            "owner_hwnd",
+            "allow_minimize",
+            "allow_maximize",
+            "fast_startup",
+            "retain_on_close",
+            "fresh_host"
           ],
           "vararg": null
         },
@@ -2279,7 +2287,8 @@
           "kwarg": null,
           "kwonly": [],
           "positional": [
-            "self"
+            "self",
+            "generation"
           ],
           "vararg": null
         },
@@ -2310,7 +2319,9 @@
           "kwonly": [],
           "positional": [
             "self",
-            "message"
+            "message",
+            "details",
+            "stage"
           ],
           "vararg": null
         },
@@ -2378,7 +2389,8 @@
           "kwarg": null,
           "kwonly": [],
           "positional": [
-            "self"
+            "self",
+            "generation"
           ],
           "vararg": null
         },
@@ -2872,7 +2884,9 @@
         "rows": {
           "async": false,
           "kwarg": null,
-          "kwonly": [],
+          "kwonly": [
+            "blocking"
+          ],
           "positional": [
             "self"
           ],
@@ -3784,7 +3798,9 @@
         "_resolve_abaqus_for_odb_on": {
           "async": false,
           "kwarg": null,
-          "kwonly": [],
+          "kwonly": [
+            "newest_first"
+          ],
           "positional": [
             "self",
             "client",
@@ -4465,7 +4481,10 @@
         "send_shell_command": {
           "async": false,
           "kwarg": null,
-          "kwonly": [],
+          "kwonly": [
+            "show_echo",
+            "replace_prompt"
+          ],
           "positional": [
             "self",
             "command"
@@ -8417,7 +8436,9 @@
         "job_schedules": {
           "async": false,
           "kwarg": null,
-          "kwonly": [],
+          "kwonly": [
+            "blocking"
+          ],
           "positional": [
             "self"
           ],
@@ -8629,7 +8650,8 @@
             "sender",
             "app_data",
             "user_data",
-            "force_new_press"
+            "force_new_press",
+            "hitbox_pressed"
           ],
           "vararg": null
         },
@@ -9837,7 +9859,9 @@
         "dock_console": {
           "async": false,
           "kwarg": null,
-          "kwonly": [],
+          "kwonly": [
+            "_native_confirmed"
+          ],
           "positional": [
             "self"
           ],

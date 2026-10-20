@@ -5,11 +5,12 @@ WINUX = ROOT / "WinUx"
 
 
 def _read(relative):
-    return (WINUX / relative).read_text(encoding="utf-8")
+    from ui_sources import implementation_path
+    return implementation_path(WINUX / relative).read_text(encoding="utf-8")
 
 
 def test_combo_arrow_uses_native_imgui_combo_hit_target():
-    source = _read("components/qt_combo_box.py")
+    source = _read("ui/framework/qt/combo_box.py")
     assert "self.button = dpg.add_combo(" in source
     assert "no_preview=True" in source
     assert "callback=self._native_selected" in source
@@ -21,7 +22,7 @@ def test_combo_arrow_uses_native_imgui_combo_hit_target():
 
 def test_shared_form_layout_uses_one_table_and_compact_rows():
     dialog = _read("dialogs/qt_dialog.py")
-    style = _read("widgets/imgui_qt_style.py")
+    style = _read("ui/framework/qt/style.py")
     assert "def form_layout(self, parent=None, *, label_width=None):" in dialog
     assert "def form_layout_row(self, table, label, builder):" in dialog
     assert "form_label_cell_theme" in dialog
@@ -44,7 +45,7 @@ def test_product_version_remains_1_1_0():
 
 
 def test_combo_dropdown_is_native_begincombo_not_second_modal_overlay():
-    source = _read("components/qt_combo_box.py")
+    source = _read("ui/framework/qt/combo_box.py")
     constructor = source.split("def __init__", 1)[1].split("# ------------------------------------------------------------------ API", 1)[0]
     assert "self.button = dpg.add_combo(" in constructor
     assert "no_preview=True" in constructor
@@ -53,7 +54,7 @@ def test_combo_dropdown_is_native_begincombo_not_second_modal_overlay():
     assert "popup=True" not in source
 
 def test_combo_uses_one_full_width_native_frame_with_editor_overlay():
-    source = _read("components/qt_combo_box.py")
+    source = _read("ui/framework/qt/combo_box.py")
     constructor = source.split("def __init__", 1)[1].split("# ------------------------------------------------------------------ API", 1)[0]
     assert "self.button = dpg.add_combo(" in constructor
     assert "width=-1" in constructor
@@ -70,7 +71,7 @@ def test_combo_uses_one_full_width_native_frame_with_editor_overlay():
 
 
 def test_combo_popup_owner_spans_entire_control_instead_of_arrow_only():
-    source = _read("components/qt_combo_box.py")
+    source = _read("ui/framework/qt/combo_box.py")
     constructor = source.split("def __init__", 1)[1].split("# ------------------------------------------------------------------ API", 1)[0]
     combo_call = constructor.split("self.button = dpg.add_combo(", 1)[1].split(")\n", 1)[0]
     assert "width=-1" in combo_call

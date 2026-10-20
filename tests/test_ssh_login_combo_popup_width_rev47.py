@@ -5,11 +5,12 @@ WINUX = ROOT / "WinUx"
 
 
 def _read(relative):
-    return (WINUX / relative).read_text(encoding="utf-8")
+    from ui_sources import implementation_path
+    return implementation_path(WINUX / relative).read_text(encoding="utf-8")
 
 
 def test_editable_combo_popup_width_follows_full_shell_rect():
-    source = _read("components/qt_combo_box.py")
+    source = _read("ui/framework/qt/combo_box.py")
     geometry = source.split("def _popup_geometry", 1)[1].split(
         "# -------------------------------------------------------------- behavior", 1)[0]
     assert "dpg.get_item_rect_min(self.shell)" in geometry
@@ -19,7 +20,7 @@ def test_editable_combo_popup_width_follows_full_shell_rect():
 
 
 def test_arrow_hit_target_no_longer_owns_a_narrow_native_combo_popup():
-    source = _read("components/qt_combo_box.py")
+    source = _read("ui/framework/qt/combo_box.py")
     constructor = source.split("def __init__", 1)[1].split(
         "# ------------------------------------------------------------------ API", 1)[0]
     assert "self.button = dpg.add_drawlist(" in constructor
@@ -30,7 +31,7 @@ def test_arrow_hit_target_no_longer_owns_a_narrow_native_combo_popup():
 
 
 def test_history_rows_fill_the_retained_popup_and_keep_editable_input():
-    source = _read("components/qt_combo_box.py")
+    source = _read("ui/framework/qt/combo_box.py")
     assert "dpg.add_selectable(" in source
     assert "parent=self._popup, width=-1" in source
     assert "readonly=not self.editable" in source

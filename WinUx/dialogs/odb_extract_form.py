@@ -1,12 +1,14 @@
 from __future__ import annotations
 
-import dearpygui.dearpygui as dpg
-from .qt_dialog import QtDialog, QtTable
-from .theme import DialogMetrics
+from DearUIQt.backends import dpg
+from DearUIQt.dialogs.qt_dialog import QtDialog, QtTable
+from DearUIQt.themes import DialogMetrics
+from DearUIQt.layouts import QGridLayout, QVBoxLayout, QHBoxLayout
 from .logic.odb import format_extract_number as _number, history_item_label as _item_label
 
 
 class ODBExtractDialog(QtDialog):
+    REUSABLE_HOST = True
     REVERSE_OPTIONS = ("As is", "Reverse X", "Reverse Y", "Reverse Both")
 
     def __init__(self, view, catalog, on_result):
@@ -25,28 +27,26 @@ class ODBExtractDialog(QtDialog):
         # made a simple selection workflow feel like three unrelated panels;
         # placing them side-by-side mirrors a compact Qt splitter/form without
         # introducing another dock or custom widget.
-        axes_layout = dpg.add_table(
-            parent=self.content, header_row=False, width=-1,
-            policy=dpg.mvTable_SizingStretchProp, pad_outerX=False,
-            borders_innerH=False, borders_outerH=False,
-            borders_innerV=False, borders_outerV=False,
-        )
-        dpg.add_table_column(parent=axes_layout, width_stretch=True, init_width_or_weight=1.0)
-        dpg.add_table_column(parent=axes_layout, width_stretch=True, init_width_or_weight=1.0)
+        axes_layout = QGridLayout(
+            2, parent=self._qt_parent(self.content), after=view.after,
+            backend=dpg, height=0)
+        self.own_widget(axes_layout)
         self.axes = {}
-        with dpg.table_row(parent=axes_layout):
-            for axis in ("x", "y"):
-                with dpg.group() as axis_panel:
-                    with dpg.group(horizontal=True, horizontal_spacing=DialogMetrics.BUTTON_GAP, parent=axis_panel) as axis_actions:
-                        self.action(
-                            "Add to {}".format(axis.upper()), lambda axis=axis: self._add_selected(axis),
-                            "secondary", parent=axis_actions, width=84,
-                        )
-                        self.action(
-                            "Remove {}".format(axis.upper()), lambda axis=axis: self._remove_selected(axis),
-                            "secondary", parent=axis_actions, width=84,
-                        )
-                    self.axes[axis] = QtTable(axis_panel, (axis.upper() + " Data",), height=125, multiple=True)
+        for axis in ("x", "y"):
+            column = 0 if axis == "x" else 1
+            axis_panel = QVBoxLayout(parent=axes_layout.cell(0, column), spacing=6, backend=dpg)
+            axis_actions = QHBoxLayout(
+                parent=axis_panel, spacing=DialogMetrics.BUTTON_GAP, backend=dpg)
+            self.action(
+                "Add to {}".format(axis.upper()), lambda axis=axis: self._add_selected(axis),
+                "secondary", parent=axis_actions.tag, width=84,
+            )
+            self.action(
+                "Remove {}".format(axis.upper()), lambda axis=axis: self._remove_selected(axis),
+                "secondary", parent=axis_actions.tag, width=84,
+            )
+            self.axes[axis] = QtTable(
+                axis_panel.tag, (axis.upper() + " Data",), height=125, multiple=True)
 
         form = self.form_layout(label_width=118)
         self.reverse = self.form_layout_row(
@@ -83,7 +83,7 @@ class ODBExtractDialog(QtDialog):
         if self._x_ids and self._y_ids:
             self.finish({"x": [dict(self._items_by_id[key]) for key in self._x_ids],
                          "y": [dict(self._items_by_id[key]) for key in self._y_ids],
-                         "reverse": dpg.get_value(self.reverse)})
+                         "reverse": self.control_value(self.reverse)})
 
     def finish(self, value):
         if self._finished:
@@ -99,6 +99,8 @@ class ODBExtractDialog(QtDialog):
 
 
 class ODBXYResultDialog(QtDialog):
+    REUSABLE_HOST = True
+
     def __init__(self, view, result):
         self.result = dict(result or {})
         self.curves = list(self.result.get("curves") or [])

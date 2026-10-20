@@ -2,7 +2,7 @@ from itertools import count
 import unittest
 from unittest.mock import Mock
 
-from WinUx.widgets import QGridLayout, QLabel
+from WinUx.ui import QGridLayout, QLabel
 
 
 def backend():

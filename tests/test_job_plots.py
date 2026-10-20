@@ -1,6 +1,7 @@
 """Regression coverage for Job Viewer realtime ODB History Plots."""
 
 import importlib.util
+import ast
 from pathlib import Path
 import sys
 import types
@@ -13,20 +14,20 @@ SERVER = ROOT / "WinUx" / "server_model.py"
 REMOTE_ODB = ROOT / "WinUx" / "services" / "remote_odb.py"
 CONTROLLER = ROOT / "WinUx" / "controller.py"
 JOB_PLOT_CONTROLLER = ROOT / "WinUx" / "controllers" / "job_plot.py"
-JOBS = ROOT / "WinUx" / "components" / "jobs_view.py"
-PLOTS = ROOT / "WinUx" / "components" / "job_plots.py"
-DOCK = ROOT / "WinUx" / "components" / "dock_widget.py"
-DOCK_MANAGER = ROOT / "WinUx" / "components" / "dock_manager.py"
+JOBS = ROOT / "WinUx" / "ui" / "components" / "jobs_view.py"
+PLOTS = ROOT / "WinUx" / "ui" / "components" / "job_plots.py"
+DOCK = ROOT / "DearUIQt/docking/dock_widget.py"
+DOCK_MANAGER = ROOT / "DearUIQt/docking/dock_manager.py"
 VIEW = ROOT / "WinUx" / "view.py"
-EXPLORER = ROOT / "WinUx" / "components" / "explorer_list_view.py"
-EXPLORER_POINTER = ROOT / "WinUx" / "components" / "explorer_pointer_capture.py"
-EXPLORER_DRAG_DROP = ROOT / "WinUx" / "components" / "explorer_drag_drop.py"
-EXPLORER_CONTEXT = ROOT / "WinUx" / "components" / "explorer_context_menu.py"
-INTERACTION_GATE = ROOT / "WinUx" / "components" / "interaction_gate.py"
-FLOAT_RESIZER = ROOT / "WinUx" / "components" / "floating_window_resizer.py"
-SPLITTER_LAYOUT = ROOT / "WinUx" / "ui" / "splitter_layout.py"
-PLOT_DOCKING = ROOT / "WinUx" / "ui" / "plot_docking.py"
-CONSOLE_DOCKING = ROOT / "WinUx" / "ui" / "console_docking.py"
+EXPLORER = ROOT / "WinUx" / "ui" / "components" / "explorer_list_view.py"
+EXPLORER_POINTER = ROOT / "WinUx" / "ui" / "components" / "explorer_pointer_capture.py"
+EXPLORER_DRAG_DROP = ROOT / "WinUx" / "ui" / "components" / "explorer_drag_drop.py"
+EXPLORER_CONTEXT = ROOT / "WinUx" / "ui" / "components" / "explorer_context_menu.py"
+INTERACTION_GATE = ROOT / "DearUIQt" / "input_gate.py"
+FLOAT_RESIZER = ROOT / "DearUIQt/docking/floating_window_resizer.py"
+SPLITTER_LAYOUT = ROOT / "WinUx" / "ui" / "behaviors" / "splitter_behavior.py"
+PLOT_DOCKING = ROOT / "WinUx" / "ui" / "behaviors" / "plot_docking.py"
+CONSOLE_DOCKING = ROOT / "WinUx" / "ui" / "behaviors" / "console_docking.py"
 VIEW_RUNTIME_SOURCE = "\n".join(
     path.read_text(encoding="utf-8")
     for path in (VIEW, SPLITTER_LAYOUT, PLOT_DOCKING, CONSOLE_DOCKING)
@@ -137,11 +138,17 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         source = PLOTS.read_text(encoding="utf-8")
         self.assertIn("class JobPlotsWindow", source)
         self.assertIn("DockWidget(", source)
-        self.assertNotIn("with dpg.window(", source)
+        # The dock remains embedded; auxiliary popup menus may own a window.
+        for node in ast.walk(ast.parse(source)):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name) and node.func.value.id == "dpg"
+                    and node.func.attr == "window"):
+                self.assertTrue(any(keyword.arg == "popup" and isinstance(keyword.value, ast.Constant)
+                                    and keyword.value.value is True for keyword in node.keywords))
         self.assertIn("dpg.plot(", source)
         self.assertIn("dpg.add_plot_axis", source)
         self.assertIn("dpg.add_line_series", source)
-        self.assertIn("dpg.add_checkbox", source)
+        self.assertIn("QCheckBox(", source)
         self.assertIn("default_history_ids", source)
         self.assertNotIn('label="Auto fit"', source)
         self.assertIn("PANEL_GAP = 8", source)
@@ -149,13 +156,14 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("OUTER_MARGIN = 6", source)
         self.assertIn('dpg.mvPlotCol_PlotBg', source)
         self.assertIn("panel_surface_theme(", source)
-        self.assertIn("checkbox_theme(dpg, checked=False)", source)
-        self.assertIn("checkbox_theme(dpg, checked=True)", source)
+        self.assertIn("from DearUIQt.qt import QCheckBox, QLineEdit, QPushButton", source)
+        self.assertNotIn("dpg.add_checkbox", source)
         self.assertIn("self.toolbar = dpg.add_child_window", source)
 
     def test_plot_layout_avoids_unsupported_separator_configure_item(self):
         source = PLOTS.read_text(encoding="utf-8")
-        self.assertIn("self.header_separator = dpg.add_drawlist", source)
+        self.assertIn("self._header_separator_canvas = QCanvas", source)
+        self.assertIn("self._header_separator_canvas.painter().drawLine", source)
         self.assertIn("def _safe_configure", source)
         self.assertNotIn("dpg.configure_item(self.header_separator", source)
 
@@ -165,14 +173,13 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("dpg.mvPlotCol_LegendText", source)
         self.assertIn("dpg.mvPlotCol_InlayText", source)
         self.assertIn("dpg.mvPlotCol_PlotBg, (255, 255, 255, 255)", source)
-        self.assertIn("checkbox_theme(dpg, checked=False)", source)
-        self.assertIn("checkbox_theme(dpg, checked=True)", source)
-        style = (ROOT / "WinUx" / "widgets" / "imgui_qt_style.py").read_text(encoding="utf-8")
+        self.assertIn("QCheckBox(", source)
+        style = (ROOT / "DearUIQt" / "qt" / "style.py").read_text(encoding="utf-8")
         self.assertIn("def checkbox_theme", style)
         self.assertIn("mvStyleVar_FrameBorderSize, 1", style)
         rebuild = source[source.index("def _rebuild_history_list"):source.index("def _checkbox_changed")]
-        self.assertIn("self._checkbox_theme_on if item_id in self.selected_ids", rebuild)
-        self.assertIn("else self._checkbox_theme_off", rebuild)
+        self.assertIn("checkbox = QCheckBox", rebuild)
+        self.assertIn("checkbox.clicked.connect", rebuild)
 
     def test_server_has_persistent_live_monitor_on_shared_transport(self):
         source = REMOTE_ODB.read_text(encoding="utf-8")
@@ -216,7 +223,7 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("def undock_job_plots", source)
         self.assertIn("def dock_job_plots", source)
         self.assertIn("dpg.move_item(window.root", source)
-        self.assertIn("on_close=floating_closed", source)
+        self.assertIn("host = PlotDockHost(self, panel, dock, closed, drag_anchor=drag_anchor)", source)
         self.assertIn("def get_job_plots", source)
         self.assertIn("def close_job_plots", source)
         self.assertIn("def _update_floating_plot_docking", source)
@@ -237,10 +244,15 @@ class JobPlotsArchitectureTests(unittest.TestCase):
     def test_plot_component_exposes_qt_like_float_close_and_drag_contract(self):
         source = PLOTS.read_text(encoding="utf-8")
         dock = DOCK.read_text(encoding="utf-8")
+        manager = DOCK_MANAGER.read_text(encoding="utf-8")
         self.assertIn("DockWidget(", source)
         self.assertIn("self.drag_handle = self.dock.drag_handle", source)
-        self.assertIn("add_mouse_drag_handler", source)
-        self.assertIn("_on_header_drag", source)
+        # r71: DockManager owns default title-bar drag so single docks get the
+        # same five-way live drop targets as QTabBar drags. A per-window global
+        # mouse-drag handler would detach immediately and bypass that preview.
+        self.assertNotIn("callback=self._on_header_drag", source)
+        self.assertIn("def _update_title_interaction", manager)
+        self.assertIn("self._dock_drop_target_at(mouse, key)", manager)
         self.assertIn("on_dock_change", source)
         self.assertIn("class DockWidget", dock)
         self.assertIn("self.float_button = dpg.add_button", dock)
@@ -311,16 +323,19 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("def _point_near_rect", source)
         self.assertIn("self._left_mouse_pressed()", source)
 
-    def test_qt_like_tearoff_preserves_grab_anchor_and_float_geometry(self):
+    def test_native_tearoff_releases_embedded_capture_instead_of_moving_dpg_root(self):
         plots = PLOTS.read_text(encoding="utf-8")
         source = VIEW_RUNTIME_SOURCE
         self.assertIn("drag_anchor", plots)
-        self.assertIn("get_item_rect_min(self.drag_handle)", plots)
+        self.assertIn("self._drag_handle_widget.globalPos()", plots)
+        self.assertIn("self._drag_handle_widget.isActive()", plots)
         self.assertIn("self._plot_float_geometries = {}", source)
         self.assertIn("def _remember_plot_float_geometry", source)
-        self.assertIn("is_drag_tearoff", source)
-        self.assertIn("float(pointer_pos[0]) - anchor_x", source)
-        self.assertIn("saved_geometry", source)
+        undock = source.split("def undock_job_plots(", 1)[1].split("def dock_job_plots(", 1)[0]
+        self.assertIn("panel.end_pointer_capture()", undock)
+        self.assertIn("manager._reset_tab_drag()", undock)
+        self.assertNotIn("dpg.add_window", undock)
+        self.assertNotIn("dpg.move_item", undock)
 
     def test_escape_cancels_active_floating_dock_drag(self):
         source = VIEW_RUNTIME_SOURCE
@@ -336,9 +351,11 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("FILE_JOB_SPLITTER_GUTTER_SIZE = 9", source)
         self.assertIn("FILE_PANEL_SPLITTER_GUTTER_SIZE = 9", source)
         self.assertIn("CONSOLE_DOCK_SPLITTER_GUTTER_SIZE = 9", source)
-        # Plot splitters still use enlarged invisible halos; the three primary
-        # workspace splitters now use explicit layout gutters instead.
-        self.assertGreaterEqual(source.count("2 * self.SPLITTER_HIT_PADDING"), 1)
+        # Every workspace splitter reserves a real strip; the Plot handle must
+        # not overlap list rows or the header in either orientation.
+        self.assertIn("PLOT_DOCK_SEPARATOR_SIZE = 9", source)
+        self.assertNotIn("2 * self.SPLITTER_HIT_PADDING", source)
+        self.assertNotIn("2 * self.HORIZONTAL_SPLITTER_HIT_PADDING", source)
 
     def test_file_job_splitter_has_dedicated_non_overlapping_gutter(self):
         source = VIEW_RUNTIME_SOURCE
@@ -398,8 +415,8 @@ class JobPlotsArchitectureTests(unittest.TestCase):
     def test_all_splitters_capture_before_explorer_callbacks(self):
         source = VIEW_RUNTIME_SOURCE
         update = source[source.index("def update(self):"):source.index("def _update_floating_plot_resize_interaction")]
-        self.assertLess(update.index("self._pre_dispatch_splitter_input()"),
-                        update.index("self._drain_dpg_callbacks()"))
+        self.assertLess(update.index('"pre-dispatch splitter input", self._pre_dispatch_splitter_input'),
+                        update.index('"DPG callback dispatch", self._drain_dpg_callbacks'))
         self.assertIn("self._file_panel_splitter_owner = object()", source)
         self.assertIn("self._horizontal_splitter_owner = object()", source)
         self.assertIn("self._plot_splitter_owner = object()", source)
@@ -434,7 +451,7 @@ class JobPlotsArchitectureTests(unittest.TestCase):
 
     def test_v1520_has_reusable_qmainwindow_like_dock_manager(self):
         manager = DOCK_MANAGER.read_text(encoding="utf-8")
-        components = (ROOT / "WinUx" / "components" / "__init__.py").read_text(
+        components = (ROOT / "WinUx" / "ui" / "components" / "__init__.py").read_text(
             encoding="utf-8")
         self.assertIn("class DockManager", manager)
         self.assertIn("def add_dock_widget", manager)
@@ -447,7 +464,7 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("def restore_state", manager)
         self.assertIn("self.tab_strip = dpg.add_child_window", manager)
         self.assertIn('tab_position="bottom"', VIEW_RUNTIME_SOURCE)
-        self.assertIn('"DockManager": (".dock_manager", "DockManager")', components)
+        self.assertIn('"DockManager": ("DearUIQt.docking.dock_manager", "DockManager")', components)
 
     def test_v1539_job_plots_use_single_job_without_tabification(self):
         source = VIEW_RUNTIME_SOURCE
@@ -481,12 +498,12 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         self.assertIn("self._tab_insert_marker = dpg.draw_line", manager)
         self.assertIn("on_tab_tearoff=self._job_plot_tab_tearoff", source)
         self.assertIn("def _job_plot_tab_tearoff", source)
-        self.assertIn("dock_manager.update_interaction()", source)
+        self.assertIn("dock_manager.update_interaction", source)
 
-    def test_v1521_tab_tearoff_keeps_gesture_continuous_and_supports_center_tabify(self):
+    def test_native_tab_tearoff_uses_host_and_retains_center_tabify_target(self):
         source = VIEW_RUNTIME_SOURCE
         self.assertIn("self._plot_synthetic_float_drag = {}", source)
-        self.assertIn("Native window dragging cannot inherit that press", source)
+        self.assertIn("host = PlotDockHost(self, panel, dock, closed, drag_anchor=drag_anchor)", source)
         self.assertIn('return "tabify"', source)
         self.assertIn('str(area or "").strip().lower() == "tabify"', source)
         self.assertIn("tabify_target", source)
@@ -521,8 +538,8 @@ class JobPlotsArchitectureTests(unittest.TestCase):
         source = VIEW_RUNTIME_SOURCE
         self.assertIn("dpg.mvStyleVar_WindowRounding, 1", source)
         self.assertIn("dpg.mvThemeCol_ResizeGrip, (0, 0, 0, 0)", source)
-        self.assertIn("no_resize=True", source)
-        self.assertIn("FloatingWindowResizer(", source)
+        hosts = (ROOT / "WinUx" / "dialogs" / "native_dock_hosts.py").read_text(encoding="utf-8")
+        self.assertIn("modal=False, resizable=True", hosts)
         self.assertIn("_apply_floating_plot_resize_cursor", source)
 
     def test_v1523_floating_resizer_supports_all_four_corners_and_pointer_capture(self):

@@ -18,3 +18,13 @@ known_hosts
 OPTIMIZATION_GOAL.md
 REFACTOR_NOTES.md
 tools/*.json
+*.tmp
+*.bak
+*.orig
+*.rej
+*~
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+# The ABI-matched native runtime is part of the shipped installation.

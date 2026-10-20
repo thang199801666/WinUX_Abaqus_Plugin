@@ -13,8 +13,8 @@ import WinUx
 import dearpygui.dearpygui as dpg
 from WinUx.view import WinUXView
 from WinUx.controllers.callbacks import REQUIRED_CALLBACK_KEYS
-from WinUx.components.explorer_list_view import ListViewItem
-from WinUx.components.shared_scroller import dpg_window_rect
+from WinUx.ui.components.explorer_list_view import ListViewItem
+from WinUx.ui.components.shared_scroller import dpg_window_rect
 
 
 def main():

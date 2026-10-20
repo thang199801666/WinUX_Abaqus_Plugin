@@ -9,11 +9,12 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 DIALOGS = ROOT / "WinUx" / "dialogs"
+COMMON_DIALOGS = ROOT / "DearUIQt/dialogs"
 
 
 class QtDialogStyleTests(unittest.TestCase):
     def test_theme_has_one_shared_qt_control_contract(self):
-        source = (DIALOGS / "theme.py").read_text(encoding="utf-8")
+        source = (COMMON_DIALOGS / "theme.py").read_text(encoding="utf-8")
         for token in (
             "mvInputText", "mvInputInt", "mvInputFloat", "mvCombo", "mvListbox",
             "mvRadioButton", "mvSelectable", "mvProgressBar", "mvTable",
@@ -22,7 +23,7 @@ class QtDialogStyleTests(unittest.TestCase):
             self.assertIn(token, source)
 
     def test_default_button_is_qt_neutral_with_focus_border(self):
-        source = (DIALOGS / "theme.py").read_text(encoding="utf-8")
+        source = (COMMON_DIALOGS / "theme.py").read_text(encoding="utf-8")
         start = source.index("def primary_button_theme")
         end = source.index("def secondary_button_theme", start)
         block = source[start:end]
@@ -31,14 +32,14 @@ class QtDialogStyleTests(unittest.TestCase):
         self.assertNotIn("p.HIGHLIGHT_TEXT", block)
 
     def test_sections_and_navigation_are_qt_like_not_white_cards(self):
-        source = (DIALOGS / "theme.py").read_text(encoding="utf-8")
+        source = (COMMON_DIALOGS / "theme.py").read_text(encoding="utf-8")
         section = source[source.index("def surface_theme"):source.index("def body_theme")]
         self.assertIn("DialogPalette.WINDOW_BG", section)
         self.assertIn("mvStyleVar_ChildBorderSize", section)
         self.assertIn("def navigation_theme", source)
 
     def test_qtdialog_owns_shared_form_status_navigation_and_button_box_layout(self):
-        source = (DIALOGS / "qt_dialog.py").read_text(encoding="utf-8")
+        source = (COMMON_DIALOGS / "qt_dialog.py").read_text(encoding="utf-8")
         for token in (
             "def note(", "def status_text(", "def navigation_panel(",
             "QDialogButtonBox-like layout", "QFormLayout-style row",
@@ -72,7 +73,7 @@ class QtDialogStyleTests(unittest.TestCase):
         self.assertIn('"Combine operation"', odb)
 
     def test_dialog_density_is_compact_and_shared(self):
-        source = (DIALOGS / "theme.py").read_text(encoding="utf-8")
+        source = (COMMON_DIALOGS / "theme.py").read_text(encoding="utf-8")
         for token in (
             "LABEL_WIDTH = 104", "BUTTON_WIDTH = 82", "BUTTON_HEIGHT = 26",
             "FOOTER_HEIGHT = 48", "WINDOW_PAD_X = 10", "ROW_SPACING = 5",
@@ -84,7 +85,7 @@ class QtDialogStyleTests(unittest.TestCase):
         login = (DIALOGS / "login_form.py").read_text(encoding="utf-8")
         settings = (DIALOGS / "settings_form.py").read_text(encoding="utf-8")
         blocking = (DIALOGS / "blocking_form.py").read_text(encoding="utf-8")
-        self.assertIn("self.preferred_size = (420, 184)", login)
+        self.assertIn("self.preferred_size = (420, 204)", login)
         self.assertIn("self.preferred_size = (760, 520)", settings)
         self.assertIn("self.preferred_size = (480,", blocking)
 

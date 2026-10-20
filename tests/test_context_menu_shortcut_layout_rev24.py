@@ -1,9 +1,9 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-CONTEXT = ROOT / "WinUx" / "components" / "explorer_context_menu.py"
-RENDER = ROOT / "WinUx" / "components" / "explorer_rendering.py"
-PANEL = ROOT / "WinUx" / "components" / "file_panel.py"
+CONTEXT = ROOT / "WinUx" / "ui" / "components" / "explorer_context_menu.py"
+RENDER = ROOT / "WinUx" / "ui" / "components" / "explorer_rendering.py"
+PANEL = ROOT / "WinUx" / "ui" / "components" / "file_panel.py"
 
 
 def test_shortcuts_have_a_dedicated_right_aligned_slot():

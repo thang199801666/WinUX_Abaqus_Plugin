@@ -6,7 +6,7 @@ import math
 import re
 from dataclasses import dataclass
 
-from .inp_preferences import INPPreferences
+from .preferences.inp import INPPreferences
 
 
 DOF_MAP = {

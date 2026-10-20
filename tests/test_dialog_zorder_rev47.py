@@ -1,9 +1,11 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-HOST = ROOT / "WinUx" / "platform" / "native_dialog_host.py"
-VIEWPORT = ROOT / "WinUx" / "platform" / "floating_viewport.py"
-DIALOG = ROOT / "WinUx" / "dialogs" / "floating_dialog.py"
+# Legacy hosts were re-homed under WinUx/ui; the old WinUx/platform/ and
+# WinUx/dialogs/ modules are thin aliases (see WinUx/ui/_compat).
+HOST = ROOT / "WinUx" / "ui" / "native" / "native_dialog_host.py"
+VIEWPORT = ROOT / "WinUx" / "ui" / "native" / "floating_viewport.py"
+DIALOG = ROOT / "WinUx" / "ui" / "hosting" / "floating_dialog.py"
 
 
 def test_genuine_close_handoff_uses_one_shot_non_topmost_zorder_repair():
@@ -17,7 +19,9 @@ def test_open_activation_keeps_cross_process_owner_dialog_stack_together():
     host = HOST.read_text(encoding="utf-8")
     viewport = VIEWPORT.read_text(encoding="utf-8")
     assert "def prepare_owned_dialog_stack" in host
-    helper = host.split("def prepare_owned_dialog_stack", 1)[1].split("def handoff_owner_before_close", 1)[0]
+    helper = host.split(
+        "def prepare_owned_dialog_stack", 1)[1].split(
+        "def is_native_window_foreground", 1)[0]
     assert "SWP_NOACTIVATE" in helper
     assert "SetWindowPos(owner" in helper
     assert "SetWindowPos(dialog" in helper
@@ -49,7 +53,8 @@ def test_native_dialog_controller_prefers_main_viewport_hwnd_resolver():
     assert 'resolved_owner or find_process_window("WinUX")' in block
 
 
-def test_native_login_keeps_owner_and_dialog_in_same_stack_on_publish_and_show():
-    source = (ROOT / "WinUx" / "dialogs" / "native_login_runtime.py").read_text(encoding="utf-8")
-    assert "prepare_owned_dialog_stack" in source
-    assert source.count("prepare_owned_dialog_stack(self.owner_hwnd, self.hwnd)") >= 3
+# test_native_login_keeps_owner_and_dialog_in_same_stack_on_publish_and_show
+# was superseded by test_native_login_controls: the legacy native Tk login
+# runtime (WinUx/dialogs/native_login_runtime.py) was removed; login now runs
+# through the process-isolated DearImGui FloatingDialogController host whose
+# cross-process stack repair is covered by test_open_activation above.

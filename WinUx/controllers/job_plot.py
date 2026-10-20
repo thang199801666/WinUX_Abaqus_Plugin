@@ -11,10 +11,11 @@ from __future__ import annotations
 import threading
 import time
 
-from ..abaqus_version_preferences import AbaqusVersionPreferences
+from ..preferences.abaqus_versions import AbaqusVersionPreferences
 from ..diagnostics import log_exception
-from ..performance_preferences import PerformancePreferences
+from ..preferences.performance import PerformancePreferences
 from ..services.adaptive_polling import AdaptivePollingPolicy, EventIntervalLearner
+from ..services.inactivity_polling import UserInactivityPolicy
 
 
 class JobPlotController:
@@ -29,6 +30,11 @@ class JobPlotController:
         # jobs avoid hammering the server while still reacting quickly near the
         # historically likely appearance time.
         self._appearance_learner = EventIntervalLearner()
+        self._adaptive_preferences_cache = None
+        self._adaptive_preferences_loaded_at = 0.0
+        if not hasattr(app, "_inactivity_policy"):
+            app._inactivity_policy = UserInactivityPolicy(
+                settings=PerformancePreferences().load())
 
     @property
     def view(self):
@@ -94,7 +100,11 @@ class JobPlotController:
             message = str(payload.get("message") or payload.get("state") or "")
             window.set_status(message or "Monitoring ODB...")
         elif payload_type == "fatal":
-            window.set_error(str(payload.get("error") or "Realtime ODB monitor failed"))
+            # A remote helper may stop while Abaqus is still writing the ODB.
+            # The watcher restarts it, so this is a transient retry state,
+            # not a terminal red Error dialog/status.
+            window.set_status("Plot retrying: {}".format(
+                str(payload.get("error") or "ODB is temporarily unreadable")))
 
     def selection_snapshot(self, job_id):
         with self._lock:
@@ -116,6 +126,38 @@ class JobPlotController:
             "history_confidence_samples": settings["odb_history_confidence_samples"],
             "catalog_changed_checks": settings["odb_catalog_changed_checks"],
         }
+
+    def effective_adaptive_settings(self):
+        """Apply app-inactivity backoff to the ordinary ODB policy.
+
+        The remote monitor asks for effective settings several times per second
+        so a resume can interrupt a long deep-idle wait immediately.  Cache the
+        local JSON preference document for two seconds; activity stage remains
+        live/in-memory and therefore does not inherit that cache delay.
+        """
+        now = time.monotonic()
+        with self._lock:
+            preferences = self._adaptive_preferences_cache
+            loaded_at = self._adaptive_preferences_loaded_at
+        if preferences is None or now - loaded_at >= 2.0:
+            latest = PerformancePreferences().load()
+            with self._lock:
+                self._adaptive_preferences_cache = latest
+                self._adaptive_preferences_loaded_at = now
+                preferences = latest
+        policy = self.app._inactivity_policy
+        policy.configure(preferences)
+        base = {
+            "min_interval": preferences["odb_min_interval"],
+            "max_interval": preferences["odb_max_interval"],
+            "stable_samples_to_max": preferences["odb_stable_samples_to_max"],
+            "quiet_seconds_to_max": preferences["odb_quiet_seconds_to_max"],
+            "history_alpha": preferences["odb_history_alpha"],
+            "prediction_fraction": preferences["odb_prediction_fraction"],
+            "history_confidence_samples": preferences["odb_history_confidence_samples"],
+            "catalog_changed_checks": preferences["odb_catalog_changed_checks"],
+        }
+        return policy.effective_odb_settings(base, now=now)
 
     def discovery_delay(self, policy, started_at, settings):
         """Blend ordinary backoff with learned ODB-appearance timing."""
@@ -151,7 +193,7 @@ class JobPlotController:
         key = str(job_id)
         odb_path = None
         commands = AbaqusVersionPreferences().ordered_commands()
-        initial_poll = self.adaptive_settings()
+        initial_poll = self.effective_adaptive_settings()
         discovery_policy = AdaptivePollingPolicy(
             initial_poll["min_interval"],
             initial_poll["max_interval"],
@@ -160,9 +202,11 @@ class JobPlotController:
         )
         discovery_started_at = time.monotonic()
         discovery_saw_missing = False
+        monitor_retry_count = 0
+        previous_monitor_error = None
 
         while not cancel.is_set() and not self.app._closing:
-            latest_poll = self.adaptive_settings()
+            latest_poll = self.effective_adaptive_settings()
             discovery_policy.configure(
                 min_interval=latest_poll["min_interval"],
                 max_interval=latest_poll["max_interval"],
@@ -238,11 +282,12 @@ class JobPlotController:
                     lambda: self.selection_snapshot(key),
                     lambda payload: self.view.after(0, self.apply_payload, key, payload),
                     abaqus_commands=commands,
-                    adaptive_settings=self.adaptive_settings(),
-                    adaptive_settings_provider=self.adaptive_settings,
+                    adaptive_settings=self.effective_adaptive_settings(),
+                    adaptive_settings_provider=self.effective_adaptive_settings,
                 )
                 if cancel.is_set() or self.app._closing:
                     return
+                monitor_retry_count = 0
                 self.view.after(
                     0,
                     self.apply_payload,
@@ -253,13 +298,24 @@ class JobPlotController:
                         "message": "Realtime monitor stopped; reconnecting...",
                     },
                 )
+                cancel.wait(1.0)
             except Exception as exc:
                 if cancel.is_set() or self.app._closing:
                     return
-                log_exception(
-                    "Realtime Job ODB plot failed",
-                    (type(exc), exc, exc.__traceback__),
-                )
+                monitor_retry_count += 1
+                # Log the first failure or a changed error, rather than
+                # generating thousands of identical stack traces for an ODB
+                # still being written by Abaqus.
+                error_text = str(exc)
+                if error_text != previous_monitor_error:
+                    log_exception(
+                        "Realtime Job ODB plot failed (will retry)",
+                        (type(exc), exc, exc.__traceback__),
+                    )
+                    previous_monitor_error = error_text
+                retry_delay = min(30.0, max(1.0, float(
+                    latest_poll["min_interval"])) *
+                    (2 ** min(monitor_retry_count - 1, 5)))
                 self.view.after(
                     0,
                     self.apply_payload,
@@ -267,15 +323,19 @@ class JobPlotController:
                     {
                         "type": "status",
                         "state": "retry",
-                        "message": "Plot monitor retrying: {}".format(exc),
+                        "message": "ODB not ready; retry {} in {:.0f}s: {}".format(
+                            monitor_retry_count, retry_delay, error_text[:160]),
                     },
                 )
-                # The current ODB may have been recreated/replaced by the job.
-                odb_path = None
-                discovery_policy.force_fast()
-                discovery_started_at = time.monotonic()
-                discovery_saw_missing = False
-                cancel.wait(discovery_policy.current_interval)
+                # Keep the resolved path on ordinary failures (the ODB may
+                # become readable without being renamed). Rediscover every
+                # third failure in case the job rotated/renamed the file.
+                if monitor_retry_count % 3 == 0:
+                    odb_path = None
+                    discovery_policy.force_fast()
+                    discovery_started_at = time.monotonic()
+                    discovery_saw_missing = False
+                cancel.wait(retry_delay)
 
     def open(self, values):
         if self.app._closing or not values:

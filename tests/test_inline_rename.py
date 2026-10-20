@@ -12,6 +12,7 @@ import unittest
 MODULE_PATH = (
     Path(__file__).resolve().parents[1]
     / "WinUx"
+    / "ui"
     / "components"
     / "native_rename.py"
 )
@@ -64,7 +65,7 @@ if __name__ == "__main__":
 
 class RenameFontSizingTests(unittest.TestCase):
     def test_inline_rename_uses_measured_body_text_height(self):
-        root = Path(__file__).resolve().parents[1] / "WinUx" / "components"
+        root = Path(__file__).resolve().parents[1] / "WinUx" / "ui" / "components"
         list_source = (root / "explorer_list_view.py").read_text(encoding="utf-8")
         render_source = (root / "explorer_rendering.py").read_text(encoding="utf-8")
         rename_source = (root / "explorer_rename.py").read_text(encoding="utf-8")

@@ -2,7 +2,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from WinUx.components.explorer_keyboard import ExplorerKeyboardController, ExplorerKeyboardInput
+from WinUx.ui.components.explorer_keyboard import ExplorerKeyboardController, ExplorerKeyboardInput
 
 
 def fixture(count=20):

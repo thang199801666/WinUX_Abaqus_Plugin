@@ -114,6 +114,7 @@ class JobScheduleController:
             if self.app._closing or not self.server.connected:
                 raise RuntimeError("SSH is not connected")
             self.server.submit_abaqus_job(**task["job"])
+            self.view.after(0, self.app._refresh_jobs_now)
             self.record_status(task, "run", "Complete")
         except Exception as exc:
             log_exception("Scheduled run failed", (type(exc), exc, exc.__traceback__))
@@ -143,13 +144,14 @@ class JobScheduleController:
             if self.app._closing or not self.server.connected:
                 raise RuntimeError("SSH is not connected")
             if task.get("delete_requested"):
-                live_ids = {str(job.job_id) for job in self.server.list_jobs()}
-                if str(task["job_id"]) not in live_ids:
-                    self.finish_deletion(task)
-                    return
+                # The shared Job Viewer snapshot reconciles deletion. Do not
+                # race a second qstat or send qdel again while PBS is removing it.
+                task["retry_at"] = datetime.now() + timedelta(seconds=5)
+                return
             self.server.cancel_job(task["job_id"])
             task["delete_requested"] = True
             task["retry_at"] = datetime.now() + timedelta(seconds=5)
+            self.view.after(0, self.app._refresh_jobs_now)
             self.view.after(
                 0, self.status_message,
                 "Waiting for job {} to disappear".format(task["job_id"]))
@@ -173,19 +175,49 @@ class JobScheduleController:
             self.view.right.status.set(str(message))
 
     def reconcile_deletions(self, jobs):
-        """Drop delete schedules as soon as qstat no longer contains the job."""
-        live_ids = {str(job.job_id) for job in jobs}
+        """Retire delete schedules when the authoritative qstat snapshot loses a job.
+
+        A scheduled deletion becomes meaningless when the target job finishes on
+        its own before the delete deadline.  Older behavior only retired tasks
+        after WinUx itself had sent ``qdel`` (``delete_requested``), leaving
+        naturally completed jobs stuck in Job Schedule as ``Waiting`` forever.
+
+        Jobs removed after our own qdel are kept in recent history as Complete.
+        Jobs that disappeared naturally before qdel are simply discarded: no
+        pending schedule and no redundant history row remain.
+        """
+        live_ids = {str(job.job_id) for job in (jobs or ())}
+        retired = []
         with self.delete_lock:
-            completed = [
-                task for job_id, task in self.delete_tasks.items()
-                if job_id not in live_ids and task.get("delete_requested")
-            ]
-            for task in completed:
-                self.delete_tasks.pop(task["job_id"], None)
-                self.app._job_edit_settings.pop(task["job_id"], None)
+            for job_id, task in tuple(self.delete_tasks.items()):
+                if str(job_id) in live_ids:
+                    continue
+                self.delete_tasks.pop(job_id, None)
+                self.app._job_edit_settings.pop(str(job_id), None)
+                # Compatibility callers may have keyed settings with the exact
+                # original job-id object rather than its string representation.
+                if job_id != str(job_id):
+                    self.app._job_edit_settings.pop(job_id, None)
                 task["cancel"].set()
+                retired.append(task)
+
+        for task in retired:
+            if task.get("delete_requested"):
                 self.record_status(task, "delete", "Complete")
-                self.app._remove_shared_schedule(task.get("schedule_id"))
+            else:
+                # Do not turn a no-longer-needed future delete into a fake
+                # completed action. Also clear any stale same-key history from
+                # an earlier lifecycle of this PBS job id.
+                with self.history_lock:
+                    self.history.pop("delete|{}".format(task.get("job_id")), None)
+            self.app._remove_shared_schedule(task.get("schedule_id"))
+
+        if retired:
+            try:
+                self.view.after(0, self.refresh_dialog)
+            except Exception:
+                pass
+        return len(retired)
 
     def schedule_deletion(self, job_id, job_name, settings):
         """Replace a job's delete schedule with the settings from Edit Job."""
@@ -254,14 +286,22 @@ class JobScheduleController:
                 if not task["cancel"].is_set()
             ]
 
-    def rows(self):
+    def rows(self, *, blocking=True):
+        """Snapshot schedules; return None on contention for UI close requests."""
         now = datetime.now()
-        with self.run_lock:
-            run_tasks = [dict(task) for task in self.run_tasks.values() if not task["cancel"].is_set()]
-        with self.delete_lock:
-            delete_tasks = [dict(task) for task in self.delete_tasks.values() if not task["cancel"].is_set()]
-        with self.history_lock:
-            history = [dict(task) for task in self.history.values()]
+        snapshots = []
+        for lock, mapping, pending in (
+                (self.run_lock, self.run_tasks, True),
+                (self.delete_lock, self.delete_tasks, True),
+                (self.history_lock, self.history, False)):
+            if not lock.acquire(blocking):
+                return None
+            try:
+                snapshots.append([dict(task) for task in mapping.values()
+                                  if not pending or not task["cancel"].is_set()])
+            finally:
+                lock.release()
+        run_tasks, delete_tasks, history = snapshots
         rows = []
         for task in run_tasks:
             rows.append((

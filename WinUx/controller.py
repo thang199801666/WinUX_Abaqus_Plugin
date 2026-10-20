@@ -26,10 +26,11 @@ from .controllers import (
     JobActionsController, FileCommandController, ExplorerTransferInteractionMixin,
     build_controller_callbacks,
 )
-from .inp_preferences import INPPreferences
-from .login_preferences import LoginPreferences
-from .model import FileSystemModel
-from .navigation_preferences import NavigationPreferences
+from .preferences.inp import INPPreferences
+from .preferences.login import LoginPreferences
+from .preferences.performance import PerformancePreferences
+from .models import FileSystemModel
+from .preferences.navigation import NavigationPreferences
 from .preferences.sites import SitePreferences
 from .server_model import (
     RemoteTextConflictError, SSHServerModel, prepare_ssh_runtime,
@@ -37,10 +38,13 @@ from .server_model import (
 from .services import (
     platform_integration, presentation, windows_clipboard,
 )
+from .services.inactivity_polling import UserInactivityPolicy
+from .services.abaqus_console_help import ABAQUS_LINUX_HELP
 from .runtime import (
     BackgroundTaskManager, hide_registered_process_windows,
     terminate_registered_children,
 )
+from .runtime.paths import safe_current_directory
 
 
 def __getattr__(name):
@@ -119,6 +123,11 @@ class WinUXController(ExplorerTransferInteractionMixin):
         self._job_poll_policy = None
         self._job_poll_wakeup = None
         self._job_poll_force_fast = None
+        # One app-wide inactivity clock coordinates qstat, live ODB polling and
+        # reconnect backoff.  It is fed by QApplication native input, so remote
+        # workers never need their own UI/input polling thread.
+        self._inactivity_policy = UserInactivityPolicy(
+            settings=PerformancePreferences().load())
         self._reconnect_lock = threading.Lock()
         self._reconnect_active = False
         # One connection supervisor owns reconnect attempts. Other features
@@ -164,13 +173,21 @@ class WinUXController(ExplorerTransferInteractionMixin):
             "transfer_tasks", self._transfer_tasks.snapshot)
         self.view.add_watchdog_snapshot_provider(
             "analysis_tasks", self._analysis_tasks.snapshot)
+        self.view.add_watchdog_snapshot_provider(
+            "remote_polling_activity", self._inactivity_policy.snapshot)
         log_event("View construction finished")
         for panel in self.view.panels:
             panel._sort = self.navigation_preferences.load_sort(panel.panel_id)
             if panel._sort:
                 panel.set_sort_indicator(*panel._sort)
         saved_local = self.navigation_preferences.load_local()
-        self.initial_local = Path(saved_local) if saved_local else Path.cwd()
+        if saved_local:
+            try:
+                self.initial_local = Path(saved_local)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                self.initial_local = safe_current_directory()
+        else:
+            self.initial_local = safe_current_directory()
         self._initial_load_pending = True
         self.view.left.status.set("Loading...")
         # Enter Tk's event loop before touching the filesystem so the window
@@ -272,8 +289,13 @@ class WinUXController(ExplorerTransferInteractionMixin):
         if self._closing or self._close_confirmation_pending:
             return
 
-        schedules = [row for row in self.job_schedules() if row[4] == "Waiting"]
-        if schedules:
+        snapshot = self.job_schedules(blocking=False)
+        schedules = [row for row in (snapshot or []) if row[4] == "Waiting"]
+        if snapshot is None:
+            message = (
+                "Schedule information is being updated. Any pending server "
+                "schedules will continue running after WinUx closes. Exit anyway?")
+        elif schedules:
             details = "\n".join(
                 "{} | {} | {}".format(item[0], item[1], item[2])
                 for item in schedules)
@@ -286,14 +308,19 @@ class WinUXController(ExplorerTransferInteractionMixin):
             message = "Are you sure you want to exit WinUx?"
 
         self._close_confirmation_pending = True
-        self.view.confirm_action_async(
-            "Confirm Close App",
-            message,
-            self._close_confirmation_finished,
-            primary_text="Exit",
-            secondary_text="Cancel",
-            intent="danger",
-        )
+        try:
+            self.view.confirm_action_async(
+                "Confirm Close App",
+                message,
+                self._close_confirmation_finished,
+                primary_text="Exit",
+                secondary_text="Cancel",
+                intent="danger",
+            )
+        except Exception:
+            # A launch/import error must not permanently disable Exit retries.
+            self._close_confirmation_pending = False
+            raise
 
     def _close_confirmation_finished(self, confirmed):
         self._close_confirmation_pending = False
@@ -674,7 +701,27 @@ class WinUXController(ExplorerTransferInteractionMixin):
     def job_command(self, action):
         return self._job_actions_controller().job_command(action)
 
+    def user_activity(self, *_args):
+        """Wake remote pollers when WinUx becomes interactive again."""
+        policy = getattr(self, "_inactivity_policy", None)
+        if policy is None:
+            return False
+        previous = policy.note_activity()
+        if previous == policy.ACTIVE:
+            return False
+        # Resume should feel immediate: collapse scheduler backoff and interrupt
+        # the current wait.  The normal query-token budget still prevents an
+        # input storm from generating a qstat storm.
+        force_fast = getattr(self, "_job_poll_force_fast", None)
+        wakeup = getattr(self, "_job_poll_wakeup", None)
+        if force_fast is not None:
+            force_fast.set()
+        if wakeup is not None:
+            wakeup.set()
+        return True
+
     def _refresh_jobs_now(self):
+        WinUXController.user_activity(self)
         return self._job_polling_controller().refresh_now()
 
 
@@ -688,8 +735,8 @@ class WinUXController(ExplorerTransferInteractionMixin):
     def _pending_job_deletions(self):
         return self._schedule_execution_controller().pending_deletions()
 
-    def job_schedules(self):
-        return self._schedule_execution_controller().rows()
+    def job_schedules(self, *, blocking=True):
+        return self._schedule_execution_controller().rows(blocking=blocking)
 
     def _record_schedule_status(self, task, kind, status):
         return self._schedule_execution_controller().record_status(
@@ -721,6 +768,7 @@ class WinUXController(ExplorerTransferInteractionMixin):
         return self._schedule_execution_controller().install_shared(entries)
 
     def job_schedule_command(self, action, kind, key):
+        WinUXController.user_activity(self)
         return self._schedule_execution_controller().command(action, kind, key)
 
     def _refresh_schedule_dialog(self):
@@ -750,23 +798,80 @@ class WinUXController(ExplorerTransferInteractionMixin):
         return self._navigation_controller().server_failed(panel, path, generation, error)
 
     def console_command(self, command):
+        WinUXController.user_activity(self)
+        if str(command).strip() == "--help":
+            self.server.append_console_message(ABAQUS_LINUX_HELP, command="--help")
+            return True
         if not self._ensure_server_online():
             return False
         try:
-            # A user command may change cwd, so the next Server Files
-            # navigation must be allowed to re-synchronise the shell.
-            self.server.invalidate_shell_directory()
             self.server.send_shell_command(command)
+            # Preserve a best-effort cwd specifically for asynchronous Tab
+            # completion, then invalidate the stricter navigation cache so the
+            # next Server Files navigation still re-synchronises the PTY.
+            note_command = getattr(self.server, "note_shell_command", None)
+            if callable(note_command):
+                note_command(command)
+            self.server.invalidate_shell_directory()
+            # Console commands can submit/cancel jobs directly or through site
+            # scripts. Recover polling now and keep checking while they run.
+            if JobPollingController.console_may_change_jobs(command):
+                self._refresh_jobs_now()
             return True
         except Exception as exc:
             self.view.show_error("Console", str(exc))
             return False
 
+    def console_complete(self, draft, cursor, callback):
+        """Resolve one SSH Console Tab completion without blocking the UI."""
+        if not callable(callback):
+            return False
+        draft = str(draft or "")
+        cursor = max(0, min(len(draft), int(cursor)))
+
+        def worker():
+            try:
+                result = self.server.complete_shell_input(draft, cursor)
+            except Exception as exc:
+                log_event("SSH Console completion failed: {}".format(exc))
+                result = {"start": cursor, "end": cursor, "candidates": []}
+            if getattr(self, "_closing", False):
+                return
+            try:
+                self.view.after(0, callback, result)
+            except Exception:
+                pass
+
+        handle = self._submit_background(
+            "ssh-console-complete", worker, key="ssh-console-complete",
+            replace=True)
+        if handle.state == "rejected":
+            try:
+                self.view.after(0, callback, {
+                    "start": cursor, "end": cursor, "candidates": []})
+            except Exception:
+                pass
+            return False
+        return True
+
+    def console_completion_list(self, draft, candidates, columns=80):
+        """Display an ambiguous completion list without sending it to SSH."""
+        if not self.server.connected:
+            return False
+        try:
+            return bool(self.server.append_shell_completion_listing(
+                draft, candidates, columns=columns))
+        except Exception as exc:
+            log_event("SSH Console completion list failed: {}".format(exc))
+            return False
+
     def console_interrupt(self):
+        WinUXController.user_activity(self)
         if not self.server.connected:
             return False
         try:
             self.server.interrupt_shell()
+            self._refresh_jobs_now()
             return True
         except Exception as exc:
             self.view.show_error("Console", str(exc))
@@ -816,6 +921,7 @@ class WinUXController(ExplorerTransferInteractionMixin):
             return str(path)
 
     def bookmark_command(self, action):
+        WinUXController.user_activity(self)
         action = str(action or "")
         if action == "add_local":
             panel = self.view.left
@@ -849,6 +955,7 @@ class WinUXController(ExplorerTransferInteractionMixin):
             dialog.refresh(self._bookmark_entries())
 
     def _open_bookmark(self, entry):
+        WinUXController.user_activity(self)
         panel_id = str(entry.get("panel_id") or "local")
         path = str(entry.get("path") or "")
         if not path:
@@ -898,6 +1005,7 @@ class WinUXController(ExplorerTransferInteractionMixin):
             dialog.refresh(self.site_preferences.load(), selected_id)
 
     def _save_site_profile(self, values):
+        WinUXController.user_activity(self)
         dialog = getattr(self.view, "site_manager_dialog", None)
         try:
             saved = self.site_preferences.save_site(values)
@@ -908,6 +1016,7 @@ class WinUXController(ExplorerTransferInteractionMixin):
         self._refresh_site_manager(saved.get("id"))
 
     def _delete_site_profile(self, site):
+        WinUXController.user_activity(self)
         site_id = str(site.get("id") or "")
         if not site_id:
             return
@@ -926,6 +1035,7 @@ class WinUXController(ExplorerTransferInteractionMixin):
             primary_text="Delete", secondary_text="Cancel", intent="danger")
 
     def _connect_site_profile(self, values):
+        WinUXController.user_activity(self)
         dialog = getattr(self.view, "site_manager_dialog", None)
         try:
             saved = self.site_preferences.save_site(values)
@@ -971,12 +1081,14 @@ class WinUXController(ExplorerTransferInteractionMixin):
             local_items, server_items, local_root, server_root)
 
     def sync_preview(self):
+        WinUXController.user_activity(self)
         return self._sync_preview_controller().preview()
 
     def _sync_preview_ready(self, rows, local_root, server_root):
         return self._sync_preview_controller().ready(rows, local_root, server_root)
 
     def _sync_transfer_rows(self, rows):
+        WinUXController.user_activity(self)
         return self._sync_preview_controller().transfer_rows(rows)
 
     def _server_notepad_controller(self):

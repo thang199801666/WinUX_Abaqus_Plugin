@@ -9,11 +9,12 @@ from unittest.mock import patch
 
 import WinUx
 import dearpygui.dearpygui as dpg
+from DearUIQt.widgets import QApplication
 from WinUx.dialogs.local_folder_form import LocalFolderDialog
-from WinUx.components.toolbar import ResourceTextures
+from WinUx.ui.components.toolbar import ResourceTextures
 from WinUx.platform.windows_icons import WindowsIconRegistry
 from WinUx.dialogs.floating_runtime import configure_context
-from WinUx.components.shared_scroller import dpg_window_rect
+from DearUIQt.qt.scroller import dpg_window_rect
 
 
 class View:
@@ -46,6 +47,10 @@ class FolderBrowserTests(unittest.TestCase):
         self.results = []
         dpg.create_context()
         configure_context(self.view)
+        # Production hosts (WinUx/view.py) always run with a QApplication;
+        # selector behaviors like frame-count pointer transactions, clipboard
+        # access and popup/modality ownership assume it exists.
+        self.application = QApplication(after=self.view.after)
         dpg.create_viewport(title="WinUx folder browser check", width=850, height=600)
         dpg.setup_dearpygui()
         dpg.show_viewport()
@@ -56,6 +61,7 @@ class FolderBrowserTests(unittest.TestCase):
     def tearDown(self):
         self.dialog.destroy()
         self.view.drain()
+        self.application.delete()
         ResourceTextures.reset()
         WindowsIconRegistry.reset()
         dpg.destroy_context()
@@ -88,6 +94,212 @@ class FolderBrowserTests(unittest.TestCase):
                            (dpg.get_item_state(first), dpg.get_item_configuration(first)))
         self.assertFalse(dpg.get_item_configuration(self.dialog.back_button)["enabled"])
 
+    def test_sidebar_rows_have_visible_full_width_hit_targets(self):
+        tree = self.dialog._places_tree
+        self.assertEqual(tree.topLevelItemCount(), 2)
+        self.assertGreater(self.dialog.drive_group.childCount(), 0)
+        for root in (self.dialog.quick_group, self.dialog.drive_group):
+            self.assertTrue(root.isExpanded())
+            self.assertNotIn(root, tree._rendered, 'Qt Places sidebar should not show Explorer section headers')
+            for item in (root.child(0),):
+                target = tree.nativeItem(item)
+                state = dpg.get_item_state(target)
+                self.assertTrue(state['visible'], (item.text(0), state))
+                self.assertGreater(state['rect_size'][0], 100, (item.text(0), state))
+                self.assertEqual(dpg.get_item_configuration(target)['width'], 0)
+        # Collapsing/rebuilding must not restore the negative-width rows.
+        self.dialog.drive_group.setExpanded(False)
+        self.dialog.drive_group.setExpanded(True)
+        for _ in range(3):
+            self.frame()
+        target = tree.nativeItem(self.dialog.drive_group.child(0))
+        self.assertGreater(dpg.get_item_rect_size(target)[0], 100)
+        # Exercise the same native selectable callback used by pointer dispatch
+        # without navigating/enumerating a potentially offline mapped drive.
+        with patch.object(self.dialog, '_place_clicked') as clicked:
+            item = self.dialog.drive_group.child(0)
+            target = tree.nativeItem(item)
+            options = dpg.get_item_configuration(target)
+            options['callback'](target, True, options['user_data'])
+            self.view.drain()
+            self.assertIs(tree.currentItem(), item)
+            clicked.assert_called_once()
+        # Navigation remains deferred until the pointer release boundary. Test
+        # the dispatch contract explicitly rather than depending on desktop
+        # foreground ownership in unattended GUI sessions.
+        with patch.object(self.dialog, '_navigate') as navigate, \
+                patch.object(self.dialog, '_pointer_transaction_finished', return_value=True):
+            home = self.dialog.place_buttons['Home']
+            options = dpg.get_item_configuration(home)
+            options['callback'](home, True, options['user_data'])
+            navigate.assert_not_called()
+            self.dialog._commit_place_navigation()
+            navigate.assert_called_once_with(str(Path.home()))
+
+    def test_sidebar_has_compact_qt_icon_and_label_geometry(self):
+        tree = self.dialog._places_tree
+        for item, expected_text_x, expected_icon_x in (
+                (self.dialog.quick_group.child(0), 28, 5),
+                (self.dialog.drive_group.child(0), 28, 5)):
+            visual = tree._rendered[item]
+            overlay_state = dpg.get_item_state(visual['overlay'])
+            hit_state = dpg.get_item_state(visual['selectable'])
+            self.assertTrue(overlay_state['visible'], (item.text(0), overlay_state))
+            self.assertEqual(overlay_state['rect_min'], hit_state['rect_min'],
+                             'Icon/text layer must overlap the native row, not flow below it')
+            label = dpg.get_item_configuration(visual['text'])
+            self.assertEqual(label['text'], item.text(0))
+            self.assertEqual(label['size'], 13)
+            self.assertEqual(label['pos'][0], expected_text_x)
+            self.assertEqual(dpg.get_item_configuration(visual['selectable'])['label'], '')
+            if expected_icon_x is not None:
+                icon = dpg.get_item_configuration(visual['icon'])
+                self.assertEqual(icon['pmin'], [expected_icon_x, 2])
+                self.assertEqual(icon['pmax'], [expected_icon_x + 16, 18])
+                self.assertTrue(dpg.does_item_exist(icon['texture_tag']))
+        # Asynchronous drive display-name refresh must update the painted
+        # caption rather than reintroducing a second native text target.
+        drive = self.dialog.drive_group.child(0)
+        self.dialog._set_place_label(drive, 'Test drive (C:)')
+        visual = tree._rendered[drive]
+        self.assertEqual(dpg.get_item_configuration(visual['text'])['text'],
+                         self.dialog._elide_sidebar_label('Test drive (C:)'))
+
+    def test_compact_qt_selector_layout_and_size_column(self):
+        dialog = self.dialog
+        self.assertFalse(dialog.has_footer, 'Actions should align beside the filename/filter rows')
+        self.assertFalse(dpg.is_item_shown(dialog.search_shell))
+        table = dialog.listbox._details_table
+        self.assertEqual(table.columnCount(), 4)
+        self.assertEqual(table._headers, ['Name', 'Size', 'Type', 'Date Modified'])
+        self.assertEqual(dialog.listbox._column_keys[table.nativeColumn(1)], 2)
+        self.assertEqual(dialog.listbox._column_keys[table.nativeColumn(3)], 1)
+        self.assertEqual(dpg.get_item_parent(dialog._accept_button), dialog._selection_grid.cell(0, 2).tag)
+        self.assertEqual(dpg.get_item_parent(dialog._reject_button), dialog._selection_grid.cell(1, 2).tag)
+        for row, item in enumerate(dialog.listbox._values):
+            size = table.item(row, 1).text()
+            if dialog._entry_types[item.key] == 'Folder':
+                self.assertEqual(size, '')
+            elif item.text == 'file.txt':
+                self.assertEqual(size, '12 bytes')
+        self.assertEqual(dialog.listbox._format_size(2191), '2.14 KiB')
+        self.assertFalse(dpg.is_item_shown(dialog.status), 'Normal item counts must not reserve a footer')
+        for control in (dialog.control_wrapper(dialog._accept_button),
+                        dialog.control_wrapper(dialog._reject_button),
+                        dialog._details_view_control):
+            theme = control.theme()
+            self.assertIsNotNone(theme)
+            control._refresh_style()
+            self.assertEqual(dpg.get_item_info(control.tag)['theme'], theme,
+                             'Passive focus styling must preserve selector-specific chrome')
+
+    def test_folder_list_and_address_use_windows_shell_folder_icon(self):
+        from WinUx.dialogs.folder_browser_style import folder_item_texture, address_location_texture
+        native_folder = WindowsIconRegistry.get_icon(is_dir=True)
+        self.assertEqual(folder_item_texture(), native_folder)
+        self.assertEqual(folder_item_texture(size=18), native_folder)
+        self.assertEqual(address_location_texture(str(self.root)), native_folder)
+        for item in self.dialog.listbox._values:
+            if self.dialog._entry_types[item.key] == 'Folder':
+                image = self.dialog.listbox.icons[item.key]
+                self.assertEqual(dpg.get_item_configuration(image)['texture_tag'], native_folder)
+
+    def test_qt_location_field_remains_editable_and_offers_parent_locations(self):
+        address = self.dialog.address
+        self.assertFalse(dpg.is_item_shown(address.breadcrumbs))
+        self.assertTrue(dpg.is_item_shown(address.editor))
+        address.begin_edit()
+        address._editor_control.setText('typed path not committed')
+        address.refresh(force=True)
+        self.assertEqual(address._editor_control.text(), 'typed path not committed')
+        address.end_edit()
+        self.assertTrue(dpg.is_item_shown(address.editor))
+        self.assertEqual(address._editor_control.text(), self.dialog._current_path)
+        theme = address._editor_control.theme()
+        address._editor_control._refresh_style()
+        self.assertEqual(dpg.get_item_info(address.editor)['theme'], theme,
+                         'Focus styling must not reintroduce a nested input border')
+        with patch.object(address._locations, 'popup'), \
+                patch.object(address._locations, 'setActions') as set_actions:
+            address._show_locations()
+            paths = [entry['action'] for entry in set_actions.call_args.args[0]]
+            self.assertIn(str(self.root.parent), paths)
+            self.assertIn(self.dialog._current_path, paths)
+            self.assertEqual(len(paths), len(set(paths)))
+        with patch.object(self.view, 'after') as after:
+            address._location_selected(str(self.root.parent))
+            after.assert_called_once_with(1, self.dialog._navigate, str(self.root.parent))
+
+    def test_selector_control_geometry_stays_aligned_after_resize(self):
+        from DearUIQt.widgets import QRetainedItem
+        from WinUx.dialogs.folder_browser_style import METRICS
+
+        def rect(tag):
+            geometry = QRetainedItem(tag).globalGeometry()
+            return geometry.x(), geometry.y(), geometry.width(), geometry.height()
+
+        for width in (560, 680, 900):
+            dpg.configure_item(self.dialog.tag, width=width)
+            self.dialog._apply_layout()
+            for _ in range(4):
+                self.frame()
+            location = rect(self.dialog.address.tag)
+            field = rect(self.dialog.folder_edit)
+            accept = rect(self.dialog._accept_button)
+            cancel = rect(self.dialog._reject_button)
+            self.assertEqual(location[0], field[0], 'Location/filename must share a left edge')
+            for control in (location, field, accept, cancel):
+                self.assertEqual(control[3], METRICS.control_height)
+            self.assertEqual(field[1], accept[1])
+            self.assertEqual(accept[0], cancel[0])
+            self.assertEqual(accept[2], cancel[2])
+            self.assertGreaterEqual(cancel[1] - accept[1] - accept[3], METRICS.form_gap)
+            for label_name, control in (('location', location), ('filename', field)):
+                label = rect(self.dialog._form_labels[label_name].tag)
+                self.assertAlmostEqual(label[1] + label[3] / 2, control[1] + control[3] / 2, delta=1)
+            if hasattr(self.dialog, 'file_type'):
+                combo = rect(self.dialog.file_type)
+                self.assertEqual(combo[3], METRICS.control_height)
+                self.assertEqual(combo[0], field[0])
+                self.assertEqual(combo[2], field[2])
+                self.assertEqual(combo[1], cancel[1])
+                label = rect(self.dialog._form_labels['filter'].tag)
+                self.assertAlmostEqual(label[1] + label[3] / 2, combo[1] + combo[3] / 2, delta=1)
+        self.dialog._set_status('Example error', error=True)
+        self.assertTrue(dpg.is_item_shown(self.dialog.status))
+        self.dialog._set_status('Ready')
+        self.assertFalse(dpg.is_item_shown(self.dialog.status))
+
+    def test_selector_state_themes_restore_focus_disabled_and_provider_removal(self):
+        dialog = self.dialog
+        for kind, control in (
+                ('editor', dialog._folder_edit_control),
+                ('accept', dialog.control_wrapper(dialog._accept_button)),
+                ('cancel', dialog.control_wrapper(dialog._reject_button))):
+            with patch.object(control, '_focused', return_value=False):
+                control._refresh_style()
+                normal = control.theme()
+            with patch.object(control, '_focused', return_value=True):
+                control._refresh_style()
+                focused = control.theme()
+            self.assertNotEqual(focused, normal)
+            control.setEnabled(False)
+            self.assertEqual(control.theme(), dialog._selector_themes[(kind, False, True)])
+            control.setEnabled(True)
+            self.assertFalse(dpg.get_item_configuration(control.tag)['enabled'] is False)
+            with patch.object(control, '_focused', return_value=False):
+                before = len(dialog._selector_themes)
+                for _ in range(10):
+                    control._refresh_style()
+                self.assertEqual(len(dialog._selector_themes), before)
+        editor = dialog._folder_edit_control
+        old_theme = editor._provider_previous_theme
+        editor.setThemeProvider(None)
+        self.assertEqual(editor.theme(), old_theme)
+        with self.assertRaises(TypeError):
+            editor.setThemeProvider('not callable')
+        editor.setThemeProvider(dialog._selector_theme_provider('editor'))
+
     def test_navigation_history_double_click_and_up(self):
         self.dialog._enter_key(str(self.root / "Alpha"))
         self.wait_listing()
@@ -117,8 +329,32 @@ class FolderBrowserTests(unittest.TestCase):
         self.wait_listing()
         home = self.dialog.place_buttons["Home"]
         with patch.object(self.dialog, "_navigate", return_value=True) as navigate:
-            dpg.get_item_configuration(home)["callback"](home, True, None)
+            config = dpg.get_item_configuration(home)
+            config["callback"](home, True, config["user_data"])
+            self.assertFalse(navigate.called)
+            self.dialog._commit_place_navigation()
+            self.assertFalse(navigate.called, "navigation must wait for a release-render boundary")
+            for _ in range(8):
+                self.frame()
         navigate.assert_called_once_with(str(Path.home()))
+
+    def test_sidebar_visual_layers_have_native_click_handlers(self):
+        for button in self.dialog.place_buttons.values():
+            overlay = next(visual['overlay'] for visual in self.dialog._places_tree._rendered.values()
+                           if visual['selectable'] == button)
+            registry = dpg.get_item_info(overlay)["handlers"]
+            self.assertTrue(registry, "Sidebar icon/text layer must receive clicks")
+            handlers = dpg.get_item_children(registry, 1)
+            self.assertEqual(len(handlers), 1)
+            config = dpg.get_item_configuration(handlers[0])
+            with patch.object(self.dialog, "_navigate") as navigate:
+                config["callback"](handlers[0], None, config["user_data"])
+                self.assertFalse(navigate.called)
+                self.dialog._commit_place_navigation()
+                self.assertFalse(navigate.called)
+                for _ in range(8):
+                    self.frame()
+                navigate.assert_called_once_with(dpg.get_item_configuration(button)["user_data"])
 
     def test_native_header_sort_preserves_selection_and_visible_rows(self):
         key = str(self.root / "Alpha")
@@ -180,22 +416,31 @@ class FolderBrowserTests(unittest.TestCase):
         self.assertTrue(self.dialog.winfo_exists())
         self.assertFalse(self.results)
         self.assertEqual(dpg.get_value(self.dialog.path_edit), str(self.root))
-        self.assertTrue(dpg.is_item_shown(self.dialog.breadcrumbs))
+        # The location field stays a plain editable editor; breadcrumbs never
+        # appear in this browser (see address bar `breadcrumbs=False`).
+        self.assertTrue(dpg.is_item_shown(self.dialog.path_edit))
+        self.assertFalse(dpg.is_item_shown(self.dialog.breadcrumbs))
         self.dialog.address.begin_edit()
         self.dialog._close_from_native()
         self.dialog._close_from_native()
         self.assertEqual(self.results, [None])
 
-    def test_breadcrumb_click_navigates_parent(self):
-        self.dialog._enter_key(str(self.root / "Alpha"))
-        self.wait_listing()
-        button = next(tag for tag in dpg.get_item_children(self.dialog.breadcrumbs, 1)
-                      if dpg.get_item_configuration(tag).get("label") == self.root.name)
-        dpg.get_item_configuration(button)["callback"](button, None, None)
-        self.wait_listing()
-        self.assertEqual(self.dialog._current_path, str(self.root))
+    # test_breadcrumb_click_navigates_parent superseded by
+    # test_qt_location_field_remains_editable_and_offers_parent_locations:
+    # the browser location field is now always editable (breadcrumbs=False) and
+    # parent navigation is offered by the address-bar location dropdown.
 
     def test_list_mode_survives_filter_refresh(self):
+        writes = []
+        original = dpg.set_value
+        def record(tag, value):
+            if tag == self.dialog.filter_edit:
+                import traceback
+                writes.append((value, traceback.format_stack(limit=7)))
+            return original(tag, value)
+        writer = patch.object(dpg, "set_value", side_effect=record)
+        writer.start()
+        self.addCleanup(writer.stop)
         self.dialog._change_view("List")
         self.assertFalse(dpg.get_item_configuration(self.dialog.listbox.table)["header_row"])
         self.assertTrue(all(not dpg.get_item_configuration(tag)["show"]
@@ -204,9 +449,13 @@ class FolderBrowserTests(unittest.TestCase):
         self.dialog._filter_entries()
         for _ in range(3):
             self.frame()
+            writes.append(("state", dpg.get_item_state(self.dialog.filter_edit), dpg.get_focused_item()))
         self.assertTrue(all(not dpg.get_item_configuration(tag)["show"]
                             for tag in self.dialog.listbox.detail_columns))
-        self.assertEqual([item.text for item in self.dialog.listbox._values], ["Alpha"])
+        self.assertEqual([item.text for item in self.dialog.listbox._values], ["Alpha"],
+                         {"query": dpg.get_value(self.dialog.filter_edit),
+                          "status": dpg.get_value(self.dialog.status),
+                          "path": self.dialog._current_path, "writes": writes})
         self.assertFalse(dpg.get_item_configuration(self.dialog.listbox.table)["header_row"])
         self.dialog._change_view("Details")
         self.assertEqual(len(self.dialog.listbox.detail_columns), 2)
@@ -509,16 +758,11 @@ class FolderBrowserTests(unittest.TestCase):
                 self.assertTrue(dpg.is_item_active(self.dialog._rename_editor))
                 self.dialog._close_from_escape()
 
-    def test_sidebar_groups_can_collapse_and_expand(self):
-        body = self.dialog.quick_group
-        groups = dpg.get_item_children(self.dialog.places, 1)
-        header = groups[groups.index(body) - 1]
-        toggle = dpg.get_item_children(header, 1)[0]
-        callback = dpg.get_item_configuration(toggle)["callback"]
-        callback(toggle, None, None)
-        self.assertFalse(dpg.is_item_shown(body))
-        callback(toggle, None, None)
-        self.assertTrue(dpg.is_item_shown(body))
+    # test_sidebar_groups_can_collapse_and_expand superseded by
+    # test_sidebar_rows_have_visible_full_width_hit_targets: sidebar sections
+    # are now QTreeWidget top-level items (setRootSectionsVisible(False)); the
+    # header/body drawlist pair no longer exists and collapse/expand is covered
+    # by that suite plus setExpandOnItemClick.
 
     def test_browser_keyboard_shortcuts_dispatch_to_address_and_new_folder(self):
         with patch.object(dpg, "is_key_down", side_effect=lambda key: key == dpg.mvKey_LControl):

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock
 
-from WinUx.widgets import QObject, Signal, QSignalBlocker, QLabel, QLineEdit, QVBoxLayout, QPushButton
+from WinUx.ui import QObject, Signal, QSignalBlocker, QLabel, QLineEdit, QVBoxLayout, QPushButton
 
 
 class Receiver(QObject):
@@ -70,6 +70,98 @@ class SignalTests(unittest.TestCase):
     def test_queued_connection_requires_scheduler(self):
         with self.assertRaises(ValueError):
             Signal().connect(Receiver().receive, queued=True)
+
+    def test_auto_connection_queues_only_cross_thread_delivery(self):
+        pending = []
+        receiver = Receiver(after=lambda delay, cb, *args: pending.append((cb, args)))
+        signal = Signal()
+        signal.connect(receiver.receive)
+        signal.emit("direct")
+        self.assertEqual(receiver.received, [("direct", threading.get_ident())])
+        worker = threading.Thread(target=signal.emit, args=("queued",))
+        worker.start()
+        worker.join()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(len(receiver.received), 1)
+        pending[0][0](*pending[0][1])
+        self.assertEqual(receiver.received[-1], ("queued", threading.get_ident()))
+
+    def test_explicit_direct_connection_retains_calling_thread_semantics(self):
+        receiver = Receiver()
+        signal = Signal()
+        signal.connect(receiver.receive, queued=False)
+        worker = threading.Thread(target=signal.emit, args=(1,))
+        worker.start()
+        worker.join()
+        self.assertEqual(receiver.received, [(1, worker.ident)])
+
+    def test_cross_thread_auto_connection_requires_a_real_ui_scheduler(self):
+        receiver = Receiver()
+        signal = Signal()
+        signal.connect(receiver.receive)
+        failures = []
+
+        def emit():
+            try:
+                signal.emit(1)
+            except RuntimeError as error:
+                failures.append(str(error))
+
+        worker = threading.Thread(target=emit)
+        worker.start()
+        worker.join()
+        self.assertEqual(len(failures), 1)
+        self.assertFalse(receiver.received)
+
+    def test_parent_from_another_thread_is_refused_without_detaching(self):
+        parent = QObject()
+        errors = []
+
+        def construct():
+            try:
+                QObject(parent)
+            except RuntimeError as error:
+                errors.append(str(error))
+
+        worker = threading.Thread(target=construct)
+        worker.start()
+        worker.join()
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(parent.children(), [])
+
+    def test_wrong_thread_native_child_is_rejected_before_backend_allocation(self):
+        parent, backend = QObject(), Mock()
+        errors = []
+
+        def construct():
+            try:
+                QLabel(parent=parent, backend=backend)
+            except RuntimeError as error:
+                errors.append(str(error))
+
+        worker = threading.Thread(target=construct)
+        worker.start()
+        worker.join()
+        self.assertEqual(len(errors), 1)
+        backend.add_text.assert_not_called()
+
+    def test_auto_connection_refuses_a_scheduler_running_on_the_wrong_thread(self):
+        receiver = Receiver(after=lambda delay, callback, *args: callback(*args))
+        signal = Signal()
+        signal.connect(receiver.receive)
+        errors = []
+
+        def emit():
+            try:
+                signal.emit("wrong-thread")
+            except RuntimeError as error:
+                errors.append(str(error))
+
+        worker = threading.Thread(target=emit)
+        worker.start()
+        worker.join()
+        self.assertEqual(len(errors), 1)
+        self.assertFalse(receiver.received)
 
     def test_reparent_validates_cycles_before_detaching(self):
         root, other = QObject(), QObject()
@@ -140,14 +232,17 @@ class SignalTests(unittest.TestCase):
         backend.set_value.assert_called_once_with(edit.tag, "sync")
 
     def test_dialog_action_preserves_callback_default_and_disposal(self):
-        source = Path(__file__).resolve().parents[1] / "WinUx/dialogs/qt_dialog.py"
+        source = Path(__file__).resolve().parents[1] / "DearUIQt/dialogs/qt_dialog.py"
         tree = ast.parse(source.read_text(encoding="utf-8"))
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "QtDialog")
-        methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {"action", "own_widget"}]
+        methods = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in {"action", "own_widget", "_qt_parent"}]
         backend = Mock()
         backend.add_button.return_value = 17
         namespace = {"QPushButton": QPushButton, "dpg": backend,
-                     "DialogMetrics": SimpleNamespace(BUTTON_HEIGHT=28)}
+                     "DialogMetrics": SimpleNamespace(BUTTON_HEIGHT=28),
+                     "_DIALOG_REJECT_CAPTIONS": {"cancel", "close", "no"},
+                     "get_backend": lambda: backend,
+                     "QObject": QObject}
         for theme in ("primary_button_theme", "danger_button_theme", "secondary_button_theme"):
             namespace[theme] = lambda: "theme"
         harness = ast.ClassDef(name="Harness", bases=[], keywords=[], body=methods, decorator_list=[])
@@ -155,7 +250,10 @@ class SignalTests(unittest.TestCase):
         dialog = namespace["Harness"]()
         dialog._widget_owner = QObject()
         dialog.view, dialog.footer = SimpleNamespace(after=Mock()), 9
+        dialog._native_parent_owners = {}
+        dialog._default_button = None
         dialog.action_width = lambda label: 80
+        dialog._remember_focusable = Mock()
         accepted = Mock()
         self.assertEqual(dialog.action("Run", accepted, "primary", True), 17)
         click = backend.add_button.call_args.kwargs["callback"]

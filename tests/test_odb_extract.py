@@ -14,10 +14,10 @@ SERVICE = ROOT / "WinUx" / "services" / "odb_extract.py"
 SERVER = ROOT / "WinUx" / "server_model.py"
 REMOTE_ODB = ROOT / "WinUx" / "services" / "remote_odb.py"
 CONTROLLER = ROOT / "WinUx" / "controller.py"
-FILE_PANEL = ROOT / "WinUx" / "components" / "file_panel.py"
+FILE_PANEL = ROOT / "WinUx" / "ui" / "components" / "file_panel.py"
 DIALOG = ROOT / "WinUx" / "dialogs" / "odb_extract_form.py"
 CALLBACKS = ROOT / "WinUx" / "controllers" / "callbacks.py"
-LISTVIEW = ROOT / "WinUx" / "components" / "explorer_context_menu.py"
+LISTVIEW = ROOT / "WinUx" / "ui" / "components" / "explorer_context_menu.py"
 
 SPEC = importlib.util.spec_from_file_location("winux_odb_extract", SERVICE)
 odb_extract = importlib.util.module_from_spec(SPEC)

@@ -4,8 +4,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from WinUx.components.explorer_item_model import ExplorerItemModel, stable_item_identity
-from WinUx.components.explorer_list_model import ListViewItem
+from WinUx.ui.components.explorer_item_model import ExplorerItemModel, stable_item_identity
+from WinUx.ui.components.explorer_list_model import ListViewItem
 
 
 class ExplorerItemModelTests(unittest.TestCase):
@@ -104,13 +104,14 @@ class ExplorerItemModelTests(unittest.TestCase):
 
 def facade_harness():
     """Exercise actual facade methods without loading the native DPG DLL."""
-    source = Path(__file__).resolve().parents[1] / "WinUx/components/explorer_list_view.py"
+    source = Path(__file__).resolve().parents[1] / "WinUx/ui/components/explorer_list_view.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ExplorerListView")
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef)
                and node.name in {"items", "_stable_item_identity", "set_items"}]
     harness = ast.ClassDef(name="Harness", bases=[], keywords=[], body=methods, decorator_list=[])
     namespace = {"stable_item_identity": stable_item_identity,
+                 "QRetainedItem": lambda tag: SimpleNamespace(exists=lambda: True),
                  "dpg": SimpleNamespace(does_item_exist=lambda tag: True)}
     exec(compile(ast.fix_missing_locations(ast.Module(body=[harness], type_ignores=[])), str(source), "exec"), namespace)
     view = namespace["Harness"]()

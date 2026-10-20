@@ -14,7 +14,8 @@ def fixture(remote=True):
         selected_transfer_paths=Mock(return_value=[PurePosixPath('/folder/a')]),
         selected_paths=Mock(return_value=[PurePosixPath('/folder/a')]),
         parent_selected=lambda: False, row_for_path=Mock(return_value=0),
-        begin_inline_rename=Mock(), refocus_inline_rename=Mock(), select_row=Mock())
+        begin_inline_rename=Mock(), refocus_inline_rename=Mock(), select_row=Mock(),
+        focus_created_item=Mock())
     app = SimpleNamespace(_closing=False, _connection_generation=1,
         view=SimpleNamespace(after=lambda delay, cb, *args: callbacks.append((cb, args)),
             winfo_exists=lambda: True, show_error=Mock(), confirm_action_async=Mock()),
@@ -125,10 +126,11 @@ class FileCommandTests(unittest.TestCase):
         commands.command(panel, 'new_file')
         workers[0]()
         drain(callbacks)
-        panel.begin_inline_rename.assert_called_once()
+        panel.focus_created_item.assert_called_once()
+        created, commit = panel.focus_created_item.call_args.args
+        self.assertEqual(created, PurePosixPath('/folder/new'))
         app._connection_generation += 1
-        rename = panel.begin_inline_rename.call_args.args[-1]
-        self.assertFalse(rename('changed'))
+        self.assertFalse(commit('changed'))
         app.server.rename.assert_not_called()
 
     def test_stale_or_rejected_creation_makes_no_server_call(self):

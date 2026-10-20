@@ -66,7 +66,7 @@ class BackgroundTaskManagerTests(unittest.TestCase):
 
 
 class UiDispatcherOptimizationTests(unittest.TestCase):
-    def test_delayed_callbacks_use_one_scheduler_thread(self):
+    def test_delayed_callbacks_share_the_gui_event_loop_without_scheduler_thread(self):
         dispatcher = UiDispatcher()
         fired = []
         try:
@@ -75,7 +75,23 @@ class UiDispatcherOptimizationTests(unittest.TestCase):
             time.sleep(0.04)
             dispatcher.drain()
             self.assertEqual(sorted(fired), list(range(20)))
-            self.assertTrue(dispatcher._scheduler.daemon)
+            self.assertFalse(hasattr(dispatcher, "_scheduler"))
+            self.assertTrue(dispatcher.snapshot()["single_event_loop"])
+        finally:
+            dispatcher.close()
+
+    def test_cancelled_delayed_callback_releases_payload_and_never_runs(self):
+        dispatcher = UiDispatcher()
+        fired = []
+        try:
+            token = dispatcher.after(60_000, fired.append, "stale")
+            self.assertIsNotNone(token)
+            self.assertEqual(dispatcher.snapshot()["scheduled_callbacks"], 1)
+            self.assertTrue(dispatcher.after_cancel(token))
+            self.assertEqual(dispatcher.snapshot()["scheduled_callbacks"], 0)
+            self.assertIsNone(dispatcher.next_deadline_ms())
+            dispatcher.drain()
+            self.assertEqual(fired, [])
         finally:
             dispatcher.close()
 

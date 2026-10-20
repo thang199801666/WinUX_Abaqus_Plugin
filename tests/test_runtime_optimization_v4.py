@@ -3,10 +3,10 @@ import importlib.util
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
-MODEL = ROOT / "WinUx" / "components" / "explorer_list_model.py"
-LIST_VIEW = ROOT / "WinUx" / "components" / "explorer_list_view.py"
-LIST_DATA = ROOT / "WinUx" / "components" / "explorer_data_view.py"
-ROW_REGISTRY = ROOT / "WinUx" / "components" / "explorer_row_registry.py"
+MODEL = ROOT / "WinUx" / "ui" / "components" / "explorer_list_model.py"
+LIST_VIEW = ROOT / "WinUx" / "ui" / "components" / "explorer_list_view.py"
+LIST_DATA = ROOT / "WinUx" / "ui" / "components" / "explorer_data_view.py"
+ROW_REGISTRY = ROOT / "WinUx" / "ui" / "components" / "explorer_row_registry.py"
 SERVER_PATH = ROOT / "WinUx" / "dialogs" / "server_path_form.py"
 CONTROLLER = ROOT / "WinUx" / "controller.py"
 

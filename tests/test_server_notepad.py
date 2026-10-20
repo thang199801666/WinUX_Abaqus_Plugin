@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SERVER_MODEL = ROOT / "WinUx" / "server_model.py"
 SERVER_TEXT = ROOT / "WinUx" / "services" / "server_text.py"
 CONTROLLER = ROOT / "WinUx" / "controller.py"
-FILE_PANEL = ROOT / "WinUx" / "components" / "file_panel.py"
+FILE_PANEL = ROOT / "WinUx" / "ui" / "components" / "file_panel.py"
 CALLBACKS = ROOT / "WinUx" / "controllers" / "callbacks.py"
 DIALOG = ROOT / "WinUx" / "dialogs" / "server_notepad_dialog.py"
 PROCESS = ROOT / "WinUx" / "services" / "server_notepad_process.py"
@@ -30,7 +30,7 @@ SEARCH = ROOT / "WinUx" / "services" / "server_notepad_search.py"
 HIGHLIGHT = ROOT / "WinUx" / "services" / "server_notepad_highlight.py"
 COMMANDS = ROOT / "WinUx" / "services" / "server_notepad_commands.py"
 IPC = ROOT / "WinUx" / "services" / "server_notepad_ipc.py"
-TABS = ROOT / "WinUx" / "components" / "server_notepad_tabs.py"
+TABS = ROOT / "WinUx" / "ui" / "components" / "server_notepad_tabs.py"
 LAYOUT = ROOT / "WinUx" / "services" / "server_notepad_layout.py"
 TYPES = ROOT / "WinUx" / "services" / "server_notepad_types.py"
 SERVER_NOTEPAD_RUNTIME_SOURCE = "\n".join(
@@ -528,7 +528,8 @@ print(ServerNotepadDialog.__name__)
         facade = DIALOG.read_text(encoding="utf-8")
         process = SERVER_NOTEPAD_RUNTIME_SOURCE
         self.assertIn("class ServerNotepadDialog", facade)
-        self.assertIn("subprocess.Popen(", facade)
+        self.assertIn("QProcess.launch(", facade)
+        self.assertNotIn("subprocess.Popen(", facade)
         self.assertIn("server_notepad_process.py", facade)
         self.assertNotIn("import tkinter as tk", facade)
         self.assertNotIn("NativeDialogController", facade)
@@ -790,7 +791,8 @@ print(ServerNotepadDialog.__name__)
         facade = DIALOG.read_text(encoding="utf-8")
         self.assertIn("server_notepad.log", facade)
         self.assertIn("closed unexpectedly", facade)
-        self.assertIn("process.terminate()", facade)
+        self.assertIn("QProcess.launch(", facade)
+        self.assertIn("process.close(timeout=max(0.0, float(timeout)), force=True)", facade)
         self.assertIn("CREATE_NO_WINDOW", facade)
 
 

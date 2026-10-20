@@ -19,7 +19,7 @@ _IGNORED_DIRECTORIES = {
     ".pytest_cache",
     ".mypy_cache",
 }
-_IGNORED_SUFFIXES = {".pyc", ".pyo"}
+_IGNORED_SUFFIXES = {".pyc", ".pyo", ".md", ".markdown"}
 _LEGACY_LAYOUT_DIRECTORIES = {"app", "WixUx"}
 
 
@@ -57,6 +57,8 @@ def _resolve_winux_source():
 def _validate_layout():
     if not (PLUGIN_DIR / "WinUx_plugin.py").is_file():
         raise RuntimeError("WinUx registration file is missing.")
+    if not (PLUGIN_DIR / "DearUIQt" / "__init__.py").is_file():
+        raise RuntimeError("DearUIQt wrapper package is missing from the plug-in root.")
     return _resolve_winux_source()
 
 

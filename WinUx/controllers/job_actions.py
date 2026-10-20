@@ -2,8 +2,16 @@
 from pathlib import Path
 import threading
 
-from ..abaqus_version_preferences import AbaqusVersionPreferences
+from ..preferences.abaqus_versions import AbaqusVersionPreferences
 from ..runtime.operation_context import OperationContext
+
+
+CHECK_NODES_COMMAND = (
+    "pbsnodes -a | awk '\n"
+    "/^[^[:space:]]/ {node=$1}\n"
+    "/state =/ {print node, $3}\n"
+    "'"
+)
 
 
 class JobActionsController:
@@ -62,10 +70,23 @@ class JobActionsController:
                 if confirmed and context.current() else None,
             )
 
+    def _check_nodes(self):
+        if self.app._closing:
+            return
+        self.view.set_console_visible(True, persist=True, request_login=False)
+        # Use the interactive shell so PBS uses the same environment as the
+        # SSH Console and stdout/stderr arrive through its existing reader.
+        return self.app.console_command(CHECK_NODES_COMMAND)
+
     def job_command(self, action):
         if self.app._closing:
             return
         context = OperationContext(self.app, remote=True)
+        if action == "check_nodes":
+            # Cluster status is independent of the selected job and its owner.
+            # Reveal/focus the console only after the context popup has closed.
+            context.post(0, self._check_nodes)
+            return
         # Context-menu callbacks run while Dear PyGui is closing the popup.
         # Opening a modal in that same callback can silently fail. Queue modal
         # actions so popup teardown completes first.
@@ -102,7 +123,10 @@ class JobActionsController:
         if not values:
             return
         job_id, name, owner = str(values[0]), str(values[1]), str(values[2])
-        if action in ("check", "edit", "cancel", "open_temp", "hot_download", "job_plots") and owner.casefold() != self.server.username.casefold():
+        # Check Job validates the *live* SSH identity in read_job_status().
+        # Do not gate it with the login-time cached username here, otherwise a
+        # reconnect/account change can silently suppress a valid check.
+        if action in ("edit", "cancel", "open_temp", "hot_download", "job_plots") and owner.casefold() != self.server.username.casefold():
             return
         hot_download_dialog = None
         hot_download_cancel = None
@@ -128,7 +152,7 @@ class JobActionsController:
             try:
                 context.check()
                 if action == "check":
-                    response = self.server.read_job_status(job_id, name)
+                    response = self.server.read_job_status(job_id, name, owner)
                     context.post(0, self.view.show_message,
                                     "Job Status", response or "Job is available")
                 elif action == "details":
@@ -140,9 +164,9 @@ class JobActionsController:
                     if response:
                         context.post(0, self.view.show_message,
                                         "Cancel Job", response)
-                    context.post(1000, self.app._refresh_jobs_now)
+                    context.post(0, self.app._refresh_jobs_now)
                 elif action == "open_temp":
-                    folder = self.server.find_job_temp_folder(job_id, name)
+                    folder = self.server.find_job_temp_folder(job_id, name, owner)
                     context.post(0, self.app.open_path, self.view.right, folder)
                 elif action == "hot_download":
                     target = self.server.hot_download(
@@ -169,4 +193,3 @@ class JobActionsController:
             completion.report_rejection(handle, hot_download_dialog.fail)
         else:
             context.report_rejection(handle, self.view.show_error, "Job command failed")
-

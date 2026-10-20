@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from WinUx.controllers.job_actions import JobActionsController
+from WinUx.controllers.job_actions import CHECK_NODES_COMMAND, JobActionsController
 
 
 def fixture():
@@ -15,6 +15,7 @@ def fixture():
         winfo_exists=lambda: True, show_error=Mock(), show_message=Mock(),
         confirm_action_async=Mock(), edit_job=Mock(), get_job_plots=Mock(return_value=None),
         close_job_plots=Mock(), show_transfer_progress=Mock(return_value=dialog),
+        set_console_visible=Mock(),
         left=SimpleNamespace(current_path=Path('local')), right=object())
     app = SimpleNamespace(
         _closing=False, _connection_generation=1, view=view,
@@ -24,7 +25,7 @@ def fixture():
         _job_edit_settings={}, _schedule_job_deletion=Mock(),
         _selected_job_values=Mock(return_value=['1', 'job', 'owner']),
         _refresh_jobs_now=Mock(), _job_odb_command=Mock(), _open_job_plots=Mock(),
-        open_path=Mock(), _select_path=Mock())
+        open_path=Mock(), _select_path=Mock(), console_command=Mock(return_value=True))
     def submit(name, worker):
         workers.append(worker)
         return SimpleNamespace(state='pending')
@@ -39,6 +40,41 @@ def drain(callbacks):
 
 
 class JobActionsTests(unittest.TestCase):
+    def test_check_nodes_reveals_console_after_popup_and_sends_original_command(self):
+        app, actions, workers, callbacks, _ = fixture()
+        app._selected_job_values.return_value = None
+        actions.job_command('check_nodes')
+        app.view.set_console_visible.assert_not_called()
+        app.console_command.assert_not_called()
+        drain(callbacks)
+        app.view.set_console_visible.assert_called_once_with(True, persist=True, request_login=False)
+        app.console_command.assert_called_once_with(
+            "pbsnodes -a | awk '\n/^[^[:space:]]/ {node=$1}\n/state =/ {print node, $3}\n'")
+        app._selected_job_values.assert_not_called()
+        app._submit_background.assert_not_called()
+        app.view.show_message.assert_not_called()
+        self.assertEqual(workers, [])
+
+    def test_check_nodes_is_not_restricted_to_selected_job_owner(self):
+        app, actions, _, callbacks, _ = fixture()
+        app._selected_job_values.return_value = ['1', 'job', 'another']
+        actions.job_command('check_nodes')
+        drain(callbacks)
+        app.console_command.assert_called_once_with(CHECK_NODES_COMMAND)
+
+    def test_queued_check_nodes_does_not_target_a_new_session_or_closed_app(self):
+        for change in ('reconnect', 'close'):
+            with self.subTest(change=change):
+                app, actions, _, callbacks, _ = fixture()
+                actions.job_command('check_nodes')
+                if change == 'reconnect':
+                    app._connection_generation += 1
+                else:
+                    app._closing = True
+                drain(callbacks)
+                app.console_command.assert_not_called()
+                app.view.set_console_visible.assert_not_called()
+
     def test_queued_modal_does_not_open_after_reconnect(self):
         app, actions, workers, callbacks, _ = fixture()
         actions.job_command('cancel')
@@ -184,14 +220,17 @@ class JobActionsTests(unittest.TestCase):
         dialog.fail.assert_not_called()
         app.open_path.assert_not_called()
 
-    def test_owner_and_shutdown_prevent_command_submission(self):
+    def test_check_uses_live_identity_instead_of_cached_owner_guard(self):
         app, actions, workers, callbacks, _ = fixture()
         app._selected_job_values.return_value = ['1', 'job', 'another']
         actions.job_command('check')
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(callbacks, [])
+
+        # Shutdown still suppresses newly requested commands.
         app._closing = True
         actions.job_command('details')
-        self.assertEqual(workers, [])
-        self.assertEqual(callbacks, [])
+        self.assertEqual(len(workers), 1)
 
 
 if __name__ == '__main__':

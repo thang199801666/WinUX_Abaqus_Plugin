@@ -41,3 +41,67 @@ class PollingBudgetTests(unittest.TestCase):
                     self.assertGreaterEqual(delay, 5)
                     self.assertLessEqual(delay, 30)
 
+    def test_recovery_keeps_unchanged_snapshots_fast_until_scheduler_settles(self):
+        policy = self.policy()
+        policy.record_cost(100)
+        policy.observe("job-running", now=0)
+        self.assertEqual(policy.observe("job-running", now=60), 30)
+        policy.hold_fast(30, now=60)
+        for now in (60, 65, 70, 75, 80, 85):
+            self.assertEqual(policy.observe("job-running", now=now), 5)
+        self.assertEqual(policy.observe("job-removed", now=87), 5)
+        self.assertEqual(policy.snapshot(now=87)["fast_recovery_seconds"], 3)
+        self.assertEqual(policy.observe("job-removed", now=91), 30)
+
+    def test_second_action_extends_recovery_without_shortening_existing_window(self):
+        policy = self.policy()
+        policy.record_cost(100)
+        policy.observe("stable", now=0)
+        policy.hold_fast(30, now=0)
+        policy.hold_fast(30, now=20)
+        policy.hold_fast(1, now=21)
+        self.assertEqual(policy.observe("stable", now=45), 5)
+        self.assertEqual(policy.observe("stable", now=51), 30)
+
+    def test_recovery_does_not_disable_error_backoff(self):
+        policy = self.policy()
+        policy.hold_fast(30, now=0)
+        self.assertGreater(policy.on_error(), 5)
+        self.assertEqual(policy.observe("reconnected", now=5), 5)
+
+    def test_refresh_budget_allows_one_follow_up_then_limits_repeated_requests(self):
+        policy = self.policy()
+        for _ in range(2):
+            self.assertEqual(policy.next_query_delay(now=0), 0)
+            policy.record_query_start(now=0)
+        for _ in range(1000):
+            policy.force_fast(now=0)
+            self.assertEqual(policy.next_query_delay(now=0), 5)
+        self.assertEqual(policy.next_query_delay(now=2), 3)
+        self.assertEqual(policy.next_query_delay(now=5), 0)
+        policy.record_query_start(now=5)
+        self.assertEqual(policy.next_query_delay(now=5), 5)
+
+    def test_normal_poll_intervals_do_not_pay_an_extra_budget_delay(self):
+        policy = self.policy()
+        for now in range(0, 100, 5):
+            self.assertEqual(policy.next_query_delay(now=now), 0)
+            policy.record_query_start(now=now)
+
+    def test_stable_sample_limit_can_back_off_without_waiting_for_quiet_time(self):
+        policy = self.policy()
+        policy.observe("stable", now=0)
+        for now in range(1, 9):
+            policy.observe("stable", now=now)
+        self.assertEqual(policy.current_interval, 30)
+
+    def test_quiet_time_limit_can_back_off_without_many_samples(self):
+        policy = self.policy()
+        policy.observe("stable", now=0)
+        self.assertEqual(policy.observe("stable", now=90), 30)
+
+    def test_negative_jitter_cannot_violate_expensive_query_duty_budget(self):
+        policy = CostAwarePollingPolicy(5, 30, clock=lambda: 0, random_source=lambda: 0)
+        policy.record_cost(2)
+        policy.observe("stable")
+        self.assertGreaterEqual(policy.observe("stable"), 18)

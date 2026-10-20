@@ -31,7 +31,7 @@ def main():
                 view._caret = dpg.draw_rectangle((0, 0), (10, 2), parent=view.canvas)
                 view.buffer.set_output('\n'.join('Row {}'.format(n) for n in range(100)))
                 with patch.object(dpg, 'get_item_state', return_value={'rect_size': (640, 240)}), \
-                     patch('WinUx.components.console_renderer.time.monotonic') as clock:
+                     patch('WinUx.ui.components.console_renderer.time.monotonic') as clock:
                     clock.return_value = 0
                     renderer.paint()
                     with patch.object(dpg, 'draw_text', wraps=dpg.draw_text) as draws, \

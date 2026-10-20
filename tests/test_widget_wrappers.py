@@ -2,7 +2,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from WinUx.widgets import QObject, QLabel, QLineEdit, QPushButton, QProgressBar, QVBoxLayout
+from WinUx.ui import QObject, QLabel, QLineEdit, QPushButton, QProgressBar, QVBoxLayout
 
 
 class WidgetTests(unittest.TestCase):

@@ -7,12 +7,15 @@ bar -> dialog button box) instead of styling isolated ImGui controls.
 import os
 from dataclasses import dataclass
 from pathlib import Path
-import dearpygui.dearpygui as dpg
+from DearUIQt.backends import dpg
 from PIL import Image, ImageDraw, ImageFilter, ImageOps
 
-from ..components.qt_style import QtFusionPalette, QtFusionMetrics
-from ..components.shared_scroller import add_dpg_scroller_style
-from ..components.tooltip import add_styled_tooltip
+from DearUIQt.gui import QtFusionPalette, QtFusionMetrics, QPainter
+from DearUIQt.themes import (
+    ThemeTarget, ThemeColor, ThemeStyle, theme_component, make_theme, with_scrollbar,
+)
+from DearUIQt.tooltip import add_styled_tooltip
+from DearUIQt.widgets import QToolButton, QCanvas
 from ..platform.windows_icons import WindowsIconRegistry
 
 
@@ -25,17 +28,23 @@ GLYPHS = {"Back": 0xE72B, "Forward": 0xE72A, "Up": 0xE74A,
 
 @dataclass(frozen=True)
 class BrowserMetrics:
-    location_height: int = 28
-    toolbar_height: int = 34
+    control_height: int = 26
+    tool_button_size: int = 26
+    icon_size: int = 16
+    label_width: int = 76
+    action_width: int = 100
+    form_gap: int = 6
+    location_height: int = 26
+    toolbar_height: int = 32
     command_height: int = 28
-    navigation_width: int = 28
-    sidebar_width: int = 196
-    sidebar_row_height: int = 24
+    navigation_width: int = 26
+    sidebar_width: int = 144
+    sidebar_row_height: int = 20
     sidebar_section_gap: int = 8
     header_height: int = 24
-    row_height: int = 20
+    row_height: int = 18
     divider_width: int = 1
-    selection_height: int = 36
+    selection_height: int = 72
     inline_action_height: int = 34
 
 
@@ -79,227 +88,355 @@ def load_navigation_font():
 def browser_surface_theme(background=None, padding=(0, 0), cell_padding=(6, 2), spacing=(6, 3)):
     p = QtFusionPalette
     background = tuple(background or p.BASE)
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvAll):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, background)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, p.BORDER_LIGHT)
-            dpg.add_theme_color(dpg.mvThemeCol_TableHeaderBg, p.TOOLBAR)
-            dpg.add_theme_color(dpg.mvThemeCol_TableBorderLight, p.BORDER_LIGHT)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, *padding)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, *spacing)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_CellPadding, *cell_padding)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.ALL,
+        colors={
+            ThemeColor.CHILD_BACKGROUND: background,
+            ThemeColor.BORDER: p.BORDER_LIGHT,
+            ThemeColor.TABLE_HEADER_BACKGROUND: p.TOOLBAR,
+            ThemeColor.TABLE_BORDER_LIGHT: p.BORDER_LIGHT,
+        },
+        styles={
+            ThemeStyle.WINDOW_PADDING: padding,
+            ThemeStyle.ITEM_SPACING: spacing,
+            ThemeStyle.CHILD_ROUNDING: 0,
+            ThemeStyle.CELL_PADDING: cell_padding,
+        },
+    ))
 
 
 def browser_dialog_body_theme():
     return browser_surface_theme(
         background=QtFusionPalette.WINDOW,
-        padding=(8, 7), cell_padding=(4, 2), spacing=(5, 5))
+        padding=(8, 8), cell_padding=(3, 3), spacing=(METRICS.form_gap, METRICS.form_gap))
 
 
 def browser_layout_theme(cell_padding=(2, 1)):
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvTable):
-            dpg.add_theme_style(dpg.mvStyleVar_CellPadding, *cell_padding)
-            dpg.add_theme_color(dpg.mvThemeCol_TableBorderStrong, (0, 0, 0, 0))
-            dpg.add_theme_color(dpg.mvThemeCol_TableBorderLight, (0, 0, 0, 0))
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.TABLE,
+        colors={
+            ThemeColor.TABLE_BORDER_STRONG: (0, 0, 0, 0),
+            ThemeColor.TABLE_BORDER_LIGHT: (0, 0, 0, 0),
+        },
+        styles={ThemeStyle.CELL_PADDING: cell_padding, ThemeStyle.ITEM_SPACING: (0, 0)},
+    ))
 
 
 def browser_toolbar_theme(*, border_bottom=False):
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.WINDOW)
-            dpg.add_theme_color(dpg.mvThemeCol_Border,
-                                p.BORDER_LIGHT if border_bottom else (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 3)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 4, 2)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={
+            ThemeColor.CHILD_BACKGROUND: p.WINDOW,
+            ThemeColor.BORDER: p.BORDER_LIGHT if border_bottom else (0, 0, 0, 0),
+        },
+        styles={
+            ThemeStyle.WINDOW_PADDING: (0, 3),
+            ThemeStyle.ITEM_SPACING: (4, 2),
+            ThemeStyle.CHILD_BORDER_SIZE: 0,
+            ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    ))
 
 
 def browser_field_shell_theme(*, focused=False):
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.BASE)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, p.FOCUS if focused else p.BORDER)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 3, 1)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 1)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 1)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={
+            ThemeColor.CHILD_BACKGROUND: p.BASE,
+            ThemeColor.BORDER: p.FOCUS if focused else p.BORDER,
+        },
+        styles={
+            ThemeStyle.WINDOW_PADDING: (3, 1),
+            ThemeStyle.CHILD_BORDER_SIZE: 1,
+            ThemeStyle.CHILD_ROUNDING: 2,
+        },
+    ))
+
+
+def browser_file_editor_theme(*, focused=False, disabled=False, font_height=14, combo=False):
+    """Quiet one-pixel field chrome, scoped to the selector's filename input."""
+    p = QtFusionPalette
+    background = p.BUTTON_DISABLED if disabled else p.BASE
+    text = p.TEXT_DISABLED if disabled else p.TEXT
+    border = p.FOCUS if focused and not disabled else (174, 178, 182, 255)
+    colors = {ThemeColor.FRAME_BACKGROUND: background,
+              ThemeColor.FRAME_BACKGROUND_HOVERED: background,
+              ThemeColor.FRAME_BACKGROUND_ACTIVE: background,
+              ThemeColor.TEXT: text, ThemeColor.BORDER: border}
+    if combo:
+        colors.update({ThemeColor.BUTTON: background,
+                       ThemeColor.BUTTON_HOVERED: p.HIGHLIGHT_HOVER,
+                       ThemeColor.BUTTON_ACTIVE: p.HIGHLIGHT_SOFT,
+                       ThemeColor.POPUP_BACKGROUND: p.BASE,
+                       ThemeColor.HEADER: p.SELECTION_ACTIVE,
+                       ThemeColor.HEADER_HOVERED: p.HIGHLIGHT_HOVER})
+    return make_theme(theme_component(
+        ThemeTarget.COMBO_BOX if combo else ThemeTarget.LINE_EDIT,
+        enabled_state=not disabled, colors=colors,
+        styles={ThemeStyle.FRAME_BORDER_SIZE: 1, ThemeStyle.FRAME_ROUNDING: 2,
+                ThemeStyle.FRAME_PADDING: (5, max(0, (METRICS.control_height - font_height) / 2))},
+    ))
+
+
+def browser_action_theme(*, default=False, focused=False, disabled=False):
+    """Restrained Qt-like action chrome without the generic raised-button edge."""
+    return make_theme(theme_component(
+        ThemeTarget.PUSH_BUTTON, enabled_state=not disabled,
+        colors={ThemeColor.BUTTON: QtFusionPalette.BUTTON_DISABLED if disabled else (250, 250, 250, 255),
+                ThemeColor.BUTTON_HOVERED: (232, 243, 250, 255),
+                ThemeColor.BUTTON_ACTIVE: (214, 233, 245, 255),
+                ThemeColor.TEXT: QtFusionPalette.TEXT_DISABLED if disabled else QtFusionPalette.TEXT,
+                ThemeColor.BORDER: QtFusionPalette.FOCUS if (default or focused) and not disabled else (174, 178, 182, 255)},
+        styles={ThemeStyle.FRAME_BORDER_SIZE: 1, ThemeStyle.FRAME_ROUNDING: 2,
+                ThemeStyle.FRAME_PADDING: (8, 4)},
+    ))
 
 
 def browser_icon_slot_theme():
-    """Borderless fixed-height slot that vertically centers embedded icons.
-
-    Dear ImGui table cells top-align images while QLineEdit/QToolBar content is
-    vertically centered.  A tiny child canvas gives address/search icons their
-    own stable alignment without changing input routing.
-    """
+    """Borderless fixed-height slot that vertically centers embedded icons."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.BASE)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: p.BASE, ThemeColor.BORDER: (0, 0, 0, 0)},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (0, 0), ThemeStyle.ITEM_SPACING: (0, 0),
+            ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    ))
 
 
-def browser_embedded_editor_theme():
+def browser_embedded_editor_theme(font_height=14):
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvInputText):
-            clear = (255, 255, 255, 0)
-            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, clear)
-            dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, clear)
-            dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, clear)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, clear)
-            dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT)
-            dpg.add_theme_color(dpg.mvThemeCol_TextSelectedBg, (0, 120, 215, 100))
-            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 3, 4)
-    return theme
+    clear = (255, 255, 255, 0)
+    return make_theme(theme_component(
+        ThemeTarget.LINE_EDIT,
+        colors={
+            ThemeColor.FRAME_BACKGROUND: clear,
+            ThemeColor.FRAME_BACKGROUND_HOVERED: clear,
+            ThemeColor.FRAME_BACKGROUND_ACTIVE: clear,
+            ThemeColor.BORDER: clear,
+            ThemeColor.TEXT: p.TEXT,
+            ThemeColor.TEXT_SELECTED_BACKGROUND: (0, 120, 215, 100),
+        },
+        styles={
+            ThemeStyle.FRAME_BORDER_SIZE: 0, ThemeStyle.FRAME_ROUNDING: 0,
+            ThemeStyle.FRAME_PADDING: (2, max(0, (METRICS.control_height - 2 - font_height) / 2)),
+        },
+    ))
 
+
+def browser_caption_theme():
+    return make_theme(
+        theme_component(
+            ThemeTarget.CHILD_WINDOW,
+            colors={ThemeColor.CHILD_BACKGROUND: (0, 0, 0, 0), ThemeColor.BORDER: (0, 0, 0, 0)},
+            styles={ThemeStyle.WINDOW_PADDING: (0, 0), ThemeStyle.ITEM_SPACING: (0, 0),
+                    ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.CHILD_ROUNDING: 0}),
+        # DPG Text calls AlignTextToFramePadding itself. Suppress that extra
+        # offset: the caption host already positions text at the field baseline.
+        theme_component(ThemeTarget.TEXT, styles={ThemeStyle.FRAME_PADDING: (0, 0)}),
+    )
+
+
+
+def browser_rename_editor_theme():
+    """Fusion-style inline rename editor without renderer symbols in the form."""
+    return make_theme(theme_component(
+        ThemeTarget.LINE_EDIT,
+        colors={
+            ThemeColor.FRAME_BACKGROUND: QtFusionPalette.BASE,
+            ThemeColor.TEXT: QtFusionPalette.TEXT,
+            ThemeColor.BORDER: (72, 72, 72, 255),
+        },
+        styles={
+            ThemeStyle.FRAME_BORDER_SIZE: 1,
+            ThemeStyle.FRAME_ROUNDING: 0,
+            ThemeStyle.FRAME_PADDING: (2, 1),
+        },
+    ))
 
 def browser_workspace_theme():
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.BASE)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, p.BORDER)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 1)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: p.BASE, ThemeColor.BORDER: p.BORDER},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (0, 0), ThemeStyle.ITEM_SPACING: (0, 0),
+            ThemeStyle.CHILD_BORDER_SIZE: 1, ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    ))
 
 
 def browser_sidebar_theme():
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.BASE)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 3, 4)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 3, 1)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-            add_dpg_scroller_style(dpg, track=p.WINDOW_ALT)
-    return theme
+    spec = theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: p.BASE, ThemeColor.BORDER: (0, 0, 0, 0)},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (3, 4), ThemeStyle.ITEM_SPACING: (3, 1),
+            ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    )
+    return make_theme(with_scrollbar(spec, track=p.WINDOW_ALT))
 
 
 def browser_sidebar_row_theme():
-    """QTreeView item palette for Places rows.
+    """QTreeView item palette for Places rows."""
+    p = QtFusionPalette
+    return make_theme(theme_component(
+        ThemeTarget.SELECTABLE,
+        colors={
+            ThemeColor.HEADER: p.SELECTION_ACTIVE,
+            ThemeColor.HEADER_HOVERED: p.SELECTION_ACTIVE_HOVER,
+            ThemeColor.HEADER_ACTIVE: p.SELECTION_ACTIVE_PRESSED,
+            ThemeColor.NAV_HIGHLIGHT: p.FOCUS,
+            ThemeColor.TEXT: p.SELECTION_TEXT,
+        },
+        styles={
+            ThemeStyle.FRAME_PADDING: (4, 3), ThemeStyle.FRAME_ROUNDING: 0,
+            ThemeStyle.SELECTABLE_TEXT_ALIGN: (0.0, 0.5),
+        },
+    ))
 
-    A selected ``mvSelectable`` paints ``Header`` continuously, so use the
-    real active-selection role here instead of the pale hover colour.  The
-    overlay label is recoloured separately by
-    :func:`browser_sidebar_item_text_theme`, keeping icon + text readable as
-    one Qt-style selected row.
+
+def browser_selected_item_theme(*, active=True):
+    """Explorer-like selection using the same row surface as hover."""
+    fill = QtFusionPalette.SELECTION_ACTIVE if active else QtFusionPalette.SELECTION_INACTIVE
+    text = QtFusionPalette.SELECTION_TEXT if active else QtFusionPalette.TEXT
+    return make_theme(theme_component(
+        ThemeTarget.SELECTABLE,
+        colors={ThemeColor.HEADER: fill, ThemeColor.HEADER_HOVERED: fill,
+                ThemeColor.HEADER_ACTIVE: fill, ThemeColor.TEXT: text},
+        styles={
+            ThemeStyle.FRAME_ROUNDING: 0,
+            ThemeStyle.FRAME_PADDING: (5, 2),
+            ThemeStyle.SELECTABLE_TEXT_ALIGN: (0.0, 0.5),
+            ThemeStyle.FRAME_BORDER_SIZE: 0,
+        },
+    ))
+
+
+def browser_name_item_theme(*, selected=False, disabled=False, current=False, active=True):
+    """Vertically centered QFileDialog Name-cell selectable.
+
+    The details columns are native table text cells while the Name column is a
+    Selectable embedded beside an icon. Keep the Selectable centered inside its
+    explicit row height so icon, label, hover and selection share one geometry.
     """
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvSelectable):
-            dpg.add_theme_color(dpg.mvThemeCol_Header, p.SELECTION_ACTIVE)
-            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, p.SELECTION_ACTIVE_HOVER)
-            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, p.SELECTION_ACTIVE_PRESSED)
-            dpg.add_theme_color(dpg.mvThemeCol_NavHighlight, p.FOCUS)
-            dpg.add_theme_color(dpg.mvThemeCol_Text, p.SELECTION_TEXT)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 4, 3)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_SelectableTextAlign, 0.0, 0.5)
-    return theme
+    if disabled:
+        fill = p.SELECTION_INACTIVE
+        hover = p.SELECTION_INACTIVE
+        pressed = p.SELECTION_INACTIVE
+        text = p.TEXT_DISABLED
+        border = p.SELECTION_INACTIVE_BORDER
+    elif selected and active:
+        fill = p.SELECTION_ACTIVE
+        hover = fill
+        pressed = fill
+        text = p.SELECTION_TEXT
+        border = p.SELECTION_BORDER
+    elif selected:
+        fill = p.SELECTION_INACTIVE
+        hover = fill
+        pressed = fill
+        text = p.TEXT
+        border = p.SELECTION_INACTIVE_BORDER
+    else:
+        fill = p.HIGHLIGHT_SOFT
+        hover = p.HIGHLIGHT_HOVER if active else p.WINDOW_ALT
+        pressed = p.BUTTON_ACTIVE if active else p.SELECTION_INACTIVE
+        text = p.TEXT
+        border = p.FOCUS if active else p.SELECTION_INACTIVE_BORDER
+    return make_theme(theme_component(
+        ThemeTarget.SELECTABLE,
+        colors={
+            ThemeColor.HEADER: fill,
+            ThemeColor.HEADER_HOVERED: hover,
+            ThemeColor.HEADER_ACTIVE: pressed,
+            ThemeColor.NAV_HIGHLIGHT: p.FOCUS,
+            ThemeColor.TEXT: text,
+            ThemeColor.BORDER: border,
+        },
+        styles={
+            ThemeStyle.SELECTABLE_TEXT_ALIGN: (0.0, 0.5),
+            ThemeStyle.FRAME_PADDING: (5, 2),
+            ThemeStyle.FRAME_ROUNDING: 0,
+            # The spanning Selectable is the single hover/selection surface.
+            # Keep its outer geometry identical in every state.
+            ThemeStyle.FRAME_BORDER_SIZE: 0,
+        },
+    ))
+
+
+def browser_selected_text_theme(*, active=True):
+    return make_theme(theme_component(
+        ThemeTarget.TEXT,
+        colors={ThemeColor.TEXT: QtFusionPalette.SELECTION_TEXT if active else QtFusionPalette.TEXT},
+    ))
 
 
 def browser_sidebar_item_text_theme(*, selected=False):
-    """Display-role text for overlay labels in QTreeView-like rows.
-
-    The sidebar uses an empty Selectable as the full-row hit/selection target
-    and draws the icon/label above it.  Dear ImGui therefore cannot recolor the
-    overlay label automatically when the row becomes selected; mirror Qt's
-    highlighted-text role explicitly.
-    """
+    """Display-role text for overlay labels in QTreeView-like rows."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvText):
-            dpg.add_theme_color(
-                dpg.mvThemeCol_Text, p.SELECTION_TEXT if selected else p.TEXT)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.TEXT,
+        colors={ThemeColor.TEXT: p.SELECTION_TEXT if selected else p.TEXT},
+    ))
 
 
 def browser_list_viewport_theme():
-    """QAbstractItemView viewport chrome for the folder list.
-
-    FolderListView intentionally keeps the outer child window as the stable
-    scroll owner.  Binding a generic browser surface here used to overwrite
-    QtListView's scrollbar metrics; keep the flat viewport while restoring the
-    shared WinUx/Qt scrollbar palette and thickness.
-    """
+    """QAbstractItemView viewport chrome for the folder list."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.BASE)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-            add_dpg_scroller_style(dpg, track=p.WINDOW_ALT)
-    return theme
+    spec = theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: p.BASE, ThemeColor.BORDER: (0, 0, 0, 0)},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (0, 0), ThemeStyle.ITEM_SPACING: (0, 0),
+            ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    )
+    return make_theme(with_scrollbar(spec, track=p.WINDOW_ALT))
 
 
 def browser_row_cell_theme():
-    """Transparent fixed-height cell canvas for QFileDialog detail rows.
-
-    The table owns the selected-row background.  Keeping each cell canvas
-    transparent lets ``highlight_table_row`` paint continuously across Name,
-    Date modified and Type while icon/text overlays use one vertical metric.
-    """
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (0, 0, 0, 0))
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return theme
+    """Transparent fixed-height cell canvas for QFileDialog detail rows."""
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: (0, 0, 0, 0), ThemeColor.BORDER: (0, 0, 0, 0)},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (0, 0), ThemeStyle.ITEM_SPACING: (0, 0),
+            ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    ))
 
 
 def browser_sidebar_item_container_theme():
     """Zero-margin canvas for one QTreeView-like sidebar row."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.BASE)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: p.BASE, ThemeColor.BORDER: (0, 0, 0, 0)},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (0, 0), ThemeStyle.ITEM_SPACING: (0, 0),
+            ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    ))
 
 
 def browser_sidebar_header_theme():
     """Unselected QTreeView branch row with only hover/press feedback."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvSelectable):
-            dpg.add_theme_color(dpg.mvThemeCol_Header, (0, 0, 0, 0))
-            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, p.HIGHLIGHT_HOVER)
-            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, p.BUTTON_ACTIVE)
-            dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.SELECTABLE,
+        colors={
+            ThemeColor.HEADER: (0, 0, 0, 0), ThemeColor.HEADER_HOVERED: p.HIGHLIGHT_HOVER,
+            ThemeColor.HEADER_ACTIVE: p.BUTTON_ACTIVE, ThemeColor.TEXT: p.TEXT,
+        },
+        styles={ThemeStyle.FRAME_PADDING: (0, 0), ThemeStyle.FRAME_ROUNDING: 0},
+    ))
 
 
 def create_branch_indicator(parent, expanded=True, pos=(1, 0)):
@@ -327,130 +464,121 @@ def paint_branch_indicator(indicator, expanded):
 def browser_breadcrumb_button_theme():
     """Flat QToolButton-like segment used inside the address field."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvButton):
-            dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 0, 0, 0))
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, p.HIGHLIGHT_HOVER)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, p.HIGHLIGHT_SOFT)
-            dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 3, 2)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.PUSH_BUTTON,
+        colors={
+            ThemeColor.BUTTON: (0, 0, 0, 0), ThemeColor.BUTTON_HOVERED: p.HIGHLIGHT_HOVER,
+            ThemeColor.BUTTON_ACTIVE: p.HIGHLIGHT_SOFT, ThemeColor.TEXT: p.TEXT,
+            ThemeColor.BORDER: (0, 0, 0, 0),
+        },
+        styles={
+            ThemeStyle.FRAME_BORDER_SIZE: 0, ThemeStyle.FRAME_ROUNDING: 0,
+            ThemeStyle.FRAME_PADDING: (3, 2),
+        },
+    ))
 
 
 def browser_breadcrumb_blank_theme():
     """Invisible address-bar remainder that stays visually inert on hover."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvButton):
-            clear = (0, 0, 0, 0)
-            dpg.add_theme_color(dpg.mvThemeCol_Button, clear)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, clear)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, clear)
-            dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, clear)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
-    return theme
+    clear = (0, 0, 0, 0)
+    return make_theme(theme_component(
+        ThemeTarget.PUSH_BUTTON,
+        colors={
+            ThemeColor.BUTTON: clear, ThemeColor.BUTTON_HOVERED: clear,
+            ThemeColor.BUTTON_ACTIVE: clear, ThemeColor.TEXT: p.TEXT, ThemeColor.BORDER: clear,
+        },
+        styles={
+            ThemeStyle.FRAME_BORDER_SIZE: 0, ThemeStyle.FRAME_ROUNDING: 0,
+            ThemeStyle.FRAME_PADDING: (0, 0),
+        },
+    ))
 
 
 def create_breadcrumb_chevron(parent):
     """Draw a DPI-stable Qt-style breadcrumb separator without font glyphs."""
     height = max(18, METRICS.location_height - 3)
-    canvas = dpg.add_drawlist(11, height, parent=parent)
+    canvas = QCanvas(11, height, parent=parent)
     cy = height * 0.5
+    painter = QPainter(canvas)
     color = QtFusionPalette.TEXT_MUTED
-    dpg.draw_line((4.0, cy - 3.5), (7.5, cy), parent=canvas, color=color, thickness=1.0)
-    dpg.draw_line((7.5, cy), (4.0, cy + 3.5), parent=canvas, color=color, thickness=1.0)
+    painter.drawLine((4.0, cy - 3.5), (7.5, cy), color=color, thickness=1.0)
+    painter.drawLine((7.5, cy), (4.0, cy + 3.5), color=color, thickness=1.0)
     return canvas
 
 
 def browser_toolbar_divider_theme():
     """Compatibility theme for older callers; the toolbar now draws its divider."""
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, (0, 0, 0, 0))
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: (0, 0, 0, 0), ThemeColor.BORDER: (0, 0, 0, 0)},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (0, 0), ThemeStyle.CHILD_BORDER_SIZE: 0,
+            ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    ))
 
 
 def create_toolbar_divider(parent):
-    """Draw one optically centered, one-pixel toolbar separator.
-
-    A 1 px ``mvChildWindow`` is not reliable inside an ImGui table cell: the
-    child can inherit padding/minimum sizing and appears as a thick, top-biased
-    gray strip on Windows.  A draw-list line keeps the separator exactly one
-    device pixel wide and lets us center its shorter 14 px stroke inside the
-    28 px location row.
-    """
+    """Draw one optically centered, one-pixel toolbar separator."""
     height = METRICS.location_height
     width = 9
-    canvas = dpg.add_drawlist(width=width, height=height, parent=parent)
+    canvas = QCanvas(width, height, parent=parent)
     line_height = 14
     y1 = (height - line_height) * 0.5
     y2 = y1 + line_height
-    # Half-pixel x placement keeps a 1 px line aligned to the raster grid.
     x = (width * 0.5) + 0.5
-    dpg.draw_line(
-        (x, y1), (x, y2), parent=canvas,
-        color=(218, 218, 218, 255), thickness=1.0)
+    QPainter(canvas).drawLine(
+        (x, y1), (x, y2), color=(218, 218, 218, 255), thickness=1.0)
     return canvas
 
 
 def browser_inline_icon_button_theme():
     """Small borderless icon button embedded in a QLineEdit-like field."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvImageButton):
-            dpg.add_theme_color(dpg.mvThemeCol_Button, (0, 0, 0, 0))
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, p.HIGHLIGHT_HOVER)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, p.HIGHLIGHT_SOFT)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 2)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 2, 2)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.IMAGE_BUTTON,
+        colors={
+            ThemeColor.BUTTON: (0, 0, 0, 0), ThemeColor.BUTTON_HOVERED: p.HIGHLIGHT_HOVER,
+            ThemeColor.BUTTON_ACTIVE: p.HIGHLIGHT_SOFT, ThemeColor.BORDER: (0, 0, 0, 0),
+        },
+        styles={
+            ThemeStyle.FRAME_BORDER_SIZE: 0, ThemeStyle.FRAME_ROUNDING: 2,
+            ThemeStyle.FRAME_PADDING: (2, 2),
+        },
+    ))
 
 
 def browser_tool_button_theme(*, checked=False):
-    """Compact checkable QToolButton styling for list/details toggles.
-
-    Qt's checked tool buttons retain a soft sunken fill; they do not look as
-    if keyboard focus is permanently pinned to the button.  Keep the checked
-    border neutral and reserve the blue focus role for real focus states.
-    """
+    """Compact checkable QToolButton styling for list/details toggles."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvImageButton):
-            base = p.HIGHLIGHT_SOFT if checked else (255, 255, 255, 0)
-            dpg.add_theme_color(dpg.mvThemeCol_Button, base)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, p.BUTTON_HOVER)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, p.BUTTON_ACTIVE)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, p.BORDER if checked else (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1 if checked else 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, QtFusionMetrics.FRAME_ROUNDING)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 5, 6)
-    return theme
+    base = p.HIGHLIGHT_SOFT if checked else (255, 255, 255, 0)
+    return make_theme(theme_component(
+        ThemeTarget.IMAGE_BUTTON,
+        colors={
+            ThemeColor.BUTTON: base, ThemeColor.BUTTON_HOVERED: p.BUTTON_HOVER,
+            ThemeColor.BUTTON_ACTIVE: p.BUTTON_ACTIVE,
+            ThemeColor.BORDER: p.BORDER if checked else (0, 0, 0, 0),
+        },
+        styles={
+            ThemeStyle.FRAME_BORDER_SIZE: 1 if checked else 0,
+            ThemeStyle.FRAME_ROUNDING: QtFusionMetrics.FRAME_ROUNDING,
+            ThemeStyle.FRAME_PADDING: (3, 3),
+        },
+    ))
 
 
 def browser_inline_action_theme():
     """QFileDialog-like action strip used while entering a new folder name."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.WINDOW_ALT)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, p.BORDER_LIGHT)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 4, 3)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 4, 2)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: p.WINDOW_ALT, ThemeColor.BORDER: p.BORDER_LIGHT},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (4, 3), ThemeStyle.ITEM_SPACING: (4, 2),
+            ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    ))
 
 
 def _downsample_icon(image, size=16):
@@ -559,14 +687,16 @@ def _generated_folder_selector_icon(key, disabled=False, size=20):
     filename = FOLDER_SELECTOR_ICON_MAP.get(normalized)
     if not filename:
         return None
-    path = FOLDER_SELECTOR_ICON_DIR / filename
-    if not path.is_file():
-        return None
     size = max(1, int(size))
     tag = "folder_selector_generated_{}_{}_{}px".format(
         normalized, "disabled" if disabled else "normal", size)
     if dpg.does_item_exist(tag):
         return tag
+    # A live context texture is authoritative. Do not stat the same bundled
+    # PNG for every directory row or every toolbar rebuild on the click path.
+    path = FOLDER_SELECTOR_ICON_DIR / filename
+    if not path.is_file():
+        return None
     try:
         image = Image.open(path).convert("RGBA")
         if image.size != (FOLDER_SELECTOR_MASTER_SIZE, FOLDER_SELECTOR_MASTER_SIZE):
@@ -579,7 +709,7 @@ def _generated_folder_selector_icon(key, disabled=False, size=20):
             "edit_address", "address_menu", "details", "list",
         }
         thin_strength = {
-            # Rev 1.1.6 masters are already drawn with a lighter optical
+            # Rev 1.1.4 masters are already drawn with a lighter optical
             # weight. Keep erosion subtle so 16-20 px edges stay crisp.
             "back": 0.18, "forward": 0.18, "up": 0.18,
             "refresh": 0.14, "details": 0.12, "list": 0.12,
@@ -661,128 +791,124 @@ def _crisp_toolbar_icon(key, disabled=False):
 
 
 def view_mode_texture(mode):
-    """Use the generated high-resolution list/details toolbar artwork."""
+    """Small symbolic Qt tool-button icons, not Explorer's colored tiles."""
     key = "list" if str(mode or "details").strip().lower() == "list" else "details"
-    return (_generated_folder_selector_icon(key, size=20)
-            or _crisp_toolbar_icon(key)
-            or navigation_texture("List" if key == "list" else "Details"))
+    return qt_browser_texture(key)
 
 
 def browser_details_theme():
     """QHeaderView-like table chrome; row selection stays owned by QtListView."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvTable):
-            dpg.add_theme_color(dpg.mvThemeCol_TableHeaderBg, p.TOOLBAR)
-            dpg.add_theme_color(dpg.mvThemeCol_Header, p.TOOLBAR)
-            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, p.HEADER_HOVER)
-            dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, p.HEADER_PRESSED)
-            dpg.add_theme_color(dpg.mvThemeCol_TableBorderStrong, p.BORDER_LIGHT)
-            dpg.add_theme_color(dpg.mvThemeCol_TableBorderLight, p.BORDER_LIGHT)
-            dpg.add_theme_color(dpg.mvThemeCol_TableRowBg, p.BASE)
-            dpg.add_theme_color(dpg.mvThemeCol_TableRowBgAlt, p.BASE)
-            dpg.add_theme_style(dpg.mvStyleVar_CellPadding, 5, 1)
-            add_dpg_scroller_style(dpg, track=p.WINDOW_ALT)
-        with dpg.theme_component(dpg.mvButton):
-            dpg.add_theme_color(dpg.mvThemeCol_Button, p.TOOLBAR)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, p.HEADER_HOVER)
-            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, p.HEADER_PRESSED)
-            dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, p.BORDER_LIGHT)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 3)
-            if hasattr(dpg, "mvStyleVar_ButtonTextAlign"):
-                dpg.add_theme_style(dpg.mvStyleVar_ButtonTextAlign, 0.0, 0.5)
-    return theme
+    table = theme_component(
+        ThemeTarget.TABLE,
+        colors={
+            ThemeColor.TABLE_HEADER_BACKGROUND: p.TOOLBAR, ThemeColor.HEADER: p.TOOLBAR,
+            ThemeColor.HEADER_HOVERED: p.HEADER_HOVER, ThemeColor.HEADER_ACTIVE: p.HEADER_PRESSED,
+            ThemeColor.TABLE_BORDER_STRONG: (0, 0, 0, 0), ThemeColor.TABLE_BORDER_LIGHT: (0, 0, 0, 0),
+            ThemeColor.TABLE_ROW_BACKGROUND: p.BASE, ThemeColor.TABLE_ROW_BACKGROUND_ALT: p.BASE,
+        },
+        styles={ThemeStyle.CELL_PADDING: (5, 1), ThemeStyle.ITEM_SPACING: (0, 0)},
+    )
+    button = theme_component(
+        ThemeTarget.PUSH_BUTTON,
+        colors={
+            ThemeColor.BUTTON: p.TOOLBAR, ThemeColor.BUTTON_HOVERED: p.HEADER_HOVER,
+            ThemeColor.BUTTON_ACTIVE: p.HEADER_PRESSED, ThemeColor.TEXT: p.TEXT,
+            ThemeColor.BORDER: p.BORDER_LIGHT,
+        },
+        styles={
+            ThemeStyle.FRAME_BORDER_SIZE: 0, ThemeStyle.FRAME_ROUNDING: 0,
+            ThemeStyle.FRAME_PADDING: (6, 3),
+        },
+    ).with_style(ThemeStyle.BUTTON_TEXT_ALIGN, 0.0, 0.5, optional=True)
+    return make_theme(with_scrollbar(table, track=p.WINDOW_ALT), button)
 
 
 
 def browser_empty_state_theme():
     """Muted QFileDialog/QAbstractItemView empty-state surface."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.BASE)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 8, 8)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 4, 4)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-        with dpg.theme_component(dpg.mvText):
-            dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT_MUTED)
-    return theme
+    return make_theme(
+        theme_component(
+            ThemeTarget.CHILD_WINDOW,
+            colors={ThemeColor.CHILD_BACKGROUND: p.BASE, ThemeColor.BORDER: (0, 0, 0, 0)},
+            styles={
+                ThemeStyle.WINDOW_PADDING: (8, 8), ThemeStyle.ITEM_SPACING: (4, 4),
+                ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.CHILD_ROUNDING: 0,
+            },
+        ),
+        theme_component(ThemeTarget.TEXT, colors={ThemeColor.TEXT: p.TEXT_MUTED}),
+    )
 
 
 def browser_status_text_theme(*, error=False):
     """QDialogButtonBox status text: muted normally, danger colour on errors."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvText):
-            dpg.add_theme_color(dpg.mvThemeCol_Text, p.DANGER if error else p.TEXT_MUTED)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.TEXT, colors={ThemeColor.TEXT: p.DANGER if error else p.TEXT_MUTED},
+    ))
 
 
 def browser_footer_theme():
     """Compact QFileDialog/QDialogButtonBox footer surface."""
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.WINDOW)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 12, 8)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 6, 2)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: p.WINDOW, ThemeColor.BORDER: (0, 0, 0, 0)},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (12, 8), ThemeStyle.ITEM_SPACING: (6, 2),
+            ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    ))
 
 
 def browser_sidebar_section_text_theme():
     """QTreeView top-level branch label styling."""
-    p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvText):
-            dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.TEXT, colors={ThemeColor.TEXT: QtFusionPalette.TEXT},
+    ))
 
 def browser_divider_theme():
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, QtFusionPalette.BORDER_LIGHT)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: QtFusionPalette.BORDER_LIGHT, ThemeColor.BORDER: (0, 0, 0, 0)},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (0, 0), ThemeStyle.CHILD_BORDER_SIZE: 0,
+            ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    ))
 
 
 def browser_selection_bar_theme():
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvChildWindow):
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, p.WINDOW)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 4, 4)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 4, 2)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.CHILD_WINDOW,
+        colors={ThemeColor.CHILD_BACKGROUND: p.WINDOW, ThemeColor.BORDER: (0, 0, 0, 0)},
+        styles={
+            ThemeStyle.WINDOW_PADDING: (4, 4), ThemeStyle.ITEM_SPACING: (0, 0),
+            ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.CHILD_ROUNDING: 0,
+        },
+    ))
 
 
 def browser_separator_theme():
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvSeparator):
-            dpg.add_theme_color(dpg.mvThemeCol_Separator, p.BORDER_LIGHT)
-            dpg.add_theme_color(dpg.mvThemeCol_SeparatorHovered, p.BORDER_LIGHT)
-            dpg.add_theme_color(dpg.mvThemeCol_SeparatorActive, p.BORDER_LIGHT)
-    return theme
+    return make_theme(theme_component(
+        ThemeTarget.SEPARATOR,
+        colors={
+            ThemeColor.SEPARATOR: p.BORDER_LIGHT,
+            ThemeColor.SEPARATOR_HOVERED: p.BORDER_LIGHT,
+            ThemeColor.SEPARATOR_ACTIVE: p.BORDER_LIGHT,
+        },
+    ))
 
 
 
 def _navigation_texture(name, disabled=False):
     """Build one cached Qt-like toolbar glyph texture."""
     key = str(name or "").strip().lower().replace(" ", "_")
+    if key in ("back", "forward", "up", "refresh", "edit_address", "address_menu", "chevron"):
+        return qt_browser_texture(key, disabled=disabled)
     generated = _generated_folder_selector_icon(key, disabled=disabled, size=20)
     if generated:
         return generated
@@ -838,63 +964,130 @@ def navigation_disabled_texture(name):
 
 def navigation_button_theme():
     p = QtFusionPalette
-    with dpg.theme() as theme:
-        for item_type, enabled in ((kind, state) for kind in (dpg.mvButton, dpg.mvImageButton)
-                                   for state in (True, False)):
-            with dpg.theme_component(item_type, enabled_state=enabled):
-                dpg.add_theme_color(dpg.mvThemeCol_Button, (255, 255, 255, 0))
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, p.BUTTON_HOVER)
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, p.BUTTON_ACTIVE)
-                dpg.add_theme_color(dpg.mvThemeCol_Text, p.TEXT if enabled else p.TEXT_DISABLED)
-                dpg.add_theme_color(dpg.mvThemeCol_TextDisabled, p.TEXT_DISABLED)
-                dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-                dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
-                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, QtFusionMetrics.FRAME_ROUNDING)
-                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 5, 6)
-    return theme
+    components = []
+    for target in (ThemeTarget.PUSH_BUTTON, ThemeTarget.IMAGE_BUTTON):
+        for enabled in (True, False):
+            components.append(theme_component(
+                target, enabled_state=enabled,
+                colors={
+                    ThemeColor.BUTTON: (255, 255, 255, 0),
+                    ThemeColor.BUTTON_HOVERED: p.BUTTON_HOVER,
+                    ThemeColor.BUTTON_ACTIVE: p.BUTTON_ACTIVE,
+                    ThemeColor.TEXT: p.TEXT if enabled else p.TEXT_DISABLED,
+                    ThemeColor.TEXT_DISABLED: p.TEXT_DISABLED,
+                    ThemeColor.BORDER: (0, 0, 0, 0),
+                },
+                styles={
+                    ThemeStyle.FRAME_BORDER_SIZE: 0,
+                    ThemeStyle.FRAME_ROUNDING: QtFusionMetrics.FRAME_ROUNDING,
+                    ThemeStyle.FRAME_PADDING: (3, 3),
+                },
+            ))
+    return make_theme(*components)
 
 
 def folder_item_texture(size=16):
-    """Generated folder icon rasterized exactly for its final UI slot."""
-    size = max(1, int(size))
-    generated = _generated_folder_selector_icon("folder", size=size)
-    if generated:
-        return generated
-    tag = "native_browser_folder_item_{}_aa".format(size)
-    if dpg.does_item_exist(tag):
-        return tag
-    scale = 4
-    canvas = max(16, size) * scale
-    image = Image.new("RGBA", (canvas, canvas), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(image)
-    k = canvas / 16.0
-    outline = (183, 128, 25, 255)
-    folder = (245, 184, 61, 255)
-    folder_hi = (255, 204, 91, 255)
-    shadow = (214, 157, 45, 255)
-    draw.rounded_rectangle((2*k, 5*k, 14*k, 13*k), radius=1*k,
-                           fill=folder, outline=outline, width=max(1, int(round(k))))
-    draw.polygon(((2*k, 5*k), (2*k, 3*k), (7*k, 3*k),
-                  (9*k, 5*k)), fill=folder_hi)
-    draw.line((2*k, 5*k, 14*k, 5*k), fill=outline, width=max(1, int(round(k))))
-    draw.line((3*k, 9*k, 13*k, 9*k), fill=shadow, width=max(1, int(round(k))))
-    prepared = _resize_rgba_for_toolbar(image, size, monochrome=False)
-    return WindowsIconRegistry._add_native_texture(prepared, tag)
+    """Use the real Windows Shell directory icon, not a drawn substitute.
+
+    ``size`` remains a compatibility argument for the address-bar/list callers;
+    the registry owns the shared native folder texture and its system fallback.
+    """
+    return WindowsIconRegistry.get_icon(is_dir=True)
 
 
 def new_folder_texture():
-    """Use the generated high-resolution new-folder glyph for the browser toolbar."""
-    return (_generated_folder_selector_icon("new_folder", size=20)
-            or _crisp_toolbar_icon("new_folder")
-            or folder_item_texture())
+    return qt_browser_texture("new_folder")
+
+
+def _qt_browser_symbol_image(name, *, disabled=False, size=16):
+    """Draw a single-tab folder and consistent fine-stroke toolbar symbols.
+
+    Retain a 3x texture master instead of uploading a 16 px raster which Windows
+    then has to magnify at 125/150/200% display scale.
+    """
+    key = str(name).lower().replace(" ", "_")
+    size = max(1, int(size))
+    image = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(image)
+    ink = (160, 160, 160, 255) if disabled else (48, 52, 55, 255)
+    def line(points):
+        draw.line([(int(x * 4), int(y * 4)) for x, y in points], fill=ink, width=4)
+    if key == "back":
+        line([(10, 3), (5, 8), (10, 13)])
+    elif key == "forward":
+        line([(6, 3), (11, 8), (6, 13)])
+    elif key == "up":
+        line([(3, 10), (8, 5), (13, 10)])
+    elif key in ("edit_address", "address_menu", "chevron"):
+        draw.polygon([(5*4, 6*4), (11*4, 6*4), (8*4, 10*4)], fill=ink)
+    elif key == "list":
+        for x in (3, 9):
+            for y in (3, 9):
+                draw.rectangle((x*4, y*4, (x+3)*4, (y+3)*4), fill=ink)
+    elif key == "details":
+        for y in (4, 8, 12):
+            line([(3, y), (5, y)])
+            line([(7, y), (13, y)])
+    elif key == "refresh":
+        draw.arc((3*4, 3*4, 13*4, 13*4), 35, 320, fill=ink, width=4)
+        draw.polygon([(11*4, 2*4), (14*4, 3*4), (13*4, 6*4)], fill=ink)
+    else:
+        # One continuous silhouette. The old second tab/stroke above it made
+        # the glyph look like two stacked folders rather than Qt's directory.
+        line([(2.5, 4.5), (6.5, 4.5), (8.5, 6.5), (13.5, 6.5),
+              (13.5, 12.5), (2.5, 12.5), (2.5, 4.5)])
+        if key == "new_folder":
+            # Separate the plus from the folder outline instead of overlaying
+            # two dark strokes into an unreadable blob.
+            draw.rectangle((9*4, 8*4, 16*4, 15*4), fill=(0, 0, 0, 0))
+            line([(10, 11.5), (15, 11.5)])
+            line([(12.5, 9), (12.5, 14)])
+    return image.resize((size * 3, size * 3), Image.Resampling.LANCZOS)
+
+
+def qt_browser_texture(name, *, disabled=False, size=16):
+    """Cache dense symbolic masters while keeping the display slot 16 logical px."""
+    key = str(name).lower().replace(" ", "_")
+    size = max(1, int(size))
+    tag = "qt_browser_symbol_v2_{}_{}_{}".format(key, size, int(disabled))
+    if dpg.does_item_exist(tag):
+        return tag
+    return WindowsIconRegistry._add_native_texture(
+        _qt_browser_symbol_image(name, disabled=disabled, size=size), tag)
+
+
+def prepare_browser_textures():
+    """Warm bounded shared graphics on the hidden host's DPG owner thread.
+
+    Never construct a chooser, enumerate folders/drives, read preferences or
+    install handlers. These context-scoped textures are the same caches used
+    by real forms; a destroyed DPG context naturally invalidates their tags.
+    """
+    textures = []
+    for name in ("Back", "Forward", "Up", "Refresh", "Search", "Clear",
+                 "Chevron", "Edit address", "Address menu"):
+        textures.append(navigation_texture(name))
+    for name in ("Back", "Forward", "Up"):
+        textures.append(navigation_disabled_texture(name))
+    textures.extend((new_folder_texture(), view_mode_texture("details"),
+                     view_mode_texture("list"), folder_item_texture(16),
+                     folder_item_texture(18),
+                     _generated_folder_selector_icon("drive", size=18),
+                     WindowsIconRegistry.get_icon(is_dir=True)))
+    # Only documented, path-independent Shell stock icons. No mapped drive or
+    # network location is probed just to prepare an idle browser host.
+    for stock_id in (7, 8, 9, 11, 12, 58, 94):
+        textures.append(WindowsIconRegistry.get_stock_icon(stock_id))
+    return tuple(dict.fromkeys(texture for texture in textures if texture is not None))
 
 
 def navigation_button(parent, name, callback, font, theme):
     # Use a generated monochrome glyph rather than a font codepoint.  Qt-like
     # toolbar icons should keep the same geometry across DPI/font changes.
-    button = dpg.add_image_button(
-        navigation_texture(name), parent=parent, width=20, height=20,
-        callback=lambda *_args: callback())
-    dpg.bind_item_theme(button, theme)
-    add_styled_tooltip(button, name)
-    return button
+    control = QToolButton(
+        "", parent=parent, icon=navigation_texture(name), icon_size=(METRICS.icon_size, METRICS.icon_size),
+        width=METRICS.tool_button_size, height=METRICS.tool_button_size)
+    control.clicked.connect(callback)
+    control.setTheme(theme)
+    add_styled_tooltip(control.tag, name)
+    return control.tag

@@ -13,11 +13,14 @@ if str(ROOT) not in sys.path:
 from run_winux import _configure_bundled_dependencies
 _configure_bundled_dependencies(str(ROOT))
 
-from WinUx.dialogs.floating_runtime import FloatingDialogRuntime, PreparedViewport
 from WinUx.services.floating_protocol import encode_message, read_messages
 
 
 def main():
+    # Keep native failures in this worker's redirected log as well as Python
+    # exceptions; an abruptly closed IPC socket alone cannot identify a crash.
+    import faulthandler
+    faulthandler.enable()
     port = int(os.environ.pop("WINUX_FLOAT_DIALOG_PORT"))
     token = os.environ.pop("WINUX_FLOAT_DIALOG_TOKEN")
     prewarm_requested = os.environ.pop("WINUX_FLOAT_DIALOG_PREWARM", "") == "1"
@@ -37,20 +40,32 @@ def main():
         connection.sendall(encode_message({"event": "hello", "token": token}))
         messages = read_messages(connection)
         prepared = None
+        # Connect before importing concrete UI code. Import failures must reach
+        # the parent immediately rather than leaving accept() waiting 25s.
+        if not prewarm_requested:
+            initial = next(messages)
+        from WinUx.dialogs.floating_runtime import FloatingDialogRuntime, PreparedViewport
         if prewarm_requested:
             prepared = PreparedViewport(connection, messages)
             initial = prepared.wait_for_init()
             if initial is None:
                 return 0
-        else:
-            initial = next(messages)
         if initial.get("command") != "init":
             raise ValueError("Floating dialog requires an init handshake.")
         # All WinUx floating UI is Dear ImGui / Dear PyGui.  Individual
         # controls may emulate Qt/Fusion geometry and behavior, but no Tk/Qt
         # runtime is selected for any dialog kind.
-        runtime = FloatingDialogRuntime(connection, messages, initial, prepared=prepared)
-        runtime.run()
+        while initial is not None:
+            runtime = FloatingDialogRuntime(connection, messages, initial, prepared=prepared)
+            runtime.run()
+            if not runtime.reusable:
+                break
+            # A clean cold first lease can promote itself to PreparedViewport,
+            # making the process a normal reusable host for later QDialogs.
+            prepared = runtime.prepared
+            initial = prepared.wait_for_next_init()
+        if runtime.reusable:
+            runtime.gui.destroy()
     except Exception as exc:
         trace_text = traceback.format_exc()
         try:
@@ -61,11 +76,12 @@ def main():
         try:
             connection.sendall(encode_message({
                 "event": "error",
+                "lease": (locals().get("initial") or {}).get("lease"),
                 "message": str(exc),
                 "traceback": trace_text,
                 "stage": str(getattr(locals().get("runtime", None), "stage", "startup") or "startup"),
             }))
-        except OSError:
+        except (OSError, AttributeError):
             pass
         return 1
     finally:

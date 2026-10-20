@@ -14,6 +14,7 @@ class FileItem:
     is_dir: bool
     size: int
     modified: float
+    is_hidden: bool = False
 
     @property
     def type_text(self) -> str:

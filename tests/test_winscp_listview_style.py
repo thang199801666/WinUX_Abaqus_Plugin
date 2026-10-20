@@ -1,10 +1,10 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LISTVIEW = ROOT / "WinUx" / "components" / "explorer_list_view.py"
-FILE_PANEL = ROOT / "WinUx" / "components" / "file_panel.py"
-RENDERING = ROOT / "WinUx" / "components" / "explorer_rendering.py"
-LAYOUT = ROOT / "WinUx" / "components" / "explorer_layout.py"
+LISTVIEW = ROOT / "WinUx" / "ui" / "components" / "explorer_list_view.py"
+FILE_PANEL = ROOT / "WinUx" / "ui" / "components" / "file_panel.py"
+RENDERING = ROOT / "WinUx" / "ui" / "components" / "explorer_rendering.py"
+LAYOUT = ROOT / "WinUx" / "ui" / "components" / "explorer_layout.py"
 
 
 def test_file_panels_use_shared_qt_theme_and_metrics():

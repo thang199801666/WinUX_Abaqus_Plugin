@@ -6,8 +6,8 @@ import sys
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from WinUx.components.explorer_item_model import ExplorerItemModel, stable_item_identity as identity
-from WinUx.components.explorer_list_model import ListViewItem
+from WinUx.ui.components.explorer_item_model import ExplorerItemModel, stable_item_identity as identity
+from WinUx.ui.components.explorer_list_model import ListViewItem
 
 
 def original(old, items, selected, anchor, current):

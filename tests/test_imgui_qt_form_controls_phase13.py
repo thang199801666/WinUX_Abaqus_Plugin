@@ -5,12 +5,13 @@ WINUX = ROOT / "WinUx"
 
 
 def _read(relative):
-    return (WINUX / relative).read_text(encoding="utf-8")
+    from ui_sources import implementation_path
+    return implementation_path(WINUX / relative).read_text(encoding="utf-8")
 
 
 def test_radio_group_is_retained_native_dear_imgui_control():
-    style = _read("widgets/imgui_qt_style.py")
-    controls = _read("widgets/controls.py")
+    style = _read("ui/framework/qt/style.py")
+    controls = _read("ui/framework/qt/selection.py")
     assert "def radio_group_theme(backend, *, disabled=False, focused=False)" in style
     assert "class ImGuiRadioButtonGroup(QWidget)" in controls
     assert "backend.add_radio_button(" in controls
@@ -51,8 +52,12 @@ def test_transfer_center_uses_shared_progress_and_button_state_contracts():
 
 def test_phase13_production_paths_remain_dear_imgui_only():
     source = "\n".join([
-        _read("widgets/imgui_qt_style.py"),
-        _read("widgets/controls.py"),
+        _read("ui/framework/qt/style.py"),
+        "\n".join(_read(path) for path in (
+            "ui/framework/qt/controls.py", "ui/framework/qt/buttons.py",
+            "ui/framework/qt/editors.py", "ui/framework/qt/containers.py",
+            "ui/framework/qt/selection.py",
+        )),
         _read("dialogs/qt_dialog.py"),
         _read("dialogs/job_edit_form.py"),
         _read("dialogs/job_manager_form.py"),

@@ -2,7 +2,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from WinUx.widgets import QCheckBox, QLineEdit, QObject, QSignalBlocker
+from WinUx.ui import QCheckBox, QLineEdit, QObject, QSignalBlocker
 
 
 class CheckboxTests(unittest.TestCase):

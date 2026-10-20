@@ -5,7 +5,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def text(rel):
-    return (ROOT / rel).read_text(encoding="utf-8")
+    from ui_sources import implementation_path
+    return implementation_path(ROOT / rel).read_text(encoding="utf-8")
 
 
 def test_editable_job_grids_share_qtableview_chrome():
@@ -21,7 +22,7 @@ def test_editable_job_grids_share_qtableview_chrome():
 
 def test_transfer_rows_are_flat_qframes_not_separator_stacks():
     source = text("WinUx/dialogs/transfer_center_form.py")
-    style = text("WinUx/widgets/imgui_qt_style.py")
+    style = text("DearUIQt/qt/style.py")
     assert "transfer_row_theme" in source
     assert "height=72, border=True" in source
     assert "ChildRounding, 0" in style
@@ -39,6 +40,6 @@ def test_odb_extract_uses_side_by_side_axis_panes():
 
 def test_job_schedule_command_buttons_are_compact():
     source = text("WinUx/dialogs/job_schedule_form.py")
-    assert '("Commands", 152)' in source
-    assert 'width=64' in source
-    assert 'width=72' in source
+    assert '("Commands", 136)' in source
+    assert 'width=58' in source
+    assert 'width=68' in source

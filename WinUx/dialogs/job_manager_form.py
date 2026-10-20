@@ -1,22 +1,27 @@
 from __future__ import annotations
 
 from datetime import datetime
-import dearpygui.dearpygui as dpg
-from ..job_manager_preferences import JobManagerPreferences
-from ..abaqus_version_preferences import AbaqusVersionPreferences
-from .qt_dialog import QtDialog
+from DearUIQt.backends import dpg
+from ..preferences.job_manager import JobManagerPreferences
+from ..preferences.abaqus_versions import AbaqusVersionPreferences
+from DearUIQt.dialogs.qt_dialog import QtDialog
+from DearUIQt.widgets import QLabel, QSpacer
+from DearUIQt.modelview import QTableWidget
+from DearUIQt.layouts import QVBoxLayout, QHBoxLayout
 from .logic.job_manager import JobManagerLogic
-from .theme import DialogMetrics
-from ..widgets.imgui_qt_style import METRICS, compact_stack_theme
+from DearUIQt.themes import DialogMetrics
+from DearUIQt.themes import METRICS, compact_stack_theme, aligned_cell_theme
 
 
 class JobManagerDialog(JobManagerLogic, QtDialog):
     """Per-input job configuration using the existing submission/schedule API."""
 
+    REUSABLE_HOST = True
+
     MAX_VISIBLE_ROWS = 7
     # Visual table row height.  Controls are 26 px high and are centered
     # inside a 32 px row, matching Qt/QTableView editor geometry.
-    ROW_HEIGHT = 32
+    ROW_HEIGHT = METRICS.control_height + 6
 
     @classmethod
     def initial_size(cls, count):
@@ -33,95 +38,94 @@ class JobManagerDialog(JobManagerLogic, QtDialog):
         self._versions = settings["versions"] or [AbaqusVersionPreferences.DEFAULT_COMMAND]
         if self._prefs.get("version") not in self._versions:
             self._prefs["version"] = settings["default_command"]
-        self._successful_job_names = set()
+        self._pending_queue_job_names = set()
         self._submission_finished = self._close_requested = False
         self._submitting = False
         self.rows_by_path = {}
         self.preferred_size = self.initial_size(len(self.paths))
         QtDialog.__init__(self, view, "Abaqus Job Manager", *self.preferred_size)
         self.header("Selected input files ({})".format(len(self.paths)))
-        with dpg.table(parent=self.content, header_row=True, scrollY=True,
-                       height=-1, width=-1, resizable=True, row_background=True,
-                       freeze_rows=1, borders_innerH=True, borders_outerH=True,
-                       borders_innerV=True, borders_outerV=True,
-                       policy=dpg.mvTable_SizingStretchProp) as self.table:
-            for heading, width in (("Run", 38), ("Input file", None), ("Version", 108),
-                                   ("CPUs", 58), ("Precision", 92), ("Overwrite", 82),
-                                   ("Schedule", 112), ("Time", 160)):
-                if width is None:
-                    dpg.add_table_column(label=heading, width_stretch=True, init_width_or_weight=1)
-                else:
-                    dpg.add_table_column(label=heading, width_fixed=True, init_width_or_weight=width)
-            self.style_table(self.table)
-            for path in self.paths:
-                with dpg.table_row():
-                    # Dear ImGui top-aligns mixed-height table items.  Every cell
-                    # uses a zero-gap vertical lane plus an explicit top inset.
-                    # Editors are 26 px high in a 32 px visual row (2 px inset
-                    # after table padding); 14 px text/checks use 8 px.  Their
-                    # visual centres therefore land on the exact same Y coordinate.
-                    def cell(top=0):
-                        group = dpg.add_group()
-                        dpg.bind_item_theme(group, compact_stack_theme(dpg))
-                        if top:
-                            dpg.add_spacer(parent=group, height=top)
-                        return group
+        self.table_widget = self.own_widget(QTableWidget(
+            0, 8, parent=self._qt_parent(self.content), after=view.after, backend=dpg,
+            header_row=True, scroll_y=True, height=-1, width=-1, resizable=True,
+            row_background=True, freeze_rows=1, grid_lines=True,
+            sizing_policy=dpg.mvTable_SizingStretchProp))
+        self.table = self.table_widget.tag
+        self.table_widget.setHorizontalHeaderLabels((
+            "Run", "Input file", "Version", "CPUs", "Precision",
+            "Overwrite", "Schedule", "Time",
+        ))
+        for column, width in enumerate((38, None, 108, 58, 92, 82, 112, 160)):
+            if width is None:
+                self.table_widget.setColumnStretch(column, 1.0)
+            else:
+                self.table_widget.setColumnWidth(column, width)
+        self.style_table(self.table)
 
-                    def centered_checkbox_cell(column_width, *, checked=False):
-                        """Center a native 14 px checkbox in both axes of a fixed table cell.
+        for path in self.paths:
+            table_row = self.table_widget.rowCount()
+            self.table_widget.insertRow(table_row)
+            native_row = self.table_widget.nativeRow(table_row)
 
-                        QTableView centres indicator-only checkbox delegates. Dear ImGui
-                        otherwise places an empty-label checkbox at the left edge of the
-                        cell. Account for the table's 4 px horizontal padding on each side,
-                        then insert the exact leading spacer needed to centre the native
-                        indicator without replacing its hit target with custom drawing.
-                        """
-                        holder = cell(8)
-                        usable = max(0, int(column_width) - 8)
-                        lead = max(0, (usable - METRICS.check_size) // 2)
-                        lane = dpg.add_group(parent=holder, horizontal=True)
-                        dpg.bind_item_theme(lane, compact_stack_theme(dpg))
-                        if lead:
-                            dpg.add_spacer(parent=lane, width=lead)
-                        return self.checkbox(checked=checked, parent=lane)
+            # Table padding supplies 3 px above/below each 26 px editor.
+            # Retain the historical native alignment inside QTableWidget cell
+            # hosts so the model/view migration does not alter dialog geometry.
+            def cell(column, top=0):
+                layout = QVBoxLayout(parent=native_row, spacing=0, backend=dpg)
+                dpg.bind_item_theme(layout.tag, aligned_cell_theme())
+                if top:
+                    QSpacer(0, top, parent=layout, backend=dpg)
+                self.table_widget.setCellWidget(table_row, column, layout)
+                return layout
 
-                    # Indicator-only checkbox delegates are centred horizontally and
-                    # vertically, matching Qt/QTableView rather than ImGui's left edge.
-                    row = {"run": centered_checkbox_cell(38, checked=True)}
+            def centered_checkbox_cell(column, column_width, *, checked=False):
+                holder = cell(column, (METRICS.control_height - METRICS.check_size) // 2)
+                usable = max(0, int(column_width))
+                lead = max(0, (usable - METRICS.check_size) // 2)
+                lane_layout = QHBoxLayout(parent=holder, spacing=0, backend=dpg)
+                dpg.bind_item_theme(lane_layout.tag, compact_stack_theme())
+                if lead:
+                    QSpacer(lead, 0, parent=lane_layout, backend=dpg)
+                tag = self.checkbox(checked=checked, parent=lane_layout)
+                return tag
 
-                    # Plain text uses the same 14 px visual lane as a checkbox, so an
-                    # 8 px top inset puts its centre on the 26 px editors' centre line.
-                    name_cell = cell(8)
-                    name = dpg.add_text(path.name, parent=name_cell)
-                    with dpg.tooltip(name):
-                        dpg.add_text(str(path))
+            row = {"run": centered_checkbox_cell(0, 38, checked=True)}
 
-                    version_cell = cell(2)
-                    row["version"] = self.combo(self._versions, parent=version_cell,
-                        default_value=self._prefs["version"])
+            name_cell = cell(1, (METRICS.control_height - METRICS.check_size) // 2)
+            name_widget = QLabel(path.name, parent=name_cell, backend=dpg)
+            row["name"] = name_widget.tag
+            with dpg.tooltip(name_widget.tag):
+                QLabel(str(path), backend=dpg)
 
-                    cpu_cell = cell(2)
-                    row["cpus"] = self.spin_int(int(self._prefs.get("cpus", 4)),
-                        parent=cpu_cell, minimum=1, width=-1)
+            version_cell = cell(2)
+            row["version"] = self.combo(
+                self._versions, parent=version_cell.tag, default_value=self._prefs["version"])
 
-                    precision_cell = cell(2)
-                    row["precision"] = self.combo(("single", "double"), parent=precision_cell,
-                        default_value=self._prefs.get("precision", "single"))
+            cpu_cell = cell(3)
+            row["cpus"] = self.spin_int(
+                int(self._prefs.get("cpus", 4)), parent=cpu_cell, minimum=1, width=-1)
 
-                    row["overwrite"] = centered_checkbox_cell(
-                        82, checked=bool(self._prefs.get("overwrite", False)))
+            precision_cell = cell(4)
+            row["precision"] = self.combo(
+                ("single", "double"), parent=precision_cell.tag,
+                default_value=self._prefs.get("precision", "single"))
 
-                    schedule_cell = cell(2)
-                    row["schedule"] = self.combo(self.SCHEDULE_OPTIONS, parent=schedule_cell,
-                        default_value="Now", user_data=path, callback=self._schedule_changed)
+            row["overwrite"] = centered_checkbox_cell(
+                5, 82, checked=bool(self._prefs.get("overwrite", False)))
 
-                    time_cell = cell(2)
-                    row["time"] = self.line_edit("Runs immediately", parent=time_cell, enabled=False, width=-1,
-                        user_data=path, callback=self._time_changed)
-                    row["live"] = True
-                    row["mode"] = "Now"
-                    row["saved"] = {"Run After": "00:30:00", "Run At": ""}
-                    self.rows_by_path[path] = row
+            schedule_cell = cell(6)
+            row["schedule"] = self.combo(
+                self.SCHEDULE_OPTIONS, parent=schedule_cell.tag, default_value="Now",
+                user_data=path, callback=self._schedule_changed)
+
+            time_cell = cell(7)
+            row["time"] = self.line_edit(
+                "Runs immediately", parent=time_cell, enabled=False, width=-1,
+                user_data=path, callback=self._time_changed)
+            row["live"] = True
+            row["mode"] = "Now"
+            row["saved"] = {"Run After": "00:30:00", "Run At": ""}
+            self.rows_by_path[path] = row
         # Status belongs to the QDialogButtonBox middle slot rather than below
         # the table.  This prevents the body child from becoming a few pixels
         # taller than its viewport (and showing a stray vertical scrollbar).
@@ -133,20 +137,21 @@ class JobManagerDialog(JobManagerLogic, QtDialog):
             status_item=self.status,
             status_left_padding=14)
         self.estimate_button = self.left_buttons[0]
+        self._clock_timer = self.create_timer(1000, self._tick)
         self._tick()
 
     def _schedule_changed(self, sender, value, path):
         row = self.rows_by_path[path]
         old = row["mode"]
         if old != "Now" and not (old == "Run At" and row["live"]):
-            row["saved"][old] = dpg.get_value(row["time"])
+            row["saved"][old] = self.control_value(row["time"])
         row["mode"] = value
         row["live"] = not bool(row["saved"]["Run At"])
         text = "Runs immediately" if value == "Now" else row["saved"][value]
         if value == "Run At" and row["live"]:
             text = datetime.now().strftime(self.RUN_AT_FORMAT)
-        dpg.set_value(row["time"], text)
-        dpg.configure_item(row["time"], enabled=value != "Now")
+        self._control_wrappers[row["time"]].setText(text)
+        self.set_control_enabled(row["time"], value != "Now")
 
     def _time_changed(self, sender, value, path):
         row = self.rows_by_path[path]
@@ -159,15 +164,14 @@ class JobManagerDialog(JobManagerLogic, QtDialog):
             return
         for row in self.rows_by_path.values():
             if row["mode"] == "Run At" and row["live"]:
-                if dpg.is_item_focused(row["time"]):
+                if bool(getattr(self.control_wrapper(row["time"]), "hasFocus", lambda: False)()):
                     row["live"] = False
                 else:
-                    dpg.set_value(row["time"], datetime.now().strftime(self.RUN_AT_FORMAT))
-        self.view.after(1000, self._tick)
+                    self._control_wrappers[row["time"]].setText(datetime.now().strftime(self.RUN_AT_FORMAT))
 
     def _estimate(self):
-        dpg.configure_item(self.estimate_button, enabled=False)
-        dpg.set_value(self.status, "Estimating recommended CPU counts...")
+        self.set_control_enabled(self.estimate_button, False)
+        self.set_control_value(self.status, "Estimating recommended CPU counts...")
         self.view.after(0, self._request_core_estimates)
 
     def _run(self):
@@ -177,13 +181,14 @@ class JobManagerDialog(JobManagerLogic, QtDialog):
         try:
             for path in self.row_order:
                 row = self.rows_by_path[path]
-                if not dpg.get_value(row["run"]):
+                if not self.control_value(row["run"]):
                     continue
-                job = {name: dpg.get_value(row[name]) for name in ("version", "cpus", "precision", "overwrite")}
+                job = {name: self.control_value(row[name]) for name in ("version", "cpus", "precision", "overwrite")}
                 if job["cpus"] < 1:
                     raise ValueError("CPUs must be a positive integer")
                 job["path"] = path
-                mode, text = dpg.get_value(row["schedule"]), dpg.get_value(row["time"]).strip()
+                mode = self.control_value(row["schedule"])
+                text = str(self.control_value(row["time"], "") or "").strip()
                 if mode == "Run After":
                     job["_run_at"] = datetime.now() + self._parse_run_after(text)
                     job["_schedule_mode"] = "Run After " + text
@@ -194,24 +199,25 @@ class JobManagerDialog(JobManagerLogic, QtDialog):
             if not jobs:
                 raise ValueError("No valid jobs selected.")
         except ValueError as exc:
-            dpg.set_value(self.status, str(exc))
+            self.set_control_value(self.status, str(exc))
             return
         self._submitting = True
-        dpg.configure_item(self.run_button, enabled=False)
+        self.set_control_value(self.status, "Preparing submission...")
+        self.set_control_enabled(self.run_button, False)
         self.view.after(0, self._submit_from_native, jobs)
 
     def handle_command(self, command, *args):
         if command == "status":
-            dpg.set_value(self.status, str(args[0]))
+            self.set_control_value(self.status, str(args[0]))
         elif command == "run_enabled":
             self._submitting = not bool(args[0])
-            dpg.configure_item(self.run_button, enabled=bool(args[0]))
+            self.set_control_enabled(self.run_button, bool(args[0]))
         elif command == "core_suggestions_ready":
             for path, value in dict(args[0] or {}).items():
                 if path in self.rows_by_path:
-                    dpg.set_value(self.rows_by_path[path]["cpus"], int(value))
-            dpg.configure_item(self.estimate_button, enabled=True)
-            dpg.set_value(self.status, args[1])
+                    self.set_control_value(self.rows_by_path[path]["cpus"], int(value))
+            self.set_control_enabled(self.estimate_button, True)
+            self.set_control_value(self.status, args[1])
         elif command == "core_suggestions_failed":
-            dpg.configure_item(self.estimate_button, enabled=True)
-            dpg.set_value(self.status, "Estimate failed: {}".format(args[0]))
+            self.set_control_enabled(self.estimate_button, True)
+            self.set_control_value(self.status, "Estimate failed: {}".format(args[0]))

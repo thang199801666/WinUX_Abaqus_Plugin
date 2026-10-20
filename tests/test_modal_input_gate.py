@@ -3,10 +3,15 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 VIEW = ROOT / "WinUx" / "view.py"
-SPLITTER_LAYOUT = ROOT / "WinUx" / "ui" / "splitter_layout.py"
-VIEW_RUNTIME_SOURCE = VIEW.read_text(encoding="utf-8") + "\n" + SPLITTER_LAYOUT.read_text(encoding="utf-8")
-HOST = ROOT / "WinUx" / "platform" / "native_dialog_host.py"
-EXPLORER = ROOT / "WinUx" / "components" / "explorer_list_view.py"
+SPLITTER_LAYOUT = ROOT / "WinUx" / "ui" / "behaviors" / "splitter_behavior.py"
+SPLITTER_ADAPTER = ROOT / "WinUx" / "ui" / "behaviors" / "splitter_layout.py"
+VIEW_RUNTIME_SOURCE = "\n".join((
+    VIEW.read_text(encoding="utf-8"),
+    SPLITTER_LAYOUT.read_text(encoding="utf-8"),
+    SPLITTER_ADAPTER.read_text(encoding="utf-8"),
+))
+HOST = ROOT / "WinUx" / "ui" / "native" / "native_dialog_host.py"
+EXPLORER = ROOT / "WinUx" / "ui" / "components" / "explorer_list_view.py"
 
 
 class ModalInputGateRegressionTests(unittest.TestCase):
@@ -29,7 +34,7 @@ class ModalInputGateRegressionTests(unittest.TestCase):
 
 
     def test_native_dialogs_block_background_dpg_input(self):
-        gate = (ROOT / "WinUx" / "components" / "interaction_gate.py").read_text(encoding="utf-8")
+        gate = (ROOT / "WinUx" / "ui" / "framework" / "input_gate.py").read_text(encoding="utf-8")
         view = VIEW.read_text(encoding="utf-8")
         host = HOST.read_text(encoding="utf-8")
 

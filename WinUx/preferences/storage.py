@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from pathlib import Path
 
 
@@ -21,8 +22,18 @@ def user_profile_path(filename, root=None):
         root
         or os.environ.get("APPDATA")
         or os.environ.get("LOCALAPPDATA")
+        or os.environ.get("USERPROFILE")
     )
-    return Path(app_root or Path.home()) / "WinUX" / str(filename)
+    if app_root is None:
+        try:
+            app_root = Path.home()
+        except (OSError, RuntimeError):
+            app_root = Path(tempfile.gettempdir())
+    try:
+        base = Path(app_root)
+    except (TypeError, ValueError):
+        base = Path(tempfile.gettempdir())
+    return base / "WinUX" / str(filename)
 
 
 class JsonPreferenceStore:

@@ -12,8 +12,10 @@ import threading
 import time
 
 from ..diagnostics import log_exception
-from ..general_preferences import GeneralPreferences
-from ..login_preferences import LoginPreferences
+from ..preferences.general import GeneralPreferences
+from ..preferences.login import LoginPreferences
+from ..preferences.performance import PerformancePreferences
+from ..services.inactivity_polling import UserInactivityPolicy
 
 
 class ConnectionController:
@@ -29,6 +31,9 @@ class ConnectionController:
             app._connection_online = threading.Event()
         if not adopt_existing or not hasattr(app, "_connection_generation"):
             app._connection_generation = 0
+        if not hasattr(app, "_inactivity_policy"):
+            app._inactivity_policy = UserInactivityPolicy(
+                settings=PerformancePreferences().load())
 
     @property
     def view(self):
@@ -200,6 +205,17 @@ class ConnectionController:
                         self.app._connection_online.set()
                         self.view.after(0, self.restored, generation)
                         return
+
+                    # Do not keep probing sshd all night after the user has left
+                    # WinUx untouched.  The condition wait is local-only and is
+                    # notified immediately by the next app mouse/key event.
+                    inactivity = self.app._inactivity_policy
+                    inactivity.configure(PerformancePreferences().load())
+                    if inactivity.stage() == inactivity.DEEP_IDLE:
+                        resume_generation = inactivity.resume_generation
+                        inactivity.wait_for_resume(resume_generation, timeout=30.0)
+                        continue
+
                     attempt += 1
                     try:
                         self.server.reconnect()

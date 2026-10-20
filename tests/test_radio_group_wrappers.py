@@ -2,7 +2,7 @@ import threading
 import unittest
 from unittest.mock import Mock
 
-from WinUx.widgets import QRadioButtonGroup
+from WinUx.ui import QRadioButtonGroup
 
 
 class RadioGroupTests(unittest.TestCase):

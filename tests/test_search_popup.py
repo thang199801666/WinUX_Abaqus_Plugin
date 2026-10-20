@@ -5,7 +5,7 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOLBAR = ROOT / "WinUx" / "components" / "toolbar.py"
+TOOLBAR = ROOT / "WinUx" / "ui" / "components" / "toolbar.py"
 
 
 class SearchPopupTests(unittest.TestCase):

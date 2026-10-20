@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-import dearpygui.dearpygui as dpg
-from .qt_dialog import QtDialog, QtTable
+from DearUIQt.backends import dpg
+from DearUIQt.dialogs.qt_dialog import QtDialog
+from DearUIQt.widgets import QLabel, QtTable
 
 
 class SyncPreviewDialog(QtDialog):
+    REUSABLE_HOST = True
     def __init__(self, view, rows, local_path, server_path, on_refresh, on_transfer):
         self._rows = []
+        self._scan_pending = False
         self._on_refresh, self._on_transfer = on_refresh, on_transfer
         super().__init__(view, "Directory Synchronization Preview", 820, 470, modal=False)
         self.header("Directory synchronization", "Review differences before starting a transfer.")
         paths_form = self.form_layout(parent=self.content, label_width=54)
         self.local_path = self.form_layout_row(
-            paths_form, "Local", lambda parent: dpg.add_text("", parent=parent, wrap=690))
+            paths_form, "Local", lambda parent: QLabel("", parent=parent, wrap=690, backend=dpg).tag)
         self.server_path = self.form_layout_row(
-            paths_form, "Server", lambda parent: dpg.add_text("", parent=parent, wrap=690))
+            paths_form, "Server", lambda parent: QLabel("", parent=parent, wrap=690, backend=dpg).tag)
         self.table = QtTable(self.content, (
             {"key": "name", "label": "Name", "stretch": 2.2, "sortable": False},
             {"key": "status", "label": "Status", "width": 112, "sortable": False},
@@ -23,7 +26,7 @@ class SyncPreviewDialog(QtDialog):
             {"key": "action", "label": "Recommended action", "width": 156, "sortable": False},
         ), height=-30, multiple=True)
         self.status = self.status_text()
-        self.button_box([("Refresh", self.request_refresh, "secondary", False),
+        self.buttons = self.button_box([("Refresh", self.request_refresh, "secondary", False),
                          ("Transfer", self._transfer_selected, "primary", True),
                          ("Close", self.destroy, "secondary", False)],
                         status_item=self.status)
@@ -50,11 +53,25 @@ class SyncPreviewDialog(QtDialog):
             self._size_text(row.get("local_size"), bool(row.get("local_exists"))),
             self._size_text(row.get("server_size"), bool(row.get("server_exists"))),
             row.get("action") or "Review")) for i, row in enumerate(self._rows)])
+        self._scan_pending = False
+        self.set_control_enabled(self.buttons[1], True)
+        self.table.setVisible(True)
         self.set_status("{} difference(s) | {} recommended transfer(s)".format(len(self._rows),
             sum(row.get("action") in ("Upload", "Download") for row in self._rows)))
 
     def set_status(self, text):
         dpg.set_value(self.status, str(text))
+
+    def begin_scan(self, local_path, server_path):
+        self._scan_pending = True
+        self.table.selected.clear()
+        # Hide the old snapshot in O(1); do not delete thousands of old rows on
+        # the reopen path before the shell has had a chance to paint.
+        self.table.setVisible(False)
+        dpg.set_value(self.local_path, str(local_path))
+        dpg.set_value(self.server_path, str(server_path))
+        self.set_control_enabled(self.buttons[1], False)
+        self.set_status("Scanning Local and Server folders...")
 
     def request_refresh(self):
         self.view.after(0, self._on_refresh)
@@ -63,6 +80,9 @@ class SyncPreviewDialog(QtDialog):
         self.view.after(0, self._on_transfer, list(rows or []))
 
     def _transfer_selected(self):
+        if self._scan_pending:
+            self.set_status("Wait for the current scan to finish before transferring.")
+            return
         rows = [dict(row) for i, row in enumerate(self._rows) if i in self.table.selected]
         if not rows:
             rows = [dict(row) for row in self._rows if row.get("action") in ("Upload", "Download")]
@@ -76,3 +96,5 @@ class SyncPreviewDialog(QtDialog):
             self.refresh(*args)
         elif command == "status":
             self.set_status(*args)
+        elif command == "begin_scan":
+            self.begin_scan(*args)

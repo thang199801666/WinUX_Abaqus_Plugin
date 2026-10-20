@@ -22,8 +22,8 @@ IGNORED_DIRECTORIES = {
     ".pytest_cache",
     ".mypy_cache",
 }
-IGNORED_SUFFIXES = (".pyc", ".pyo", ".log", ".pem", ".key", ".p12", ".pfx")
-PRIVATE_FILES = {".env", "settings.json", "known_hosts", "OPTIMIZATION_GOAL.md", "REFACTOR_NOTES.md"}
+IGNORED_SUFFIXES = (".pyc", ".pyo", ".log", ".pem", ".key", ".p12", ".pfx", ".md", ".markdown")
+PRIVATE_FILES = {".env", "settings.json", "known_hosts"}
 REQUIRED_FILES = (
     VERSION_FILENAME,
     "WinUx_plugin.py",
@@ -35,6 +35,7 @@ REQUIRED_FILES = (
     "winux_update_installer.py",
     "run_winux.py",
     os.path.join("WinUx", "__main__.py"),
+    os.path.join("DearUIQt", "__init__.py"),
 )
 
 

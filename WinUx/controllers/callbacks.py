@@ -63,11 +63,17 @@ def build_controller_callbacks(controller):
         "console_output": controller.server.shell_output,
         "console_connected": lambda: controller.server.connected,
         "console_command": controller.console_command,
+        "console_complete": controller.console_complete,
+        "console_completion_list": controller.console_completion_list,
         "console_interrupt": controller.console_interrupt,
         "job_user": lambda: controller.server.username or "",
         "bookmark_command": controller.bookmark_command,
         "site_manager": controller.site_manager,
         "sync_preview": controller.sync_preview,
+        # Optional application-level activity signal.  It is intentionally not
+        # part of REQUIRED_CALLBACK_KEYS so injected/minimal views stay source
+        # compatible, while the production view can wake adaptive pollers.
+        "user_activity": controller.user_activity,
     }
     return validate_callbacks(callbacks)
 

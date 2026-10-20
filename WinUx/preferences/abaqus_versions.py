@@ -9,9 +9,9 @@ class AbaqusVersionPreferences:
     """Store Abaqus commands and the preferred/default command.
 
     Existing profiles containing only ``versions`` are migrated lazily.  The
-    preferred command defaults to ``abq2026`` and is always tried before the
-    remaining configured/built-in commands. ODB readers additionally probe the
-    real database and fall back until a release can open that ODB.
+    preferred command defaults to ``abq2026`` and leads the configured command
+    list. ODB readers independently sort installed releases newest first and
+    probe the real database until a release can open that ODB.
     """
 
     DEFAULT_COMMAND = "abq2026"

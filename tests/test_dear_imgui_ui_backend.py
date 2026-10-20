@@ -4,8 +4,9 @@ ROOT = Path(__file__).resolve().parents[1] / "WinUx"
 
 # Server Notepad is the one explicitly tracked legacy migration island. No new
 # Tk import is allowed anywhere else in the WinUx UI/runtime package.
+# (Paths are relative to WinUx; server_notepad_tabs re-homed to ui/components.)
 LEGACY_NOTEPAD_TK = {
-    "components/server_notepad_tabs.py",
+    "ui/components/server_notepad_tabs.py",
     "dialogs/modern.py",
     "services/server_notepad_layout.py",
     "services/server_notepad_editor.py",
@@ -14,7 +15,7 @@ LEGACY_NOTEPAD_TK = {
     # Shared Win32/resource helpers still expose legacy Tk-only functions used
     # exclusively by the Server Notepad migration island. The main WinUx/DPG
     # dialog path does not call those functions.
-    "platform/native_dialog_host.py",
+    "ui/native/native_dialog_host.py",
     "resources.py",
 }
 
@@ -37,19 +38,30 @@ def test_login_and_folder_chooser_use_no_secondary_ui_toolkit():
     for rel in (
         "dialogs/login_form.py",
         "dialogs/local_folder_form.py",
-        "components/qt_combo_box.py",
-        "services/floating_dialog_process.py",
     ):
         source = (ROOT / rel).read_text(encoding="utf-8")
         assert "tkinter" not in source
         assert "PyQt" not in source
         assert "PySide" not in source
+    # The retained editable combo lives in the DearUIQt widget library now.
+    combo = (ROOT.parent / "DearUIQt" / "widgets" / "combo_box.py").read_text(
+        encoding="utf-8")
+    assert "tkinter" not in combo
+    assert "PyQt" not in combo
+    assert "PySide" not in combo
+    process = (ROOT / "services/floating_dialog_process.py").read_text(encoding="utf-8")
+    assert "tkinter" not in process
+    assert "PyQt" not in process
+    assert "PySide" not in process
 
 
 def test_backend_explicit_imgui_item_view_aliases_exist():
-    source = (ROOT / "widgets/item_views.py").read_text(encoding="utf-8")
-    assert "ImGuiDataGridView = QtDataGridView" in source
-    assert "ImGuiListView = QtListView" in source
-    combo = (ROOT / "components/qt_combo_box.py").read_text(encoding="utf-8")
+    # Legacy DearUIQt/qt/item_grid.py|item_list.py are module aliases for the
+    # canonical modelview implementations, which keep the ImGui aliases.
+    grid = (ROOT.parent / "DearUIQt" / "modelview" / "table.py").read_text(encoding="utf-8")
+    listing = (ROOT.parent / "DearUIQt" / "modelview" / "list.py").read_text(encoding="utf-8")
+    assert "ImGuiDataGridView = QtDataGridView" in grid
+    assert "ImGuiListView = QtListView" in listing
+    combo = (ROOT.parent / "DearUIQt" / "widgets" / "combo_box.py").read_text(encoding="utf-8")
     assert "class ImGuiComboBox:" in combo
     assert "QtComboBox = ImGuiComboBox" in combo

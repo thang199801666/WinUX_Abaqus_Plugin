@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..inp_preferences import INPPreferences
+from ..preferences.inp import INPPreferences
 from ..inp_reader import INPReader
 from ..runtime.operation_context import OperationContext
 

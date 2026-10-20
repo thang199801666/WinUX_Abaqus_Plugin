@@ -11,7 +11,7 @@ from WinUx.runtime.command_queue import LatestCommandQueue
 
 def controller_shell():
     """Execute real transport methods without importing native input hooks."""
-    source = Path(__file__).resolve().parents[1] / "WinUx/dialogs/floating_dialog.py"
+    source = Path(__file__).resolve().parents[1] / "WinUx/ui/hosting/floating_dialog.py"
     tree = ast.parse(source.read_text(encoding="utf-8"))
     cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "FloatingDialogController")
     methods = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in {"post", "post_latest"}]

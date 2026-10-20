@@ -3,6 +3,8 @@
 import importlib.util
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -15,8 +17,8 @@ SERVER = ROOT / "WinUx" / "server_model.py"
 REMOTE_ODB = ROOT / "WinUx" / "services" / "remote_odb.py"
 CONTROLLER = ROOT / "WinUx" / "controller.py"
 JOB_PLOT_CONTROLLER = ROOT / "WinUx" / "controllers" / "job_plot.py"
-FILE_PANEL = ROOT / "WinUx" / "components" / "file_panel.py"
-JOBS_VIEW = ROOT / "WinUx" / "components" / "jobs_view.py"
+FILE_PANEL = ROOT / "WinUx" / "ui" / "components" / "file_panel.py"
+JOBS_VIEW = ROOT / "WinUx" / "ui" / "components" / "jobs_view.py"
 DIALOG = ROOT / "WinUx" / "dialogs" / "odb_check_dialog.py"
 
 SPEC = importlib.util.spec_from_file_location("winux_odb_check", SERVICE)
@@ -204,8 +206,14 @@ class ODBExtractorTests(unittest.TestCase):
                 odb_check.JSON_BEGIN, odb_check.JSON_END)
             success = mock.Mock(returncode=0, stdout=payload, stderr="")
 
+            def fake_run(command, **_kwargs):
+                # Candidate probes race concurrently; discriminate by command.
+                if "abq2026" in str(command):
+                    return missing
+                return success
+
             with mock.patch.object(
-                    odb_check.subprocess, "run", side_effect=[missing, success]) as run:
+                    odb_check.subprocess, "run", side_effect=fake_run) as run:
                 result = odb_check.check_local_odb(
                     odb_path, abaqus_commands=["abq2026", "abq2025"])
 
@@ -279,6 +287,10 @@ class ODBIntegrationArchitectureTests(unittest.TestCase):
 
         def fake_exec(_client, command, timeout=None):
             calls.append((command, timeout))
+            if "command -v" in command:
+                return 0, "\n".join(
+                    "__WINUX_ABAQUS_FOUND__" + name
+                    for name in ("abq2026", "abq2025", "abq2023")), ""
             if "abq2026 python" in command:
                 return 1, "", "ODB was created by a previous release"
             if "abq2025 python" in command:
@@ -300,21 +312,29 @@ class ODBIntegrationArchitectureTests(unittest.TestCase):
 
         self.assertEqual(command, "abq2023")
         probe_calls = [call for call in calls if " python -c " in call[0]]
-        self.assertEqual([
-            next(name for name in ("abq2026", "abq2025", "abq2023")
-                 if name + " python" in call[0])
-            for call in probe_calls[:3]
-        ], ["abq2026", "abq2025", "abq2023"])
-        self.assertIn("Test Job/job.odb", probe_calls[-1][0])
+        self.assertEqual(len(probe_calls), 3)
+        # Probes race concurrently, so only the candidate *set* is guaranteed;
+        # the selected release still honors the newest-first priority.
+        probed = set()
+        for call in probe_calls:
+            name = next(name for name in ("abq2026", "abq2025", "abq2023")
+                        if name + " python" in call[0])
+            probed.add(name)
+        self.assertEqual(probed, {"abq2026", "abq2025", "abq2023"})
+        self.assertTrue(all("Test Job/job.odb" in call[0]
+                            for call in probe_calls))
         self.assertTrue(all(timeout == model.ABAQUS_PROBE_TIMEOUT_SECONDS
-                            for _command, timeout in probe_calls[:3]))
+                            for _command, timeout in probe_calls))
 
-    def test_odb_compatibility_resolver_reuses_successful_release_as_priority_hint(self):
+    def test_odb_compatibility_resolver_rechecks_newest_despite_cached_success(self):
         calls = []
         original = SSHServerModel._exec_client
 
         def fake_exec(_client, command, timeout=None):
             calls.append(command)
+            if "command -v" in command:
+                return 0, ("__WINUX_ABAQUS_FOUND__abq2026\n"
+                           "__WINUX_ABAQUS_FOUND__abq2023"), ""
             if "abq2023 python" in command:
                 return 0, "__WINUX_ODB_RELEASE_OK__", ""
             return 1, "", "release mismatch"
@@ -335,7 +355,7 @@ class ODBIntegrationArchitectureTests(unittest.TestCase):
         self.assertEqual(first, "abq2023")
         self.assertEqual(second, "abq2023")
         probe_calls = [call for call in calls if " python -c " in call]
-        self.assertTrue(probe_calls[0].find("abq2023 python") >= 0)
+        self.assertIn("abq2026 python", probe_calls[0])
 
 
     def test_odb_discovery_skips_missing_launchers_before_heavy_probe(self):
@@ -376,7 +396,7 @@ class ODBIntegrationArchitectureTests(unittest.TestCase):
         self.assertEqual(
             discovery_calls[0][1], model.ABAQUS_DISCOVERY_TIMEOUT_SECONDS)
 
-    def test_odb_discovery_and_host_hint_are_reused_for_next_job(self):
+    def test_odb_discovery_is_cached_but_next_job_still_checks_newest_first(self):
         calls = []
         original = SSHServerModel._exec_client
 
@@ -411,8 +431,9 @@ class ODBIntegrationArchitectureTests(unittest.TestCase):
         self.assertFalse(any("command -v" in command for command, _timeout in calls))
         probe_commands = [command for command, _timeout in calls
                           if " python -c " in command]
-        self.assertEqual(len(probe_commands), 1)
-        self.assertIn("abq2023 python", probe_commands[0])
+        self.assertEqual(len(probe_commands), 2)
+        self.assertIn("abq2026 python", probe_commands[0])
+        self.assertIn("abq2023 python", probe_commands[1])
 
     def test_server_odb_tools_probe_the_real_database_for_release_compatibility(self):
         source = REMOTE_ODB.read_text(encoding="utf-8")
@@ -447,9 +468,173 @@ class ODBIntegrationArchitectureTests(unittest.TestCase):
         source = (ROOT / "WinUx" / "controllers" / "odb_analysis.py").read_text(encoding="utf-8")
         self.assertIn('AbaqusVersionPreferences().ordered_commands()', source)
 
-    def test_odb_result_window_routes_to_current_floating_adapter(self):
+    def test_odb_result_window_routes_to_current_inprocess_adapter(self):
         source = DIALOG.read_text(encoding="utf-8")
-        self.assertIn("from .floating_adapters import ODBCheckDialog", source)
+        self.assertIn("from .inprocess_adapters import ODBCheckDialog", source)
+
+
+class ProbeRacingTests(unittest.TestCase):
+    """Slow release probes must overlap; fast misses stay sequential."""
+
+    def _model(self):
+        model = SSHServerModel()
+        model.host = "cluster"
+        model.username = "tester"
+        return model
+
+    def test_slow_probes_overlap_instead_of_summing(self):
+        model = self._model()
+        probes = [("abq2026", "cmd1"), ("abq2025", "cmd2"), ("abq2023", "cmd3")]
+
+        def fake_exec(_client, command, timeout=None):
+            # Simulate a slow interpreter spin-up for every candidate.
+            time.sleep(0.25)
+            return 1, "", "release mismatch on {}".format(command)
+
+        started = time.monotonic()
+        outcomes, failures = model._race_abaqus_probe_commands(
+            fake_exec, object(), probes, 45.0, stagger=0.05)
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(len(failures), 0)
+        self.assertEqual({candidate for candidate in outcomes}, {
+            "abq2026", "abq2025", "abq2023"})
+        # Sequential probing would need >= 0.75s; overlapped probes finish
+        # in roughly one interpreter's worth of time.
+        self.assertLess(elapsed, 0.6)
+
+    def test_first_success_in_candidate_order_wins(self):
+        model = self._model()
+        probes = [("abq2026", "cmd1"), ("abq2025", "cmd2")]
+
+        def fake_exec(_client, command, timeout=None):
+            time.sleep(0.05)
+            return 0, "__WINUX_ODB_RELEASE_OK__", ""
+
+        outcomes, failures = model._race_abaqus_probe_commands(
+            fake_exec, object(), probes, 45.0, stagger=0.01)
+
+        self.assertEqual(failures, {})
+        self.assertEqual(
+            outcomes,
+            {"abq2026": (0, "__WINUX_ODB_RELEASE_OK__", ""),
+             "abq2025": (0, "__WINUX_ODB_RELEASE_OK__", "")})
+
+        # A resolver that only reads the results dict in candidate order
+        # picks the newest release, never the merely-fastest one.
+        winner = next(candidate for candidate, _command in probes
+                      if candidate in outcomes and outcomes[candidate][0] == 0)
+        self.assertEqual(winner, "abq2026")
+
+    def test_fast_probe_failures_preserve_priority_order(self):
+        model = self._model()
+        probes = [("abq2026", "cmd1"), ("abq2025", "cmd2"), ("abq2023", "cmd3")]
+        order = []
+
+        def fake_exec(_client, command, timeout=None):
+            # Instant failures settle long before the stagger window, so the
+            # chain must stay sequential in priority order.
+            order.append(command)
+            return 1, "", "mismatch"
+
+        model._race_abaqus_probe_commands(
+            fake_exec, object(), probes, 45.0)  # default stagger
+
+        self.assertEqual(order, ["cmd1", "cmd2", "cmd3"])
+
+    def test_no_further_probe_launches_after_a_winner_settles(self):
+        model = self._model()
+        probes = [("abq2026", "cmd1"), ("abq2025", "cmd2"), ("abq2023", "cmd3")]
+        launched = []
+
+        def fake_exec(_client, command, timeout=None):
+            launched.append(command)
+            if "cmd1" in command:
+                return 0, "__WINUX_ODB_RELEASE_OK__", ""
+            return 1, "", "release mismatch"
+
+        outcomes, failures = model._race_abaqus_probe_commands(
+            fake_exec, object(), probes, 45.0, stagger=0.01,
+            probe_success=lambda outcome: (
+                outcome[0] == 0 and "__WINUX_ODB_RELEASE_OK__" in outcome[1]))
+
+        self.assertEqual(launched, ["cmd1"])
+        self.assertEqual(list(outcomes), ["abq2026"])
+        self.assertEqual(failures, {})
+
+    def test_live_probe_concurrency_is_bounded(self):
+        model = self._model()
+        probes = [("abq{}".format(year), "cmd-{}".format(year))
+                  for year in range(2026, 2020, -1)]
+        state = {"active": 0, "peak": 0, "lock": threading.Lock()}
+
+        def fake_exec(_client, command, timeout=None):
+            with state["lock"]:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            time.sleep(0.05)
+            with state["lock"]:
+                state["active"] -= 1
+            return 1, "", "mismatch"
+
+        model._race_abaqus_probe_commands(
+            fake_exec, object(), probes, 45.0,
+            chunk_size=2, stagger=0.01)
+
+        self.assertEqual(state["peak"], 2)
+
+
+class LocalProbeRacingTests(unittest.TestCase):
+    def test_local_fast_misses_run_in_priority_order(self):
+        commands = ["abq2026", "abq2025", "abq2023"]
+        order = []
+
+        def fake_run(command, **_kwargs):
+            order.append(str(command))
+            return mock.Mock(returncode=1, stdout="", stderr="not found")
+
+        pairs = [(name, "cmd for {}".format(name)) for name in commands]
+        with mock.patch.object(odb_check.subprocess, "run", side_effect=fake_run):
+            outcomes, failures = odb_check._race_local_odb_checks(
+                pairs, 30.0, 0)
+
+        self.assertEqual(failures, {})
+        self.assertEqual(set(outcomes), set(commands))
+        self.assertEqual(
+            [name for name in commands
+             if "cmd for {}".format(name) in order],
+            commands)
+
+    def test_local_slow_candidates_overlap(self):
+        def fake_run(command, **_kwargs):
+            time.sleep(0.25)
+            return mock.Mock(returncode=1, stdout="", stderr="mismatch")
+
+        pairs = [(name, "cmd for {}".format(name))
+                 for name in ("abq2026", "abq2025", "abq2023")]
+        with mock.patch.object(odb_check.subprocess, "run", side_effect=fake_run):
+            started = time.monotonic()
+            odb_check._race_local_odb_checks(pairs, 30.0, 0, stagger=0.05)
+            elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.6)
+
+    def test_local_timeout_is_recorded_per_candidate_not_raised(self):
+        pairs = [("abq2026", "slow"), ("abq2025", "fast")]
+
+        def fake_run(command, timeout=None, **_kwargs):
+            if "slow" in str(command):
+                raise odb_check.subprocess.TimeoutExpired(command, timeout)
+            return mock.Mock(returncode=1, stdout="", stderr="mismatch")
+
+        with mock.patch.object(odb_check.subprocess, "run", side_effect=fake_run):
+            outcomes, failures = odb_check._race_local_odb_checks(
+                pairs, 30.0, 0, stagger=0.01)
+
+        self.assertEqual(
+            set(outcomes),
+            {"abq2025"})  # completed (returncode 1) but no payload emitted
+        self.assertIn("timed out", failures["abq2026"])
 
 
 if __name__ == "__main__":

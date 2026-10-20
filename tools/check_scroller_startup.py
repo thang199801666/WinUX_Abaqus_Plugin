@@ -10,13 +10,13 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import WinUx
 import dearpygui.dearpygui as dpg
-from WinUx.components.explorer_list_view import ExplorerListView
+from WinUx.ui.components.explorer_list_view import ExplorerListView
 
 
 def check_main_startup(output_dir):
     from WinUx.view import WinUXView
     from WinUx.controllers.callbacks import REQUIRED_CALLBACK_KEYS
-    from WinUx.components.explorer_list_view import ListViewItem
+    from WinUx.ui.components.explorer_list_view import ListViewItem
 
     view = WinUXView({key: lambda *a, **k: "" for key in REQUIRED_CALLBACK_KEYS})
     try:

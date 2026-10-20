@@ -6,8 +6,8 @@ MODERN = ROOT / "WinUx" / "dialogs" / "modern.py"
 BLOCKING = ROOT / "WinUx" / "dialogs" / "blocking_form.py"
 VIEW = ROOT / "WinUx" / "view.py"
 CONTROLLER = ROOT / "WinUx" / "controller.py"
-LISTVIEW = ROOT / "WinUx" / "components" / "explorer_list_view.py"
-FILE_PANEL = ROOT / "WinUx" / "components" / "file_panel.py"
+LISTVIEW = ROOT / "WinUx" / "ui" / "components" / "explorer_list_view.py"
+FILE_PANEL = ROOT / "WinUx" / "ui" / "components" / "file_panel.py"
 TRANSFER = ROOT / "WinUx" / "dialogs" / "transfer_center_form.py"
 
 

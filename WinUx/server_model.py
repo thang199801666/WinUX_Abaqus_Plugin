@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import re
+import shlex
 import socket
 import threading
+import uuid
 from contextlib import contextmanager
 from collections import deque
 from pathlib import PurePosixPath
@@ -161,6 +163,11 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
         self._shell_hidden_echoes = deque()
         self._shell_hidden_partial = ""
         self._shell_directory = None
+        # Best-known cwd used only for local/remote Tab completion. Unlike
+        # _shell_directory this value is not invalidated by every user command;
+        # simple ``cd`` commands update it directly while ambiguous cwd-changing
+        # shell constructs mark it unknown.
+        self._shell_completion_directory = None
         self._shell_condition = threading.Condition()
         self._shell_send_lock = threading.Lock()
         self._shell_stop = threading.Event()
@@ -191,16 +198,16 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
         duration. Calling ``close()`` from the render thread while a transfer is
         active therefore waits for that transfer (or a network timeout) and
         makes the WinUX window appear frozen. Application shutdown instead
-        detaches the live objects, closes the underlying socket immediately to
-        wake blocked Paramiko calls, and lets graceful ``close()`` methods run
-        on a daemon cleanup thread.
+        detaches the live objects, shuts down the transport socket immediately
+        to wake blocked Paramiko calls, and lets final ``close()`` methods run
+        on a daemon cleanup thread after Paramiko has observed EOF.
         """
         self._remote_tar_supported = None
         self._shell_stop.set()
 
         # Detach first so new background work observes a disconnected model.
         # Existing workers retain their local channel/SFTP objects and unwind
-        # naturally once the transport socket is closed below.
+        # naturally once the transport socket is shut down below.
         shell, self.shell = self.shell, None
         sftp, self.sftp = self.sftp, None
         client, self.client = self.client, None
@@ -221,35 +228,61 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
                 except Exception:
                     pass
 
-        def break_client_socket(value):
+        def interrupt_client_socket(value):
             if value is None:
-                return
+                return None, None
             try:
                 transport = value.get_transport()
             except Exception:
                 transport = None
-            # Do not call Transport.close() here: Paramiko's close path may
-            # join its transport thread. Closing the raw socket is sufficient
-            # to wake blocked recv/send on every channel of the one transport.
             raw_socket = getattr(transport, "sock", None) if transport else None
             if raw_socket is not None:
+                # Wake Paramiko's blocking recv/send without invalidating the
+                # WinSock handle underneath its transport thread.  Calling
+                # close() here used to race Paramiko's packetizer on Windows:
+                # recv() would then observe WSAENOTSOCK/WinError 10038 and
+                # print ``Socket exception: ... not a socket (10038)`` to the
+                # console during an otherwise normal WinUx shutdown.
+                #
+                # shutdown(SHUT_RDWR) is enough to make recv() return EOF. The
+                # transport thread can then unwind normally and close its own
+                # socket; final object cleanup happens off the render thread.
                 try:
                     raw_socket.shutdown(socket.SHUT_RDWR)
                 except Exception:
                     pass
+            return transport, raw_socket
+
+        transport, raw_socket = interrupt_client_socket(client)
+
+        def cleanup():
+            # Give the Paramiko receiver a bounded chance to consume the EOF
+            # produced by shutdown() before any object close invalidates the
+            # socket handle.  This wait is on a daemon cleanup thread, never on
+            # the UI/render path, so application Close remains instantaneous.
+            if transport is not None:
                 try:
-                    raw_socket.close()
+                    is_alive = getattr(transport, "is_alive", None)
+                    join = getattr(transport, "join", None)
+                    if callable(is_alive) and callable(join) and is_alive():
+                        join(0.75)
                 except Exception:
                     pass
 
-        break_client_socket(client)
-
-        def cleanup():
             for resource in (shell, sftp, client) + auxiliary_clients:
                 if resource is None:
                     continue
                 try:
                     resource.close()
+                except Exception:
+                    pass
+
+            # SSHClient.close() normally owns the final socket close.  Keep a
+            # best-effort fallback for injected/partial clients used by hosts
+            # and tests, but only after Paramiko had the chance to exit.
+            if raw_socket is not None:
+                try:
+                    raw_socket.close()
                 except Exception:
                     pass
 
@@ -366,6 +399,7 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
                 raise
             self.client, self.sftp = client, sftp
             self.home = PurePosixPath(home)
+            self._shell_completion_directory = self.home
             self.host = host
             self._port = int(port)
             self.username = username
@@ -406,6 +440,8 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
                 try:
                     home = self.sftp.normalize(".")
                     self.home = PurePosixPath(home)
+                    if self._shell_completion_directory is None:
+                        self._shell_completion_directory = self.home
                 except Exception:
                     pass
                 return self.home
@@ -616,16 +652,22 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
             "from odbAccess import openOdb; "
             "print(%r)" % marker
         )
+        probes = []
         for candidate in candidates:
             probe = "{} python -c {}".format(
                 candidate, cls._shell_quote(probe_code))
-            command = cls._login_shell_command(probe)
-            try:
-                status, output, error = cls._exec_client(
-                    client, command, timeout=cls.ABAQUS_PROBE_TIMEOUT_SECONDS)
-            except Exception as exc:
-                attempted.append("{} ({})".format(candidate, exc))
+            probes.append((candidate, cls._login_shell_command(probe)))
+        outcomes, failures = cls._race_abaqus_probe_commands(
+            cls._exec_client, client, probes,
+            cls.ABAQUS_PROBE_TIMEOUT_SECONDS,
+            probe_success=lambda outcome: (
+                outcome[0] == 0 and marker in outcome[1]))
+        for candidate, _command in probes:
+            if candidate in failures:
+                attempted.append(
+                    "{} ({})".format(candidate, failures[candidate]))
                 continue
+            status, output, error = outcomes[candidate]
             if status == 0 and marker in output:
                 return candidate
             detail = (error or output or "exit {}".format(status)).strip()
@@ -678,6 +720,8 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
             self._shell_hidden_echoes.clear()
             self._shell_hidden_partial = ""
             self._shell_directory = None
+            # A freshly opened interactive shell starts in the login home.
+            self._shell_completion_directory = self.home
         self._shell_stop = stop_event
 
         def reader():
@@ -888,6 +932,22 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
         with self._shell_condition:
             return self._shell_visible_output.snapshot()
 
+    def append_console_message(self, message, *, command=""):
+        """Display local help without sending it to the PTY or raw transcript."""
+        with self._shell_condition:
+            visible = self._shell_visible_output.snapshot()
+            tail = visible[max(visible.rfind("\n"), visible.rfind("\r")) + 1:]
+            plain = self._SHELL_ANSI_RE.sub("", tail)
+            prompt = tail if self._SHELL_PROMPT_LINE_RE.match(plain) else ""
+            separator = ""
+            if prompt:
+                if not prompt[-1].isspace():
+                    separator = " "
+            elif visible and not visible.endswith(("\n", "\r")):
+                separator = "\r\n"
+            text = separator + str(command) + "\r\n" + str(message).rstrip()
+            self._shell_visible_output.append(text + "\r\n" + prompt)
+
     def send_shell_command(self, command, *, show_echo=True, replace_prompt=False):
         if not self.shell or self.shell.closed:
             raise RuntimeError("Not connected to an SSH server")
@@ -908,8 +968,668 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
             self.shell.send("\x03")
 
     def invalidate_shell_directory(self):
-        """Forget the cached cwd after a user-entered shell command."""
+        """Forget the strict cwd cache after a user-entered shell command."""
         self._shell_directory = None
+
+    def note_shell_command(self, command):
+        """Keep a best-effort cwd for Tab completion without probing the PTY.
+
+        The interactive terminal keeps its editable line locally, so completion
+        runs on auxiliary SSH/SFTP channels instead of injecting characters into
+        the live PTY.  Server Files provides an exact cwd through
+        :meth:`set_shell_directory`; between navigations we can additionally
+        track ordinary ``cd`` commands.  Complex shell expressions are marked
+        unknown rather than guessed.
+        """
+        text = str(command or "").strip()
+        if not text:
+            return
+        try:
+            words = shlex.split(text, posix=True)
+        except ValueError:
+            words = []
+        if not words:
+            return
+        first = words[0]
+        if first not in ("cd", "pushd", "popd"):
+            return
+        # Compound expressions can change cwd conditionally or more than once.
+        # Do not claim an exact directory for those cases.
+        if re.search(r"(?:&&|\|\||[;`]|\$\(|[()])", text):
+            self._shell_completion_directory = None
+            return
+        if first != "cd" or len(words) > 2:
+            self._shell_completion_directory = None
+            return
+        target = words[1] if len(words) == 2 else "~"
+        if target == "-" or target.startswith("~") and target not in ("~",) and not target.startswith("~/"):
+            self._shell_completion_directory = None
+            return
+        if target == "~":
+            resolved = self.home
+        elif target.startswith("~/"):
+            resolved = self.home / target[2:]
+        elif target.startswith("/"):
+            resolved = PurePosixPath(target)
+        else:
+            base = self._shell_completion_directory or self._shell_directory or self.home
+            resolved = PurePosixPath(base) / target
+        self._shell_completion_directory = self.normalize(resolved)
+
+    @staticmethod
+    def _completion_word_context(draft, cursor):
+        """Return the editable shell word ending at *cursor*.
+
+        This intentionally implements only lexical shell rules required for
+        completion: whitespace/separators split words, while quotes and
+        backslash escapes keep spaces inside the active token.  It remains
+        useful with an unfinished quote, which ``shlex.split`` cannot parse.
+        """
+        text = str(draft or "")
+        cursor = max(0, min(len(text), int(cursor)))
+        before = text[:cursor]
+        quote = None
+        escaped = False
+        token_start = 0
+        segment_start = 0
+        word_index = 0
+        in_word = False
+        for index, char in enumerate(before):
+            if escaped:
+                escaped = False
+                in_word = True
+                continue
+            if char == "\\" and quote != "'":
+                escaped = True
+                in_word = True
+                continue
+            if quote is not None:
+                in_word = True
+                if char == quote:
+                    quote = None
+                continue
+            if char in ("'", '"'):
+                quote = char
+                in_word = True
+                continue
+            if char in ";|&":
+                if in_word:
+                    word_index += 1
+                in_word = False
+                word_index = 0
+                token_start = index + 1
+                segment_start = index + 1
+                continue
+            if char in "<>":
+                # Redirection starts a new shell token but does not start a
+                # new command segment.  Treat the target as an argument/path
+                # so constructs such as ``grep foo>res<Tab>`` and ``2>err``
+                # complete the filename after the operator.
+                if in_word:
+                    word_index += 1
+                in_word = False
+                token_start = index + 1
+                continue
+            if char.isspace():
+                if in_word:
+                    word_index += 1
+                in_word = False
+                token_start = index + 1
+                continue
+            if not in_word:
+                token_start = index
+                in_word = True
+
+        raw = before[token_start:] if in_word else ""
+        if not in_word:
+            token_start = cursor
+        opener = raw[0] if raw[:1] in ("'", '"') else None
+        payload = raw[1:] if opener else raw
+        # If the quote is already closed immediately before the caret, treat
+        # the token as complete and avoid synthesizing a second closing quote.
+        closed_quote = bool(opener and len(payload) > 0 and payload.endswith(opener) and quote is None)
+        if closed_quote:
+            payload = payload[:-1]
+        if opener == "'":
+            decoded = payload
+        else:
+            decoded_chars = []
+            escape = False
+            for char in payload:
+                if escape:
+                    decoded_chars.append(char)
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                else:
+                    decoded_chars.append(char)
+            if escape:
+                decoded_chars.append("\\")
+            decoded = "".join(decoded_chars)
+        # Find the end of the active shell token as well.  The completion
+        # prefix is still the text before the caret, but replacing through the
+        # lexical token end prevents a mid-token completion from producing
+        # duplicated suffixes (``foo<Tab>bar`` -> ``foobarbar``).
+        token_end = cursor
+        forward_quote = quote
+        forward_escaped = False
+        for index in range(cursor, len(text)):
+            char = text[index]
+            if forward_escaped:
+                forward_escaped = False
+                token_end = index + 1
+                continue
+            if char == "\\" and forward_quote != "'":
+                forward_escaped = True
+                token_end = index + 1
+                continue
+            if forward_quote is not None:
+                token_end = index + 1
+                if char == forward_quote:
+                    forward_quote = None
+                continue
+            if char in ("'", '"'):
+                forward_quote = char
+                token_end = index + 1
+                continue
+            if char.isspace() or char in ";|&<>":
+                break
+            token_end = index + 1
+
+        return {
+            "start": token_start, "end": token_end, "raw": raw,
+            "value": decoded, "quote": opener,
+            "closed_quote": closed_quote,
+            "command_position": word_index == 0,
+            "word_index": word_index,
+            "segment_start": segment_start,
+        }
+
+    @staticmethod
+    def _completion_escape(value, quote=None, close_quote=False):
+        value = str(value)
+        if quote == "'" and "'" not in value:
+            return "'" + value + ("'" if close_quote else "")
+        if quote == '"':
+            escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
+            return '"' + escaped + ('"' if close_quote else "")
+        # POSIX-safe inline escaping while retaining slash readability.
+        return re.sub(r"([\s\\'\"`$&;|<>()[\]{}*?!])", r"\\\1", value)
+
+    def _path_completion_entries(
+            self, token, quote=None, limit=64, directories_only=False):
+        """Return insertion/display pairs for remote filename completion.
+
+        Readline inserts shell-escaped text but prints human-readable names in
+        its ambiguous-match grid.  Keeping those representations separate
+        avoids lists such as ``My\\ Folder/`` while retaining a safe command
+        line replacement.
+        """
+        token = str(token or "")
+        if token == "~":
+            return [("~/", "~/")]
+        if "/" in token:
+            head, name_prefix = token.rsplit("/", 1)
+            display_head = head + "/"
+        else:
+            head, name_prefix, display_head = "", token, ""
+
+        cwd = self._shell_completion_directory or self._shell_directory or self.home
+        if token.startswith("~/"):
+            relative_head = head[2:] if head.startswith("~/") else ""
+            folder = self.home / relative_head
+        elif quote != "'" and token.startswith("$HOME/"):
+            relative_head = head[len("$HOME/"):] if head.startswith("$HOME/") else ""
+            folder = self.home / relative_head
+        elif quote != "'" and token.startswith("${HOME}/"):
+            relative_head = head[len("${HOME}/"):] if head.startswith("${HOME}/") else ""
+            folder = self.home / relative_head
+        elif quote != "'" and token.startswith("$PWD/"):
+            relative_head = head[len("$PWD/"):] if head.startswith("$PWD/") else ""
+            folder = PurePosixPath(cwd) / relative_head
+        elif quote != "'" and token.startswith("${PWD}/"):
+            relative_head = head[len("${PWD}/"):] if head.startswith("${PWD}/") else ""
+            folder = PurePosixPath(cwd) / relative_head
+        elif token.startswith("/"):
+            folder = PurePosixPath(head or "/")
+        elif head:
+            folder = PurePosixPath(cwd) / head
+        else:
+            folder = PurePosixPath(cwd)
+        folder = self.normalize(folder)
+
+        try:
+            items = self.list_directory(folder)
+        except Exception:
+            return []
+        show_hidden = name_prefix.startswith(".")
+        entries = []
+        for item in items:
+            name = str(item.name)
+            if name.startswith(".") and not show_hidden:
+                continue
+            if not name.startswith(name_prefix):
+                continue
+            if directories_only and not item.is_dir:
+                continue
+            display = display_head + name + ("/" if item.is_dir else "")
+            close_quote = bool(quote and not item.is_dir)
+            variable_prefix = next((prefix for prefix in (
+                "${HOME}/", "$HOME/", "${PWD}/", "$PWD/")
+                if quote != "'" and display.startswith(prefix)), None)
+            if variable_prefix is None:
+                insert = self._completion_escape(
+                    display, quote=quote, close_quote=close_quote)
+            else:
+                suffix = display[len(variable_prefix):]
+                if quote == '"':
+                    escaped = (suffix.replace("\\", "\\\\")
+                               .replace('"', '\\"')
+                               .replace("$", "\\$")
+                               .replace("`", "\\`"))
+                    insert = '"' + variable_prefix + escaped + ('"' if close_quote else '')
+                else:
+                    insert = variable_prefix + self._completion_escape(suffix)
+            entries.append((insert, display))
+            if len(entries) >= max(1, int(limit)):
+                break
+        return entries
+
+    def _path_completion_candidates(
+            self, token, quote=None, limit=64, directories_only=False):
+        # Compatibility helper retained for callers/tests that only need the
+        # text inserted into the editable command line.
+        return [insert for insert, _display in self._path_completion_entries(
+            token, quote=quote, limit=limit, directories_only=directories_only)]
+
+    def _command_completion_candidates(self, prefix, limit=64):
+        prefix = str(prefix or "")
+        if not prefix:
+            return []
+        script = (
+            "compgen -c -- {} 2>/dev/null | LC_ALL=C sort -u | head -n {}"
+            .format(self._shell_quote(prefix), max(1, int(limit)))
+        )
+        client = _SharedTransportClient(self, self._active_transport())
+        try:
+            _status, output, _error = self._exec_client(
+                client, self._login_shell_command(script), timeout=3.0)
+        except Exception:
+            return []
+        values = []
+        seen = set()
+        for line in str(output or "").splitlines():
+            value = line.strip()
+            if value and value.startswith(prefix) and value not in seen:
+                seen.add(value)
+                values.append(self._completion_escape(value))
+                if len(values) >= max(1, int(limit)):
+                    break
+        return values
+
+    _COMPLETION_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+    @classmethod
+    def _completion_shell_role(cls, draft, context):
+        """Classify the active token using lightweight POSIX shell semantics.
+
+        ``_completion_word_context`` knows lexical word boundaries, but raw
+        word indexes are not enough for wrappers such as ``sudo`` or ``env``.
+        This scanner consumes the common wrappers/options that occur before an
+        executable and reports whether the current token is still a command
+        position or an argument of the effective command.  It deliberately
+        stays conservative when syntax is incomplete.
+        """
+        text = str(draft or "")
+        try:
+            segment_start = max(0, int(context.get("segment_start", 0)))
+            token_start = max(segment_start, int(context.get("start", 0)))
+        except (TypeError, ValueError):
+            return {"role": "argument", "command": ""}
+        prefix = text[segment_start:token_start]
+        try:
+            words = shlex.split(prefix, posix=True)
+        except ValueError:
+            return {
+                "role": "command" if context.get("command_position") else "argument",
+                "command": cls._completion_command_name(draft, context),
+            }
+
+        index = 0
+        while index < len(words) and cls._COMPLETION_ASSIGNMENT_RE.match(words[index]):
+            index += 1
+        if index >= len(words):
+            return {"role": "command", "command": ""}
+
+        while index < len(words):
+            wrapper = words[index]
+            if wrapper == "sudo":
+                index += 1
+                value_options = {
+                    "-u": "user", "--user": "user",
+                    "-g": "group", "--group": "group",
+                    "-h": "host", "--host": "host",
+                    "-D": "directory", "--chdir": "directory",
+                    "-R": "directory", "--chroot": "directory",
+                    "-C": "plain", "--close-from": "plain",
+                    "-p": "plain", "--prompt": "plain",
+                    "-r": "plain", "--role": "plain",
+                    "-t": "plain", "--type": "plain",
+                }
+                while index < len(words):
+                    word = words[index]
+                    if cls._COMPLETION_ASSIGNMENT_RE.match(word):
+                        index += 1
+                        continue
+                    if word == "--":
+                        index += 1
+                        break
+                    if not word.startswith("-") or word == "-":
+                        break
+                    if "=" in word and word.startswith("--"):
+                        index += 1
+                        continue
+                    role = value_options.get(word)
+                    if role is not None:
+                        if index + 1 >= len(words):
+                            return {"role": role, "command": "sudo"}
+                        index += 2
+                        continue
+                    # Short options may carry their value in the same token
+                    # (for example ``sudo -uroot``).
+                    if len(word) > 2 and word[:2] in value_options:
+                        index += 1
+                        continue
+                    index += 1
+                if index >= len(words):
+                    return {"role": "command", "command": ""}
+                continue
+
+            if wrapper == "env":
+                index += 1
+                while index < len(words):
+                    word = words[index]
+                    if cls._COMPLETION_ASSIGNMENT_RE.match(word):
+                        index += 1
+                        continue
+                    if word == "--":
+                        index += 1
+                        break
+                    if word in ("-u", "--unset"):
+                        if index + 1 >= len(words):
+                            return {"role": "variable", "command": "env"}
+                        index += 2
+                        continue
+                    if word in ("-C", "--chdir"):
+                        if index + 1 >= len(words):
+                            return {"role": "directory", "command": "env"}
+                        index += 2
+                        continue
+                    if word.startswith(("--unset=", "--chdir=", "--argv0=")):
+                        index += 1
+                        continue
+                    if word.startswith("-") and word != "-":
+                        index += 1
+                        continue
+                    break
+                if index >= len(words):
+                    return {"role": "command", "command": ""}
+                continue
+
+            if wrapper in {"command", "builtin", "exec", "nohup", "time"}:
+                index += 1
+                value_options = {
+                    "exec": {"-a"},
+                    "time": {"-f", "--format", "-o", "--output"},
+                }.get(wrapper, set())
+                while index < len(words):
+                    word = words[index]
+                    if word == "--":
+                        index += 1
+                        break
+                    if not word.startswith("-") or word == "-":
+                        break
+                    if word in value_options:
+                        if index + 1 >= len(words):
+                            return {"role": "plain", "command": wrapper}
+                        index += 2
+                    else:
+                        index += 1
+                if index >= len(words):
+                    return {"role": "command", "command": ""}
+                continue
+
+            return {"role": "argument", "command": wrapper}
+
+        return {"role": "command", "command": ""}
+
+    def _shell_name_completion_candidates(self, kind, prefix, limit=64):
+        """Complete shell metadata names without touching the interactive PTY."""
+        mode = {"variable": "-v", "user": "-u", "group": "-g"}.get(str(kind))
+        if mode is None:
+            return []
+        prefix = str(prefix or "")
+        script = (
+            "compgen {} -- {} 2>/dev/null | LC_ALL=C sort -u | head -n {}"
+            .format(mode, self._shell_quote(prefix), max(1, int(limit)))
+        )
+        client = _SharedTransportClient(self, self._active_transport())
+        try:
+            _status, output, _error = self._exec_client(
+                client, self._login_shell_command(script), timeout=3.0)
+        except Exception:
+            return []
+        result = []
+        seen = set()
+        for line in str(output or "").splitlines():
+            value = line.strip()
+            if value and value.startswith(prefix) and value not in seen:
+                seen.add(value)
+                result.append(value)
+                if len(result) >= max(1, int(limit)):
+                    break
+        return result
+
+    def _variable_completion_entries(self, token, limit=64):
+        token = str(token or "")
+        braced = token.startswith("${")
+        if braced:
+            prefix = token[2:]
+        elif token.startswith("$"):
+            prefix = token[1:]
+        else:
+            return []
+        if "/" in prefix or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$|^$", prefix):
+            return []
+        values = self._shell_name_completion_candidates("variable", prefix, limit=limit)
+        if braced:
+            return [("${" + value + "}", "${" + value + "}") for value in values]
+        return [("$" + value, "$" + value) for value in values]
+
+    @staticmethod
+    def _completion_common_prefix(values):
+        values = [str(value) for value in values if str(value)]
+        if not values:
+            return ""
+        prefix = values[0]
+        for value in values[1:]:
+            while prefix and not value.startswith(prefix):
+                prefix = prefix[:-1]
+            if not prefix:
+                break
+        return prefix
+
+    @staticmethod
+    def _format_completion_candidates(values, columns=80):
+        """Format candidates in readline-like vertical columns.
+
+        Bash/readline fills columns top-to-bottom, then left-to-right.  Keep
+        the formatting backend independent from DearPyGui so detached and
+        docked consoles render the same completion list.
+        """
+        values = [str(value) for value in values if str(value)]
+        if not values:
+            return ""
+        columns = max(20, int(columns or 80))
+        widest = max(len(value.expandtabs(8)) for value in values)
+        cell = max(2, widest + 2)
+        count = max(1, columns // cell)
+        rows = (len(values) + count - 1) // count
+        lines = []
+        for row in range(rows):
+            parts = []
+            for column in range(count):
+                index = row + column * rows
+                if index >= len(values):
+                    continue
+                value = values[index]
+                is_last = column == count - 1 or index + rows >= len(values)
+                parts.append(value if is_last else value.ljust(cell))
+            lines.append("".join(parts).rstrip())
+        return "\r\n".join(lines)
+
+    def append_shell_completion_listing(self, draft, candidates, columns=80):
+        """Render an ambiguous completion list without writing to the PTY.
+
+        The current prompt already exists in the visible terminal transcript.
+        Appending the editable draft, candidate grid and the prompt again
+        reproduces readline's double-Tab redraw.  The next real PTY echo then
+        naturally continues after that redrawn prompt, so the listing remains
+        part of scrollback without sending synthetic keystrokes to the server.
+        """
+        values = []
+        seen = set()
+        for value in candidates or ():
+            value = str(value)
+            if value and value not in seen:
+                seen.add(value)
+                values.append(value)
+        listing = self._format_completion_candidates(values, columns=columns)
+        if not listing:
+            return False
+        with self._shell_condition:
+            visible = self._shell_visible_output.snapshot()
+            tail = visible[max(visible.rfind("\n"), visible.rfind("\r")) + 1:]
+            plain = self._SHELL_ANSI_RE.sub("", tail)
+            prompt = tail if self._SHELL_PROMPT_LINE_RE.match(plain) else ""
+            separator = ""
+            if prompt:
+                if not prompt[-1].isspace():
+                    separator = " "
+            elif visible and not visible.endswith(("\n", "\r")):
+                separator = "\r\n"
+            self._shell_visible_output.append(
+                separator + str(draft or "") + "\r\n" + listing +
+                "\r\n" + prompt)
+        return True
+
+    @staticmethod
+    def _completion_command_name(draft, context):
+        """Return the command word for the active simple shell segment."""
+        if context.get("command_position"):
+            return ""
+        text = str(draft or "")
+        try:
+            segment_start = max(0, int(context.get("segment_start", 0)))
+            token_start = max(segment_start, int(context.get("start", 0)))
+        except (TypeError, ValueError):
+            return ""
+        prefix = text[segment_start:token_start].strip()
+        if not prefix:
+            return ""
+        try:
+            words = shlex.split(prefix, posix=True)
+        except ValueError:
+            return ""
+        return str(words[0]) if words else ""
+
+    def complete_shell_input(self, draft, cursor, limit=64):
+        """Return remote shell completion candidates for the active token.
+
+        Completion never writes partial text into the interactive PTY.  It uses
+        the existing SFTP channel for filesystem names and an auxiliary exec
+        channel for command/metadata names, so stale completion work cannot
+        alter the command currently being edited in the Console.
+        """
+        if not self.connected:
+            return {"start": int(cursor), "end": int(cursor), "candidates": []}
+        context = self._completion_word_context(draft, cursor)
+        value = context["value"]
+        role_info = self._completion_shell_role(draft, context)
+        role = str(role_info.get("role") or "argument")
+        command_name = str(role_info.get("command") or "")
+
+        entries = []
+        completion_kind = role
+
+        # Parameter expansion is a first-class readline completion context.
+        # Keep the '$' syntax intact instead of escaping it as a filename.
+        variable_entries = self._variable_completion_entries(value, limit=limit)
+        if variable_entries:
+            entries.extend(variable_entries)
+            completion_kind = "variable-inline"
+        elif role in {"user", "group", "variable"}:
+            values = self._shell_name_completion_candidates(role, value, limit=limit)
+            entries.extend((item, item) for item in values)
+        else:
+            path_like = (
+                role != "command" or "/" in value
+                or value.startswith((".", "~")) or not value
+            )
+            if role == "command" and not path_like:
+                commands = self._command_completion_candidates(value, limit=limit)
+                entries.extend((item, item) for item in commands)
+            # Shells fall back to filename completion when command-name
+            # completion has no useful match; arguments use filesystem
+            # completion by default.  Wrapper options such as sudo -D/env -C
+            # explicitly constrain the result to directories.
+            if role == "directory" or path_like or not entries:
+                directories_only = (
+                    role == "directory"
+                    or (role == "argument" and command_name in {"cd", "pushd"})
+                )
+                entries.extend(self._path_completion_entries(
+                    value, quote=context["quote"], limit=limit,
+                    directories_only=directories_only))
+
+        candidates = []
+        display_candidates = []
+        seen = set()
+        for candidate, display in entries:
+            candidate = str(candidate)
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            candidates.append(candidate)
+            display_candidates.append(str(display))
+            if len(candidates) >= max(1, int(limit)):
+                break
+
+        # When the result reaches the transport/UI cap there may be unseen
+        # matches with a shorter prefix. Be conservative and avoid extending
+        # the editable text in that case.
+        common_prefix = ""
+        if len(candidates) < max(1, int(limit)):
+            common_prefix = self._completion_common_prefix(candidates)
+
+        replacement = ""
+        if len(candidates) == 1:
+            replacement = candidates[0]
+            # Inline variable expansion deliberately remains attached to the
+            # surrounding shell word. Commands, account names and regular
+            # files terminate with a space; directories retain '/'.
+            append_space = completion_kind != "variable-inline"
+            if (append_space and not replacement.endswith("/")
+                    and int(cursor) >= int(context["end"])):
+                replacement += " "
+        return {
+            "start": context["start"], "end": context["end"],
+            "candidates": candidates,
+            "display_candidates": display_candidates,
+            "common_prefix": common_prefix,
+            "replacement": replacement,
+            "completion_kind": completion_kind,
+        }
 
     _SHELL_PROMPT_LINE_RE = re.compile(
         r"^\[[^]\r\n]+@[^]\r\n]+(?:\s+[^]\r\n]*)?\][#$]\s*$"
@@ -950,6 +1670,7 @@ class SSHServerModel(RemoteJobsMixin, RemoteFilesystemMixin, RemoteODBMixin, Rem
         self.send_shell_command(
             command, show_echo=False, replace_prompt=True)
         self._shell_directory = target
+        self._shell_completion_directory = target
         return True
 
 

@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-import dearpygui.dearpygui as dpg
-from .qt_dialog import QtDialog
+from DearUIQt.dialogs.qt_dialog import QtDialog
 
 
 class SiteManagerDialog(QtDialog):
+    REUSABLE_HOST = True
     def __init__(self, view, sites, on_save, on_delete, on_connect):
         self._sites = []
         self._selected_id = None
@@ -43,10 +43,10 @@ class SiteManagerDialog(QtDialog):
         # Include an index so identically named profiles remain distinct.
         self._labels = ["{}: {}".format(i+1, site.get("name") or site.get("host") or "Site")
                         for i, site in enumerate(self._sites)]
-        dpg.configure_item(self.site_list, items=self._labels)
+        self.set_control_items(self.site_list, self._labels)
         index = next((i for i, site in enumerate(self._sites) if str(site.get("id")) == str(selected_id)), 0)
         if self._sites:
-            dpg.set_value(self.site_list, self._labels[index])
+            self.set_control_value(self.site_list, self._labels[index])
             self._load_site(self._sites[index])
         else:
             self._new()
@@ -58,16 +58,16 @@ class SiteManagerDialog(QtDialog):
     def _load_site(self, site):
         self._selected_id = str(site.get("id") or "") or None
         for name, item in self.fields.items():
-            dpg.set_value(item, str(site.get(name) or (22 if name == "port" else "")))
+            self.set_control_value(item, str(site.get(name) or (22 if name == "port" else "")))
         self.set_status_text(self.error, "", error=True)
 
     def _new(self):
         self._load_site({})
-        dpg.set_value(self.site_list, "")
-        dpg.focus_item(self.fields["name"])
+        self.set_control_value(self.site_list, "")
+        self.focus_control(self.fields["name"])
 
     def _snapshot(self):
-        values = {name: dpg.get_value(item).strip() for name, item in self.fields.items()}
+        values = {name: str(self.control_value(item, "") or "").strip() for name, item in self.fields.items()}
         values["id"] = self._selected_id
         try:
             values["port"] = int(values["port"])

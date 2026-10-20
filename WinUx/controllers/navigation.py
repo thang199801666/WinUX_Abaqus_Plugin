@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from ..runtime.paths import safe_current_directory
+
 
 class NavigationController:
     def __init__(self, app):
@@ -24,17 +26,21 @@ class NavigationController:
         def worker():
             if self.app._closing or not self.app._initial_load_pending:
                 return
-            current = Path.cwd()
+            current = safe_current_directory()
             path = self.app.initial_local
-            if not path.is_dir():
+            try:
+                usable = path.is_dir()
+            except (OSError, ValueError):
+                usable = False
+            if not usable:
                 path = current
             try:
                 items = self.model.list_directory(path)
-            except OSError:
+            except (OSError, ValueError):
                 path = current
                 try:
                     items = self.model.list_directory(path)
-                except OSError as exc:
+                except (OSError, ValueError) as exc:
                     self.view.after(
                         0, lambda error=str(exc): self.app._initial_local_failed(error))
                     return
@@ -156,6 +162,17 @@ class NavigationController:
     def _deliver_server_result(self, panel, path, items, record_history,
                                generation, connection_generation):
         if self._server_request_current(generation, connection_generation):
+            listview = getattr(panel, "listview", None)
+            if (path == getattr(panel, "current_path", None) and listview is not None
+                    and any(bool(getattr(listview, name, False)) for name in (
+                        "_rename_active", "_mouse_down", "_rubber_active",
+                        "_drag_started", "_item_drag_active"))):
+                # An SSH listing may finish while the user is editing/dragging.
+                # Keep it off the live gesture; generation checks also discard
+                # this retry if navigation or the connection changes meanwhile.
+                self.view.after(120, self._deliver_server_result, panel, path,
+                                items, record_history, generation, connection_generation)
+                return
             self.app._server_path_loaded(panel, path, items, record_history, generation)
 
     def _deliver_server_error(self, panel, path, generation, connection_generation, error):
@@ -200,6 +217,7 @@ class NavigationController:
         if (self.app._closing or generation != self.app._server_nav_generation or
                 not self.server.connected or not self.view.winfo_exists()):
             return
+        same_directory = path == getattr(panel, "current_path", None)
         self.view.display_server_directory(
             path, items, self.server.host,
             record_history=bool(record_history))
@@ -216,7 +234,8 @@ class NavigationController:
         self.app.navigation_preferences.save_server(
             self.server.host, self.server.username, path)
         try:
-            panel.focus()
+            if not same_directory:
+                panel.focus()
         except Exception:
             pass
 
@@ -233,4 +252,3 @@ class NavigationController:
             return
         self.view.show_error(
             "WinUx", "Could not load {}:\n{}".format(path, error))
-

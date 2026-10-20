@@ -2,8 +2,8 @@
 import os
 import tkinter as tk
 from tkinter import ttk
-from WinUx.components.server_notepad_tabs import _ToolTip, _EditorTabStrip
-from WinUx.components.shared_scroller import configure_ttk_scroller_styles
+from WinUx.ui.components.server_notepad_tabs import _ToolTip, _EditorTabStrip
+from DearUIQt.interop import configure_ttk_scroller_styles
 from WinUx.services.server_notepad_types import _ENCODING_LABELS, _EOL_NAMES
 
 

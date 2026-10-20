@@ -182,17 +182,41 @@ class TransferController:
                 progress_dialog.fail("Drop cancelled: no files selected")
             return
         if not self.drop_is_valid(source_panel, target_panel, sources, destination):
+            # Internal drag/drop within the same pane uses invalidity as a
+            # normal "no operation" signal (same folder, self target, or a
+            # recursive target).  Keep that interaction completely silent.
+            # Copy/Paste does not use this path and therefore still supports
+            # duplicating an item inside its current folder.
+            if source_panel.panel_id == target_panel.panel_id:
+                if progress_dialog is not None:
+                    progress_dialog.complete()
+                return
             source_panel.status.set("Drop cancelled: invalid destination")
             if progress_dialog is not None:
                 progress_dialog.fail("Drop cancelled: invalid destination")
             return
         cross_panel = source_panel.panel_id != target_panel.panel_id
         if cross_panel:
+            # Show feedback before remote directory/conflict checks, not after
+            # a potentially slow network round trip or recursive transfer scan.
+            if cancel_event is None:
+                cancel_event = threading.Event()
+            if progress_dialog is None:
+                action = "Upload" if source_panel.panel_id == "local" else "Download"
+                progress_dialog = self.view.show_transfer_progress(
+                    action, cancel_event, items=[source.name for source in sources])
+            self.app.transfer_cancel = cancel_event
+            progress_dialog.set_preparing("Checking destination for existing files...")
             source_panel.status.set("Checking destination for existing files...")
 
             def conflict_worker():
                 try:
-                    conflicts = self.cross_panel_conflicts(target_panel, sources, destination)
+                    if cancel_event.is_set():
+                        conflicts = []
+                    else:
+                        if source_panel.panel_id == "local" and any(not path.exists() for path in sources):
+                            raise FileNotFoundError("Source file is no longer available")
+                        conflicts = self.cross_panel_conflicts(target_panel, sources, destination)
                 except Exception as exc:
                     self.view.after(
                         0, self.drop_conflict_failed,
@@ -227,6 +251,8 @@ class TransferController:
             source_panel.status.set("Copy cancelled")
             return
         if conflicts:
+            if progress_dialog is not None:
+                progress_dialog.set_preparing("Waiting for overwrite confirmation...")
             self.view.confirm_action_async(
                 "Overwrite?", self.format_conflict_message(conflicts),
                 lambda accepted: self.continue_drop_after_overwrite(
@@ -275,6 +301,7 @@ class TransferController:
                 progress_dialog = self.view.show_transfer_progress(
                     transfer_name, cancel_event,
                     items=[source.name for source in sources])
+            progress_dialog.set_preparing("Preparing files for transfer...")
             last_update = [0.0]
 
             def progress_callback(name, current_done, current_total, overall_done, overall_total):

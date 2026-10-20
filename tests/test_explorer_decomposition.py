@@ -3,7 +3,8 @@ from pathlib import Path
 import ast
 
 ROOT = Path(__file__).resolve().parents[1]
-COMPONENTS = ROOT / "WinUx" / "components"
+# The decomposed facade + behavior mixins moved to WinUx/ui/components.
+COMPONENTS = ROOT / "WinUx" / "ui" / "components"
 FACADE = COMPONENTS / "explorer_list_view.py"
 OWNERS = {
     "ExplorerColumnsMixin": COMPONENTS / "explorer_columns.py",

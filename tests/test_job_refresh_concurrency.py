@@ -1,4 +1,5 @@
 import threading
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -101,6 +102,43 @@ class JobRefreshConcurrencyTests(unittest.TestCase):
         polling.refresh_now()
         self.assertEqual(app._submit_background.call_args.kwargs['key'], ('job-refresh', 2))
         self.assertTrue(app._submit_background.call_args.kwargs['coalesce'])
+
+    def test_requests_on_every_query_cannot_turn_poller_into_busy_loop(self):
+        app, polling, _, _ = fixture()
+        starts, threads = [], []
+        complete = threading.Event()
+        real_thread = threading.Thread
+
+        def thread(**kwargs):
+            value = real_thread(**kwargs)
+            threads.append(value)
+            return value
+
+        def query():
+            starts.append(time.monotonic())
+            polling.refresh_now()
+            if len(starts) == 4:
+                app._job_poll_cancel.set()
+                complete.set()
+            return []
+
+        app.server.list_jobs.side_effect = query
+        settings = dict(qstat_min_interval=0.05, qstat_max_interval=0.1,
+                        qstat_stable_samples_to_max=4, qstat_quiet_seconds_to_max=1)
+        try:
+            with patch('WinUx.controllers.job_polling.PerformancePreferences') as preferences, \
+                    patch('WinUx.controllers.job_polling.threading.Thread', side_effect=thread):
+                preferences.return_value.load.return_value = settings
+                polling.start()
+                self.assertTrue(complete.wait(2))
+        finally:
+            polling.stop()
+            for value in threads:
+                value.join(2)
+                self.assertFalse(value.is_alive())
+        self.assertEqual(len(starts), 4)
+        self.assertGreaterEqual(starts[2] - starts[0], 0.04)
+        self.assertGreaterEqual(starts[3] - starts[2], 0.04)
 
 
 if __name__ == '__main__':

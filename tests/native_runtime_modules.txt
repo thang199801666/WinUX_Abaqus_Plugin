@@ -1,0 +1,14 @@
+test_all_floating_dialogs.py
+test_dialog_prewarm.py
+test_file_job_splitter_native.py
+test_hidden_files_native.py
+test_initial_warm_dialog_opening.py
+test_job_manager_alignment_native.py
+test_login_alignment_native.py
+test_native_widget_wrappers.py
+test_qt_control_interactions_native.py
+test_qt_layout_native.py
+test_settings_footer_native.py
+test_settings_reset_native.py
+test_ssh_console_context_menu_rev36.py
+test_ssh_console_focus_native.py

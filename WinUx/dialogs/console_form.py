@@ -7,15 +7,20 @@ import re
 import time
 from ctypes import wintypes
 
-import dearpygui.dearpygui as dpg
+from DearUIQt.backends import dpg
 
-from .qt_dialog import QtDialog
-from ..components.console_renderer import ConsoleRenderer
+from DearUIQt.dialogs.qt_dialog import QtDialog
+from DearUIQt.widgets import QApplication, QCanvas, QFrame, QModelessMenu
+from ..ui.components.console_renderer import ConsoleRenderer
 from ..runtime.terminal_buffer import TerminalBuffer, clean_output
-from ..components.interaction_gate import unregister_pointer_protected_item
-from ..components.shared_scroller import add_dpg_scroller_style, DpgScrollerArrowOverlay
-from ..components.qt_style import QtFusionPalette
-from ..widgets.imgui_qt_style import button_theme
+from DearUIQt.input_gate import unregister_pointer_protected_item
+from DearUIQt.backends.dearpygui import DpgScrollerArrowOverlay, dpg_window_rect
+from DearUIQt.gui import QPainter, QtFusionPalette, QCursor, QKeyboard, QClipboard
+from DearUIQt.themes import (
+    ThemeTarget, ThemeColor, ThemeStyle, QTheme, theme_component, theme_spec, with_scrollbar,
+)
+from DearUIQt.core import Qt, QObject, QEvent, QItemInputBinding, QGlobalInputBinding
+from DearUIQt.core import QTimer
 
 BLACK = (12, 12, 12, 255)
 TEXT = (212, 212, 212, 255)
@@ -45,10 +50,7 @@ _GMEM_ZEROINIT = 0x0040
 
 def _win_clipboard_text_get():
     if os.name != "nt":
-        try:
-            return str(dpg.get_clipboard_text() or "")
-        except Exception:
-            return ""
+        return QClipboard(backend=dpg).text()
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     user32.OpenClipboard.argtypes = [wintypes.HWND]
@@ -96,10 +98,7 @@ def _win_clipboard_has_text():
     the clipboard temporarily open.
     """
     if os.name != "nt":
-        try:
-            return bool(dpg.get_clipboard_text())
-        except Exception:
-            return False
+        return bool(QClipboard(backend=dpg).text())
     try:
         user32 = ctypes.windll.user32
         user32.IsClipboardFormatAvailable.argtypes = [wintypes.UINT]
@@ -112,11 +111,7 @@ def _win_clipboard_has_text():
 def _win_clipboard_text_set(value):
     value = str(value or "")
     if os.name != "nt":
-        try:
-            dpg.set_clipboard_text(value)
-            return True
-        except Exception:
-            return False
+        return bool(QClipboard(backend=dpg).setText(value))
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     user32.OpenClipboard.argtypes = [wintypes.HWND]
@@ -184,13 +179,12 @@ STYLE_COLORS = {
 }
 
 
-class _ConsoleContextMenu:
-    """Qt/QMenu-like *modeless* context surface for the terminal.
+class _ConsoleContextMenu(QModelessMenu):
+    """Terminal-specialized modeless menu built on DearUIQt.
 
-    This deliberately remains an ordinary DPG window rather than an ImGui
-    popup or a Win32 TrackPopupMenu loop.  The menu therefore cannot hold the
-    application's popup/modal stack after it closes.  Keyboard current-row
-    state is rendered locally and never steals focus from the terminal.
+    The modeless window/row/theme/geometry lifecycle now belongs to DearUIQt.
+    WinUx only supplies terminal actions and defers their callbacks until the
+    physical menu click has completed.
     """
 
     WIDTH = 202
@@ -207,357 +201,85 @@ class _ConsoleContextMenu:
 
     def __init__(self, owner):
         self.owner = owner
-        self.tag = dpg.generate_uuid()
-        self._items = {}
-        self._enabled = {}
-        self._shortcuts = {}
-        self._handler_registry = None
-        self._row_handler_registries = []
-        self._visible = False
-        self._current_action = None
-        self._last_open_time = 0.0
-        self._last_open_position = None
-        self._themes = []
-
-        self._normal_theme = self._make_row_theme(
-            QtFusionPalette.MENU, QtFusionPalette.MENU_HOVER,
-            QtFusionPalette.MENU_ACTIVE, QtFusionPalette.TEXT)
-        self._current_theme = self._make_row_theme(
-            QtFusionPalette.MENU_ACTIVE, QtFusionPalette.MENU_ACTIVE,
-            QtFusionPalette.MENU_ACTIVE, QtFusionPalette.TEXT)
-        self._disabled_theme = self._make_row_theme(
-            QtFusionPalette.MENU, QtFusionPalette.MENU,
-            QtFusionPalette.MENU, QtFusionPalette.TEXT_DISABLED)
-
-        height = (
-            6 + self.ROW_HEIGHT * len(self.ACTIONS)
-            + self.SEPARATOR_HEIGHT * len(self.SEPARATORS_AFTER) + 8
+        super().__init__(
+            self.ACTIONS, separators_after=self.SEPARATORS_AFTER,
+            width=self.WIDTH, row_height=self.ROW_HEIGHT,
+            separator_height=self.SEPARATOR_HEIGHT, backend=dpg,
+            after=owner.view.after, parent=owner,
         )
-        with dpg.window(
-                tag=self.tag,
-                show=False,
-                width=self.WIDTH,
-                height=height,
-                no_title_bar=True,
-                no_resize=True,
-                no_move=True,
-                no_saved_settings=True,
-                no_scrollbar=True,
-                no_scroll_with_mouse=True,
-                no_bring_to_front_on_focus=False):
-            for action, label, shortcut in self.ACTIONS:
-                self._add_item(action, label, shortcut)
-                if action in self.SEPARATORS_AFTER:
-                    separator = dpg.add_separator()
-                    dpg.bind_item_theme(separator, self._separator_theme())
+        self.triggered.connect(self._dispatch_action)
+        # Pointer ownership stays item-scoped to the terminal canvas but the
+        # DearPyGui registry itself is now owned by DearUIQt.
+        self._canvas_input = QItemInputBinding(
+            owner._canvas_widget, backend=dpg, parent=self)
+        self._canvas_input.onClick(Qt.LeftButton, owner._canvas_left_click)
+        self._canvas_input.onClick(Qt.MiddleButton, owner._middle_click)
+        self._canvas_input.onClick(Qt.RightButton, owner._canvas_right_click)
+        self._canvas_input.activate()
 
-        with dpg.theme() as self._window_theme:
-            with dpg.theme_component(dpg.mvWindowAppItem):
-                dpg.add_theme_color(dpg.mvThemeCol_WindowBg, QtFusionPalette.MENU)
-                dpg.add_theme_color(dpg.mvThemeCol_Border, QtFusionPalette.BORDER)
-                dpg.add_theme_color(dpg.mvThemeCol_Separator, QtFusionPalette.BORDER_LIGHT)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowBorderSize, 1)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 1)
-                dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 3, 3)
-                dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 1)
-        dpg.bind_item_theme(self.tag, self._window_theme)
-
-        # Deliberately do NOT bind RMB to the draw-list.  A global release
-        # observer defers the DPG hover test/menu open until after input
-        # dispatch, avoiding the old canvas ActiveId/blocking regression.  LMB
-        # and MMB remain item-scoped to the terminal canvas.
-        with dpg.item_handler_registry() as self._handler_registry:
-            dpg.add_item_clicked_handler(
-                button=dpg.mvMouseButton_Left,
-                callback=owner._canvas_left_click,
-            )
-            dpg.add_item_clicked_handler(
-                button=dpg.mvMouseButton_Middle,
-                callback=owner._middle_click,
-            )
-            # Direct canvas fallback for RMB.  This handler only arms a
-            # deferred open; it never mutates the menu/item tree while the
-            # physical right button is down.
-            dpg.add_item_clicked_handler(
-                button=dpg.mvMouseButton_Right,
-                callback=owner._canvas_right_click,
-            )
-        dpg.bind_item_handler_registry(owner.canvas, self._handler_registry)
-
-    def _separator_theme(self):
-        with dpg.theme() as theme:
-            with dpg.theme_component(dpg.mvSeparator):
-                dpg.add_theme_color(dpg.mvThemeCol_Separator, QtFusionPalette.BORDER_LIGHT)
-                dpg.add_theme_color(dpg.mvThemeCol_SeparatorHovered, QtFusionPalette.BORDER_LIGHT)
-                dpg.add_theme_color(dpg.mvThemeCol_SeparatorActive, QtFusionPalette.BORDER_LIGHT)
-        self._themes.append(theme)
-        return theme
-
-    def _make_row_theme(self, face, hover, active, text):
-        with dpg.theme() as theme:
-            with dpg.theme_component(dpg.mvButton):
-                dpg.add_theme_color(dpg.mvThemeCol_Button, face)
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, hover)
-                dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, active)
-                dpg.add_theme_color(dpg.mvThemeCol_Text, text)
-                dpg.add_theme_color(dpg.mvThemeCol_Border, (0, 0, 0, 0))
-                dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
-                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
-                dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 7, 3)
-                align = getattr(dpg, "mvStyleVar_ButtonTextAlign", None)
-                if align is not None:
-                    dpg.add_theme_style(align, 0.0, 0.5)
-        self._themes.append(theme)
-        return theme
-
-    @staticmethod
-    def _row_label(label, shortcut):
-        # DPG buttons do not expose Qt's independent shortcut column.  Keep a
-        # compact, deterministic visual gap while retaining one full-row hit
-        # target.  The width is fixed, so this reads like a QMenu shortcut
-        # column without introducing a second non-clickable widget.
-        if not shortcut:
-            return label
-        gap = max(2, 22 - len(label) - len(shortcut))
-        return "{}{}{}".format(label, " " * gap, shortcut)
-
-    def _add_item(self, action, label, shortcut):
-        tag = dpg.add_button(
-            label=self._row_label(label, shortcut),
-            width=self.WIDTH - 8,
-            height=self.ROW_HEIGHT,
-            callback=self._clicked,
-            user_data=action,
-        )
-        self._items[action] = tag
-        self._shortcuts[action] = shortcut
-        self._enabled[action] = True
-        dpg.bind_item_theme(tag, self._normal_theme)
-        # QMenu tracks the current action under the pointer.  Keep this local
-        # to each row; no global mouse capture/focus is involved.
+    def _dispatch_action(self, action, _context=None):
         try:
-            with dpg.item_handler_registry() as registry:
-                dpg.add_item_hover_handler(callback=self._hovered, user_data=action)
-            dpg.bind_item_handler_registry(tag, registry)
-            self._row_handler_registries.append(registry)
+            self.owner.view.after(
+                0, self.owner._context_menu_triggered, str(action), self.owner)
         except Exception:
-            pass
+            self.owner._context_menu_triggered(str(action), self.owner)
 
-    def _hovered(self, sender=None, app_data=None, user_data=None):
-        if not self._visible:
-            return
-        action = str(user_data or "")
-        if self._enabled.get(action, False):
-            self._set_current(action)
-        elif self._current_action == action:
-            self._set_current(None)
-
+    # Compatibility hook retained for focused action-routing tests and older
+    # integrations that invoked the row callback directly.
     def _clicked(self, sender=None, app_data=None, user_data=None):
         action = str(user_data or "")
         if not self._enabled.get(action, True):
-            return
+            return False
         self._set_current(action)
-        # Let Dear ImGui finish this physical click before terminal state or
-        # the Windows clipboard is mutated.
-        try:
-            self.owner.view.after(
-                0, self.owner._context_menu_triggered, action, self.owner)
-        except Exception:
-            self.owner._context_menu_triggered(action, self.owner)
-
-    def _apply_theme(self, action):
-        item = self._items.get(action)
-        if item is None:
-            return
-        if not self._enabled.get(action, True):
-            theme = self._disabled_theme
-        elif action == self._current_action:
-            theme = self._current_theme
+        dispatcher = getattr(self, "_dispatch_action", None)
+        if callable(dispatcher):
+            dispatcher(action, self.owner)
         else:
-            theme = self._normal_theme
-        try:
-            if dpg.does_item_exist(item):
-                # Keep the widget technically enabled so DPG cannot replace
-                # our left-aligned menu palette/metrics with disabled-button
-                # defaults.  Logical enablement is enforced in _clicked().
-                dpg.configure_item(item, enabled=True)
-                dpg.bind_item_theme(item, theme)
-        except Exception:
-            pass
-
-    def _set_current(self, action):
-        action = str(action) if action is not None else None
-        if action is not None and not self._enabled.get(action, False):
-            action = None
-        old = self._current_action
-        self._current_action = action
-        if old is not None:
-            self._apply_theme(old)
-        if action is not None:
-            self._apply_theme(action)
-
-    def _enabled_actions(self):
-        return [action for action, _label, _shortcut in self.ACTIONS
-                if self._enabled.get(action, True)]
-
-    def setActionEnabled(self, action, enabled):
-        action = str(action)
-        enabled = bool(enabled)
-        self._enabled[action] = enabled
-        if not enabled and self._current_action == action:
-            self._current_action = None
-        self._apply_theme(action)
-        return action in self._items
-
-    def move_current(self, delta):
-        if not self._visible:
-            return False
-        actions = self._enabled_actions()
-        if not actions:
-            self._set_current(None)
-            return False
-        try:
-            index = actions.index(self._current_action)
-        except ValueError:
-            index = -1 if delta >= 0 else 0
-        index = (index + (1 if delta >= 0 else -1)) % len(actions)
-        self._set_current(actions[index])
-        return True
-
-    def activate_current(self):
-        return self.trigger(self._current_action)
-
-    def trigger(self, action):
-        """Activate one logical menu action without relying on button focus."""
-        if not self._visible:
-            return False
-        action = str(action or "")
-        if action not in self._items or not self._enabled.get(action, False):
-            return False
-        self._set_current(action)
-        try:
+            # Compatibility for detached action routers that invoke this
+            # method without constructing the full QModelessMenu object.
             self.owner.view.after(
                 0, self.owner._context_menu_triggered, action, self.owner)
-        except Exception:
-            self.owner._context_menu_triggered(action, self.owner)
         return True
 
-    @property
-    def is_open(self):
-        return bool(self._visible)
-
-    def _clamp_position(self, position):
-        try:
-            x, y = map(int, position)
-        except Exception:
-            x, y = 0, 0
-        try:
-            viewport_w = int(dpg.get_viewport_client_width() or 0)
-            viewport_h = int(dpg.get_viewport_client_height() or 0)
-        except Exception:
-            viewport_w = viewport_h = 0
-        try:
-            _width, height = dpg.get_item_rect_size(self.tag)
-            height = int(height or 0)
-        except Exception:
-            height = 0
-        if height <= 0:
-            height = (
-            6 + self.ROW_HEIGHT * len(self.ACTIONS)
-            + self.SEPARATOR_HEIGHT * len(self.SEPARATORS_AFTER) + 8
-        )
-        if viewport_w > self.WIDTH + 8:
-            x = max(4, min(x, viewport_w - self.WIDTH - 4))
-        if viewport_h > height + 8:
-            y = max(4, min(y, viewport_h - height - 4))
-        return x, y
-
-    def popup(self, position=None, *, context=None):
-        """Open/reposition without entering any popup/modal stack."""
-        try:
-            if position is None:
-                position = dpg.get_mouse_pos(local=False)
-            position = self._clamp_position(position)
-            now = time.monotonic()
-            # Native interception and the release fallback can observe the same
-            # physical gesture on unusual backend/window-hook paths.  Treat a
-            # near-identical open as one event rather than rebuilding state.
-            duplicate = (
-                self._visible
-                and self._last_open_position == position
-                and now - self._last_open_time < 0.12
-            )
-            self._last_open_time = now
-            self._last_open_position = position
-            if duplicate:
-                return True
-            dpg.set_item_pos(self.tag, position)
-            dpg.configure_item(self.tag, show=True)
-            self._visible = True
-            enabled = self._enabled_actions()
-            self._set_current(enabled[0] if enabled else None)
-            return True
-        except Exception:
-            self._visible = False
-            return False
-
-    def hide(self):
-        self._visible = False
-        self._set_current(None)
-        try:
-            dpg.configure_item(self.tag, show=False)
-            return True
-        except Exception:
-            return False
-
-    def delete(self):
-        self._visible = False
-        self._current_action = None
-        items = [
-            self.tag, self._handler_registry, *self._row_handler_registries,
-            self._window_theme, *self._themes
-        ]
-        seen = set()
-        for item in items:
-            if not item or item in seen:
-                continue
-            seen.add(item)
-            try:
-                if dpg.does_item_exist(item):
-                    dpg.delete_item(item)
-            except Exception:
-                pass
-
-
-
-def terminal_theme():
-    with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvAll):
-            dpg.add_theme_color(dpg.mvThemeCol_WindowBg, BLACK)
-            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, BLACK)
-            dpg.add_theme_color(dpg.mvThemeCol_Text, TEXT)
-            dpg.add_theme_color(dpg.mvThemeCol_Border, QtFusionPalette.BORDER_DARK)
-            add_dpg_scroller_style(dpg)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 4, 4)
-            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_WindowBorderSize, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 0)
-        with dpg.theme_component(dpg.mvWindowAppItem):
-            dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
-    return theme
+def terminal_theme(*, parent=None, backend=None):
+    base = with_scrollbar(theme_component(
+        ThemeTarget.ALL,
+        colors={
+            ThemeColor.WINDOW_BACKGROUND: BLACK,
+            ThemeColor.CHILD_BACKGROUND: BLACK,
+            ThemeColor.TEXT: TEXT,
+            ThemeColor.BORDER: QtFusionPalette.BORDER_DARK,
+        },
+        styles={
+            ThemeStyle.WINDOW_PADDING: (4, 4),
+            ThemeStyle.ITEM_SPACING: (0, 0),
+            ThemeStyle.WINDOW_BORDER_SIZE: 0,
+            ThemeStyle.CHILD_BORDER_SIZE: 0,
+        },
+    ))
+    window = theme_component(
+        ThemeTarget.WINDOW,
+        styles={ThemeStyle.WINDOW_PADDING: (0, 0)},
+    )
+    return QTheme(theme_spec(base, window), backend=backend, parent=parent)
 
 
 class ConsoleDialog(QtDialog):
+    REUSABLE_HOST = True
     clean_output = staticmethod(clean_output)
     updated_history = TerminalBuffer.updated_history
 
-    def __init__(self, view, output_callback, command_callback, interrupt_callback, error_callback=None):
+    def __init__(self, view, output_callback, command_callback, interrupt_callback, error_callback=None, *, footer=False, completion_callback=None, completion_list_callback=None):
         self.output_callback, self.command_callback = output_callback, command_callback
         self.interrupt_callback, self.error_callback = interrupt_callback, error_callback
+        self.completion_callback = completion_callback
+        self.completion_list_callback = completion_list_callback
         self.buffer = TerminalBuffer()
         self._last_output = None
         self._follow_tail = True
         self._scroll_pending = False
+        self._cursor_scroll_pending = False
+        self._manual_scroll_until = 0.0
         self._surrogate = None
         self._last_paint = None
         self._line_height = 17
@@ -585,64 +307,107 @@ class ConsoleDialog(QtDialog):
         self._click_count = 0
         self._context_menu_pending = False
         self._suppress_left_click_until = 0.0
-        super().__init__(view, "SSH Console", 760, 440, modal=False, footer=False)
+        self._completion_request_serial = 0
+        self._completion_pending = None
+        self._completion_state = None
+        self._completion_applying = False
+        self._completion_queued_directions = []
+        super().__init__(view, "SSH Console", 760, 440, modal=False, footer=footer)
         self.preferred_size = (760, 440)
-        self._theme = terminal_theme()
-        dpg.bind_item_theme(self.tag, self._theme)
-        dpg.bind_item_theme(self.content, self._theme)
+        self._theme = terminal_theme(parent=self, backend=dpg)
+        self.setTheme(self._theme)
+        self._content_surface = self.contentWidget()
+        self._content_surface.setTheme(self._theme)
         self._scroller_arrow_overlay = DpgScrollerArrowOverlay(
             dpg, self.content, f"{self.tag}_scroller", vertical=True, horizontal=False)
-        with dpg.drawlist(parent=self.content, width=600, height=20) as self.canvas:
-            # Keep terminal rows under our own pixel control instead of relying
-            # on Dear PyGui's multiline draw_text layout. That makes the caret
-            # track the active row exactly and avoids the visible vertical drift
-            # seen on some Windows builds when the console is resized.
-            self._line_items = []
-            self._current_line_fill = dpg.draw_rectangle((0, 0), (0, 0), color=CURRENT_LINE, fill=CURRENT_LINE)
-            self._caret = dpg.draw_rectangle((0, 0), (7, 2), color=COMMAND, fill=COMMAND)
+        self._canvas_widget = QCanvas(
+            width=600, height=20, parent=self.content, backend=dpg)
+        self.canvas = self._canvas_widget.tag
+        # Keep terminal rows under our own pixel control instead of relying
+        # on Dear PyGui's multiline draw_text layout. That makes the caret
+        # track the active row exactly and avoids the visible vertical drift
+        # seen on some Windows builds when the console is resized.
+        self._line_items = []
+        painter = QPainter(self._canvas_widget)
+        self._current_line_fill = painter.drawRect(
+            (0, 0), (0, 0), color=CURRENT_LINE, fill=CURRENT_LINE)
+        self._caret = painter.drawRect(
+            (0, 0), (7, 2), color=COMMAND, fill=COMMAND)
         self._create_context_menu()
         # Compatibility: one terminal owns both output and editable command.
         self.output = self.input = self.canvas
-        self.shortcuts[(dpg.mvKey_Up, False)] = lambda: self.view.after(0, self._up_key)
-        self.shortcuts[(dpg.mvKey_Down, False)] = lambda: self.view.after(0, self._down_key)
-        self.shortcuts[(dpg.mvKey_Home, False)] = lambda: self.view.after(0, self._home)
-        self.shortcuts[(dpg.mvKey_End, False)] = lambda: self.view.after(0, self._end)
-        self.shortcuts[(dpg.mvKey_Delete, False)] = lambda: self.view.after(0, self._delete)
-        self.shortcuts[(dpg.mvKey_C, True)] = lambda: self.view.after(0, self._control_c)
-        self.shortcuts[(dpg.mvKey_A, True)] = lambda: self.view.after(0, self._select_all)
-        with dpg.handler_registry() as self._terminal_handlers:
-            for key, callback in ((dpg.mvKey_Back, self._backspace), (dpg.mvKey_V, self._paste),
-                                  (dpg.mvKey_Tab, self._tab), (dpg.mvKey_Left, self._left),
-                                  (dpg.mvKey_Right, self._right)):
-                dpg.add_key_press_handler(key=key, callback=lambda s,a,u: self.view.after(0, u), user_data=callback)
-            dpg.add_key_press_handler(key=dpg.mvKey_F, callback=self._find_shortcut)
-            dpg.add_key_press_handler(key=dpg.mvKey_F3, callback=self._find_repeat_shortcut)
-            dpg.add_mouse_wheel_handler(callback=self._wheel)
-            dpg.add_mouse_drag_handler(button=dpg.mvMouseButton_Left, threshold=1.0, callback=self._mouse_drag)
-            dpg.add_mouse_release_handler(button=dpg.mvMouseButton_Left, callback=self._mouse_release)
-            dpg.add_mouse_release_handler(
-                button=dpg.mvMouseButton_Right, callback=self._right_release_fallback)
-            # Keep one lightweight global LMB observer only to relinquish the
-            # console's WM_CHAR ownership after the user clicks elsewhere. All
-            # terminal click/selection work itself is item-scoped to the
-            # draw-list above; this callback only schedules a deferred focus
-            # check and never mutates the destination widget in this batch.
-            dpg.add_mouse_click_handler(
-                button=dpg.mvMouseButton_Left, callback=self._mouse_click)
+        self.setShortcut(Qt.Key_Up, lambda: self.view.after(0, self._up_key))
+        self.setShortcut(Qt.Key_Down, lambda: self.view.after(0, self._down_key))
+        self.setShortcut(Qt.Key_Home, lambda: self.view.after(0, self._home))
+        self.setShortcut(Qt.Key_End, lambda: self.view.after(0, self._end))
+        self.setShortcut(Qt.Key_Delete, lambda: self.view.after(0, self._delete))
+        self.setShortcut(Qt.Key_Delete, lambda: self.view.after(0, self._delete_word_right), ctrl=True)
+        self.setShortcut(Qt.Key_Home, lambda: self.view.after(0, self._delete_to_start), ctrl=True)
+        self.setShortcut(Qt.Key_End, lambda: self.view.after(0, self._delete_to_end), ctrl=True)
+        self.setShortcut(Qt.Key_C, lambda: self.view.after(0, self._control_c), ctrl=True)
+        # SSH terminals conventionally use readline/emacs bindings. Keep the
+        # existing CMD-style Home/End/F8 behavior, but make the standard Ctrl
+        # chords available as well so the embedded console feels like a real
+        # shell instead of a GUI textbox. Ctrl+Shift+A retains Select All.
+        self.setShortcut(Qt.Key_A, lambda: self.view.after(0, self._control_a), ctrl=True)
+        self.setShortcut(Qt.Key_E, lambda: self.view.after(0, self._line_end), ctrl=True)
+        self.setShortcut(Qt.Key_B, lambda: self.view.after(0, self._line_left), ctrl=True)
+        self.setShortcut(Qt.Key_P, lambda: self.view.after(0, self._up_key), ctrl=True)
+        self.setShortcut(Qt.Key_N, lambda: self.view.after(0, self._down_key), ctrl=True)
+        self.setShortcut(Qt.Key_R, lambda: self.view.after(0, self._history_contains), ctrl=True)
+        self.setShortcut(Qt.Key_W, lambda: self.view.after(0, self._kill_word_left), ctrl=True)
+        self.setShortcut(Qt.Key_U, lambda: self.view.after(0, self._kill_to_start), ctrl=True)
+        self.setShortcut(Qt.Key_K, lambda: self.view.after(0, self._kill_to_end), ctrl=True)
+        self.setShortcut(Qt.Key_Y, lambda: self.view.after(0, self._yank), ctrl=True)
+        self.setShortcut(Qt.Key_D, lambda: self.view.after(0, self._line_delete), ctrl=True)
+        self.setShortcut(Qt.Key_H, lambda: self.view.after(0, self._line_backspace), ctrl=True)
+        self.setShortcut(Qt.Key_L, lambda: self.view.after(0, self._clear_console), ctrl=True)
+        # DOSKEY template keys: F1 copies one character from the previous
+        # command, F3 copies its remainder from the current column and F5
+        # recalls the complete template. F8 remains prefix-history search.
+        self.setShortcut(Qt.Key_F1, lambda: self.view.after(0, self._template_char))
+        self.setShortcut(Qt.Key_F5, lambda: self.view.after(0, self._template_full))
+        self.setShortcut(Qt.Key_F8, lambda: self.view.after(0, self._history_prefix))
+        self.setShortcut(Qt.Key_Insert, lambda: self.view.after(0, self._toggle_overwrite))
+        self._terminal_handlers = QGlobalInputBinding(
+            backend=dpg, parent=self, after=self.view.after)
+        for key, callback in (
+                (Qt.Key_Backspace, self._backspace), (Qt.Key_V, self._paste),
+                (Qt.Key_Tab, self._tab), (Qt.Key_Left, self._left),
+                (Qt.Key_Right, self._right)):
+            self._terminal_handlers.onKeyPress(
+                key, lambda s, a, u: self._queue_key(u), user_data=callback)
+        self._terminal_handlers.onKeyPress(Qt.Key_F, self._find_shortcut)
+        self._terminal_handlers.onKeyPress(Qt.Key_F3, self._f3_shortcut)
+        self._terminal_handlers.onMouseWheel(self._wheel)
+        self._terminal_handlers.onMouseDrag(
+            Qt.LeftButton, self._mouse_drag, threshold=1.0)
+        self._terminal_handlers.onMouseRelease(Qt.LeftButton, self._mouse_release)
+        self._terminal_handlers.onMouseRelease(
+            Qt.RightButton, self._right_release_fallback)
+        # Keep one lightweight global LMB observer to route the console's
+        # WM_CHAR ownership, including clicks in blank terminal space. All
+        # terminal click/selection work itself is item-scoped to the canvas.
+        self._terminal_handlers.onMouseClick(Qt.LeftButton, self._mouse_click)
+        self._terminal_handlers.activate()
         self.focus_input()
         self._refresh()
-        self.view.after(0, self._paint_tick)
+        self._paint_tick()
+        self._refresh_timer = self.create_timer(100, self._refresh)
+        self._paint_timer = self.create_timer(33, self._paint_tick)
 
-    def focus_input(self, follow_tail=True):
+    def focus_input(self, follow_tail=True, focus_window=True):
         if self.winfo_exists():
+            self._caret_blink_started = time.monotonic()
             if follow_tail:
                 self._follow_tail = True
                 self._scroll_pending = True
-            # Focus the dialog window rather than the child scrolling region.
-            # This keeps QtDialog shortcut dispatch and native WM_CHAR routing
-            # aligned with the console while still rendering the terminal in
-            # the child area.
-            dpg.focus_item(self.tag)
+                self._manual_scroll_until = 0.0
+            # Avoid re-focusing an already-active window. Repeated focus_item()
+            # calls can reset ImGui navigation/scroll state, especially while
+            # the terminal child is being wheel-scrolled.
+            if focus_window and not self.isActiveWindow():
+                self.activateWindow()
 
     def native_right_click(self, x=None, y=None):
         """Open the modeless context surface after Win32 RMB dispatch ends.
@@ -659,7 +424,7 @@ class ConsoleDialog(QtDialog):
         self._prepare_context_menu_state()
         try:
             if x is None or y is None:
-                position = tuple(map(int, dpg.get_mouse_pos(local=False)))
+                position = QCursor.pos(backend=dpg).toTuple()
             else:
                 position = (int(x), int(y))
             opened = bool(menu.popup(position, context=self))
@@ -684,11 +449,19 @@ class ConsoleDialog(QtDialog):
         deferred callback/frame even though the physical RMB happened over the
         Console.
         """
+        surface = getattr(self, "_content_surface", None)
+        if surface is not None:
+            try:
+                return surface.containsGlobalPoint(position, clipped=True)
+            except Exception:
+                pass
+        # Transitional compatibility for detached/legacy hosts that only keep
+        # the native content id. New runtime surfaces always take the QWidget
+        # path above.
         try:
-            mx, my = map(float, position)
-            x0, y0 = map(float, dpg.get_item_rect_min(self.content))
-            width, height = map(float, dpg.get_item_rect_size(self.content))
-            return width > 0 and height > 0 and x0 <= mx < x0 + width and y0 <= my < y0 + height
+            left, top, right, bottom = dpg_window_rect(dpg, self.content, clip=True)
+            x, y = map(float, position)
+            return float(left) <= x < float(right) and float(top) <= y < float(bottom)
         except Exception:
             return False
 
@@ -706,7 +479,7 @@ class ConsoleDialog(QtDialog):
         if menu is None:
             return
         try:
-            position = tuple(map(int, dpg.get_mouse_pos(local=False)))
+            position = QCursor.pos(backend=dpg).toTuple()
         except Exception:
             return
         if bool(getattr(menu, "is_open", False)):
@@ -740,7 +513,7 @@ class ConsoleDialog(QtDialog):
             # re-query hover here; that delayed hover query was the root cause
             # of the menu apparently doing nothing on the dock Console.
             if position is None:
-                position = tuple(map(int, dpg.get_mouse_pos(local=False)))
+                position = QCursor.pos(backend=dpg).toTuple()
             self.native_right_click(*position)
         finally:
             # Never let a lost/failed open leave RMB permanently suppressed.
@@ -760,7 +533,7 @@ class ConsoleDialog(QtDialog):
         if menu is None or bool(getattr(menu, "is_open", False)):
             return
         try:
-            position = tuple(map(int, dpg.get_mouse_pos(local=False)))
+            position = QCursor.pos(backend=dpg).toTuple()
         except Exception:
             return
         self._queue_context_menu_after_right_release(position)
@@ -780,7 +553,7 @@ class ConsoleDialog(QtDialog):
             self._context_menu_pending = False
             return
         try:
-            down = bool(dpg.is_mouse_button_down(dpg.mvMouseButton_Right))
+            down = QCursor.isButtonDown(Qt.RightButton, backend=dpg)
         except Exception:
             down = False
         if down and time.monotonic() - float(started) < 1.0:
@@ -813,8 +586,13 @@ class ConsoleDialog(QtDialog):
             return
         if self._mouse_over_context_menu():
             return
-        self.focus_input(follow_tail=False)
         cell = self._cell_from_mouse()
+        # The physical click already focuses its window. Calling focus_item()
+        # again changes ImGui navigation/scroll state before hit-testing.
+        self.focus_input(follow_tail=False, focus_window=False)
+        self._scroll_pending = False
+        self._cursor_scroll_pending = False
+        self._follow_tail = False
         if cell is None:
             return
         now = time.monotonic()
@@ -838,7 +616,7 @@ class ConsoleDialog(QtDialog):
         self._last_paint = None
 
     def _mouse_click(self, sender=None, app_data=None, user_data=None):
-        """Global LMB callback used only to relinquish console keyboard input.
+        """Capture keyboard ownership from the physical LMB event.
 
         Check menu ownership now, but defer focus changes and dismissal so a
         menu button remains visible until its mouse-release activation.
@@ -850,11 +628,19 @@ class ConsoleDialog(QtDialog):
         if self._mouse_over_context_menu():
             return
         try:
-            self.view.after(0, self._deactivate_keyboard_if_pointer_outside)
+            try:
+                position = tuple(map(float, QCursor.pos(backend=dpg).toTuple()))
+            except Exception:
+                position = tuple(map(float, dpg.get_mouse_pos(local=False)))
+            inside = self._terminal_rect_contains(position)
+            if inside and self._over_terminal():
+                # Also activate clicks in blank space below a short transcript.
+                self.focus_input(follow_tail=False, focus_window=False)
+            self.view.after(0, self._deactivate_keyboard_if_pointer_outside, inside)
         except Exception:
             pass
 
-    def _deactivate_keyboard_if_pointer_outside(self):
+    def _deactivate_keyboard_if_pointer_outside(self, inside=None):
         if not self.winfo_exists():
             return
         if self._mouse_over_context_menu():
@@ -864,7 +650,9 @@ class ConsoleDialog(QtDialog):
         # mouse-down. Outside controls retain their physical click when this
         # overlay is dismissed.
         self._hide_context_menu()
-        if self._over_terminal():
+        # Use the mouse-down decision, not wherever the pointer moved while
+        # this callback waited in the UI queue.
+        if inside is True or (inside is None and self._over_terminal()):
             return
         setter = getattr(self.view, "_set_console_keyboard_active", None)
         if callable(setter):
@@ -875,35 +663,32 @@ class ConsoleDialog(QtDialog):
         menu = getattr(self, "_context_menu_obj", None)
         if menu is None or not bool(getattr(menu, "is_open", False)):
             return False
-        tag = getattr(menu, "tag", None)
-        if tag is None:
-            return False
-        try:
-            if not dpg.does_item_exist(tag) or not dpg.is_item_shown(tag):
-                return False
-            if dpg.is_item_hovered(tag):
-                return True
-        except Exception:
-            pass
-        try:
-            mx, my = map(float, dpg.get_mouse_pos(local=False))
-            x0, y0 = map(float, dpg.get_item_pos(tag))
-            config = dpg.get_item_configuration(tag) or {}
+        contains = getattr(menu, "containsGlobalPoint", None)
+        if callable(contains):
             try:
-                width, height = map(float, dpg.get_item_rect_size(tag))
+                return bool(contains(QCursor.pos(backend=dpg)))
             except Exception:
-                width = height = 0
-            if width <= 1:
-                width = float(config.get("width") or 0)
-            if height <= 1:
-                height = float(config.get("height") or 0)
-            return x0 <= mx < x0 + width and y0 <= my < y0 + height
+                pass
+        # Transitional compatibility for old menu objects that expose only a
+        # native retained tag. QModelessMenu never takes this path.
+        tag = getattr(menu, "tag", None)
+        try:
+            if tag and dpg.is_item_hovered(tag):
+                return True
+            mx, my = map(float, dpg.get_mouse_pos(local=False))
+            x, y = map(float, dpg.get_item_pos(tag))
+            width, height = dpg.get_item_rect_size(tag)
+            if not width or not height:
+                config = dpg.get_item_configuration(tag) or {}
+                width = width or config.get("width", 0)
+                height = height or config.get("height", 0)
+            return x <= mx < x + float(width) and y <= my < y + float(height)
         except Exception:
             return False
 
     def _over_terminal(self):
         try:
-            return dpg.is_item_hovered(self.content) or dpg.is_item_hovered(self.canvas)
+            return self._content_surface.underMouse() or self._canvas_widget.underMouse()
         except Exception:
             return False
 
@@ -911,8 +696,9 @@ class ConsoleDialog(QtDialog):
         if not self._render_rows:
             return None
         try:
-            mx, my = map(float, dpg.get_mouse_pos(local=False))
-            x0, y0 = map(float, dpg.get_item_rect_min(self.canvas))
+            mx, my = map(float, QCursor.pos(backend=dpg).toTuple())
+            origin = self._canvas_widget.globalPos()
+            x0, y0 = float(origin.x()), float(origin.y())
         except Exception:
             return None
         row = max(0, min(len(self._render_rows) - 1, int((my - y0) // self._line_height)))
@@ -956,7 +742,11 @@ class ConsoleDialog(QtDialog):
         if cell is not None:
             self._selection_focus = cell
         if self._selection_anchor == self._selection_focus:
+            columns = getattr(self, "_render_columns", None)
+            if columns and cell is not None and not self._find_active:
+                self.buffer.move_cursor_to_cell(columns, *cell)
             self._selection_anchor = self._selection_focus = None
+        self._caret_blink_started = time.monotonic()
         self._last_paint = None
 
     def _selection_bounds(self):
@@ -1131,6 +921,9 @@ class ConsoleDialog(QtDialog):
     def native_character(self, code):
         if not self.winfo_exists():
             return
+        keyboard_active = getattr(self, "keyboard_active", None)
+        if callable(keyboard_active) and not keyboard_active():
+            return
         if 0xd800 <= code <= 0xdbff:
             self._surrogate = code
             return
@@ -1146,8 +939,23 @@ class ConsoleDialog(QtDialog):
                 self._edited()
 
     def _edited(self):
+        if not getattr(self, "_completion_applying", False):
+            # Any ordinary edit invalidates a pending/cycling completion. A
+            # late SSH result is ignored by its serial + draft/cursor guard.
+            self._completion_request_serial = getattr(
+                self, "_completion_request_serial", 0) + 1
+            self._completion_pending = None
+            self._completion_state = None
+            self._completion_queued_directions = []
+        self._caret_blink_started = time.monotonic()
+        self._selection_dragging = False
+        self._clear_selection()
+        # Editing owns the viewport: even if the user previously scrolled up,
+        # the next typed character/caret move must reveal the live input row.
+        self._manual_scroll_until = 0.0
         self._follow_tail = True
-        self._scroll_pending = True
+        self._scroll_pending = False
+        self._cursor_scroll_pending = True
         self._last_paint = None
 
     def _backspace(self):
@@ -1156,12 +964,39 @@ class ConsoleDialog(QtDialog):
                 self._find_query = self._find_query[:-1]
                 self._find_changed()
             return
-        self.buffer.backspace()
+        if self._ctrl_down():
+            self.buffer.delete_word_left()
+        else:
+            self.buffer.backspace()
         self._edited()
 
-    @staticmethod
-    def _ctrl_down():
-        return dpg.is_key_down(dpg.mvKey_LControl) or dpg.is_key_down(dpg.mvKey_RControl)
+    def _ctrl_down(self):
+        override = getattr(self, "_ctrl_key_override", None)
+        if override is not None:
+            return bool(override)
+        return bool(QKeyboard.modifiers(backend=dpg) & Qt.ControlModifier)
+
+    def _shift_down(self):
+        override = getattr(self, "_shift_key_override", None)
+        if override is not None:
+            return bool(override)
+        return bool(QKeyboard.modifiers(backend=dpg) & Qt.ShiftModifier)
+
+    def _run_key_with_modifiers(self, callback, ctrl=False, shift=False):
+        previous_ctrl = getattr(self, "_ctrl_key_override", None)
+        previous_shift = getattr(self, "_shift_key_override", None)
+        self._ctrl_key_override = bool(ctrl)
+        self._shift_key_override = bool(shift)
+        try:
+            callback()
+        finally:
+            self._ctrl_key_override = previous_ctrl
+            self._shift_key_override = previous_shift
+
+    def _queue_key(self, callback):
+        ctrl = self._ctrl_down()
+        shift = self._shift_down()
+        self.view.after(0, self._run_key_with_modifiers, callback, ctrl, shift)
 
     def _left(self):
         if self._find_active:
@@ -1175,29 +1010,368 @@ class ConsoleDialog(QtDialog):
         self.buffer.move_cursor(1, by_word=self._ctrl_down())
         self._edited()
 
-    def _home(self):
+    def _line_left(self):
+        if self._find_active:
+            return
+        self.buffer.move_cursor(-1)
+        self._edited()
+
+    def _line_home(self):
         if self._find_active:
             return
         self.buffer.move_home()
         self._edited()
 
-    def _end(self):
+    def _line_end(self):
         if self._find_active:
             return
         self.buffer.move_end()
         self._edited()
 
-    def _delete(self):
+    def _control_a(self):
+        # Preserve the transcript-wide Select All accelerator on Ctrl+Shift+A
+        # while giving plain Ctrl+A the conventional readline beginning-of-line
+        # behavior used by SSH shells. A visible context menu keeps priority.
+        if self._context_menu_key_action("select_all"):
+            return
+        if self._shift_down():
+            self._select_all()
+        else:
+            self._line_home()
+
+    def _home(self):
+        if self._find_active:
+            return
+        if self._ctrl_down():
+            # cmd.exe line editing: Ctrl+Home removes everything before caret.
+            self.buffer.delete_to_start()
+        else:
+            self.buffer.move_home()
+        self._edited()
+
+    def _end(self):
+        if self._find_active:
+            return
+        if self._ctrl_down():
+            # cmd.exe line editing: Ctrl+End removes everything after caret.
+            self.buffer.delete_to_end()
+        else:
+            self.buffer.move_end()
+        self._edited()
+
+    def _line_backspace(self):
+        if self._find_active:
+            if self._find_query:
+                self._find_query = self._find_query[:-1]
+                self._find_changed()
+            return
+        self.buffer.backspace()
+        self._edited()
+
+    def _line_delete(self):
         if self._find_active:
             return
         self.buffer.delete()
         self._edited()
 
-    def _tab(self):
+    def _delete(self):
         if self._find_active:
             return
-        self.buffer.type_text("\t")
+        if self._ctrl_down():
+            self.buffer.delete_word_right()
+        else:
+            self.buffer.delete()
         self._edited()
+
+    def _delete_word_left(self):
+        if self._find_active:
+            return
+        self.buffer.delete_word_left()
+        self._edited()
+
+    def _delete_word_right(self):
+        if self._find_active:
+            return
+        self.buffer.delete_word_right()
+        self._edited()
+
+    def _delete_to_start(self):
+        if self._find_active:
+            return
+        self.buffer.delete_to_start()
+        self._edited()
+
+    def _delete_to_end(self):
+        if self._find_active:
+            return
+        self.buffer.delete_to_end()
+        self._edited()
+
+    def _kill_word_left(self):
+        if self._find_active:
+            return
+        self.buffer.kill_word_left()
+        self._edited()
+
+    def _kill_to_start(self):
+        if self._find_active:
+            return
+        self.buffer.kill_to_start()
+        self._edited()
+
+    def _kill_to_end(self):
+        if self._find_active:
+            return
+        self.buffer.kill_to_end()
+        self._edited()
+
+    def _yank(self):
+        if self._find_active:
+            return
+        if self.buffer.yank():
+            self._edited()
+
+    def _toggle_overwrite(self):
+        if self._find_active:
+            return
+        self.buffer.toggle_overwrite()
+        self._caret_blink_started = time.monotonic()
+        self._last_paint = None
+
+    def _template_char(self):
+        if self._find_active or self.buffer.pending is not None:
+            return
+        if self.buffer.copy_template_char():
+            self._edited()
+
+    def _template_remainder(self):
+        if self._find_active or self.buffer.pending is not None:
+            return
+        if self.buffer.copy_template_remainder():
+            self._edited()
+
+    def _template_full(self):
+        if self._find_active or self.buffer.pending is not None:
+            return
+        if self.buffer.copy_template():
+            self._edited()
+
+    def _history_prefix(self):
+        if self._find_active or self.buffer.pending is not None:
+            return
+        if self.buffer.recall_prefix(-1):
+            self._edited()
+
+    def _history_contains(self):
+        if self._find_active or self.buffer.pending is not None:
+            return
+        if self.buffer.recall_contains(-1):
+            self._edited()
+
+    def _clear_command_line(self):
+        if self._find_active or self.buffer.pending is not None:
+            return False
+        if not self.buffer.draft:
+            return False
+        self.buffer.clear_draft()
+        self._edited()
+        return True
+
+    def _tab(self):
+        if self._find_active or self.buffer.pending is not None:
+            return
+        callback = getattr(self, "completion_callback", None)
+        if not callable(callback):
+            return
+
+        # _shift_down() resolves both left/right Shift through QKeyboard.
+        # honors a queued modifier snapshot when the key callback is deferred.
+        direction = -1 if self._shift_down() else 1
+        state = self._completion_state
+        if (state is not None
+                and self.buffer.draft == state.get("current_draft")
+                and self.buffer.cursor == state.get("current_cursor")
+                and len(state.get("candidates", ())) > 1):
+            # CMD-style ambiguous completion: the first Tab has already
+            # expanded the safe shared prefix.  Repeated Tab/Shift+Tab then
+            # walks the matching token values without touching the rest of the
+            # command line.  This is intentionally different from readline's
+            # double-Tab listing and mirrors cmd.exe filename completion.
+            self._cycle_completion_state(state, direction)
+            return
+
+        draft, cursor = self.buffer.draft, self.buffer.cursor
+        pending = self._completion_pending
+        if pending is not None and pending[:2] == (draft, cursor):
+            # Preserve extra Tab presses while the remote lookup is in flight.
+            # Once candidates arrive the first physical Tab expands the shared
+            # prefix and each queued direction advances one CMD-style match.
+            self._completion_queued_directions.append(direction)
+            return
+        self._completion_request_serial += 1
+        serial = self._completion_request_serial
+        self._completion_pending = (draft, cursor, serial, direction)
+        self._completion_state = None
+        self._completion_queued_directions = []
+
+        def completed(result):
+            try:
+                self.view.after(0, self._completion_result,
+                                serial, draft, cursor, direction, result)
+            except Exception:
+                pass
+
+        try:
+            accepted = callback(draft, cursor, completed)
+        except Exception:
+            self._completion_pending = None
+            return
+        if accepted is False:
+            self._completion_pending = None
+
+    def _completion_columns(self):
+        """Approximate the terminal width for readline-style candidate grids."""
+        try:
+            width = int(self._content_surface.globalGeometry(clipped=True).width())
+        except Exception:
+            width = 640
+        char_width = max(1, int(getattr(self, "_char_width", 8) or 8))
+        return max(20, (max(160, width) - 16) // char_width)
+
+    def _show_completion_candidates(self, candidates):
+        callback = getattr(self, "completion_list_callback", None)
+        if not callable(callback):
+            return False
+        values = [str(value) for value in candidates if str(value)]
+        if not values:
+            return False
+        try:
+            accepted = callback(
+                self.buffer.draft, values, self._completion_columns())
+        except Exception:
+            return False
+        if accepted is False:
+            return False
+        # The model appends the list + a fresh prompt to visible scrollback.
+        # Force a refresh immediately so the user sees the double-Tab result
+        # without waiting for the regular 100 ms polling tick.
+        try:
+            self._set_output(self.output_callback())
+        except Exception:
+            pass
+        self._follow_tail = True
+        self._manual_scroll_until = 0.0
+        self._scroll_pending = True
+        self._cursor_scroll_pending = True
+        self._last_paint = None
+        return True
+
+    def _completion_result(self, serial, draft, cursor, direction, result):
+        if not self.winfo_exists():
+            return
+        pending = self._completion_pending
+        if (pending is None or pending[2] != serial
+                or serial != self._completion_request_serial):
+            return
+        self._completion_pending = None
+        queued_directions = list(self._completion_queued_directions)
+        self._completion_queued_directions = []
+        if self.buffer.draft != draft or self.buffer.cursor != cursor:
+            return
+        if not isinstance(result, dict):
+            return
+        try:
+            start = max(0, min(len(draft), int(result.get("start", cursor))))
+            end = max(start, min(len(draft), int(result.get("end", cursor))))
+        except (TypeError, ValueError):
+            return
+        raw_candidates = list(result.get("candidates", ()))
+        raw_display = list(result.get("display_candidates", ()))
+        candidates = []
+        display_candidates = []
+        seen = set()
+        for index, raw_value in enumerate(raw_candidates):
+            value = str(raw_value)
+            if value in seen:
+                continue
+            seen.add(value)
+            candidates.append(value)
+            if index < len(raw_display):
+                display_candidates.append(str(raw_display[index]))
+            else:
+                display_candidates.append(value)
+        if not candidates:
+            return
+
+        current = draft[start:end]
+        typed_prefix = draft[start:cursor]
+        state = {
+            "prefix": draft[:start], "suffix": draft[end:],
+            "candidates": candidates, "candidate_index": -1,
+            "display_candidates": display_candidates, "applied_value": current,
+            "typed_prefix": typed_prefix,
+            "current_draft": draft, "current_cursor": cursor,
+        }
+        self._completion_state = state
+
+        if len(candidates) == 1:
+            replacement = str(result.get("replacement", "") or candidates[0])
+            if replacement == current:
+                self._completion_state = None
+                return
+            self._apply_completion_value(state, replacement)
+            # An unambiguous completion is complete; the next Tab should query
+            # the next command/path segment instead of reusing stale state.
+            self._completion_state = None
+            return
+
+        # Both Tab and Shift+Tab use conservative readline-style ambiguity
+        # handling.  Menu/cycle completion is intentionally not enabled by
+        # default because it silently changes the command when several matches
+        # exist.
+        common_prefix = str(result.get("common_prefix", "") or "")
+        if (common_prefix.startswith(typed_prefix)
+                and len(common_prefix) > len(typed_prefix)):
+            self._apply_completion_value(state, common_prefix)
+        # If the user pressed Tab again before the async query completed,
+        # replay those presses now.  The first physical Tab owns the common
+        # prefix expansion; every additional press advances a concrete match.
+        for queued_direction in queued_directions:
+            self._cycle_completion_state(state, queued_direction)
+
+    def _cycle_completion_state(self, state, direction):
+        candidates = list(state.get("candidates", ()))
+        if not candidates:
+            return False
+        try:
+            index = int(state.get("candidate_index", -1))
+        except (TypeError, ValueError):
+            index = -1
+        step = -1 if int(direction or 1) < 0 else 1
+        if index < 0:
+            index = len(candidates) - 1 if step < 0 else 0
+        else:
+            index = (index + step) % len(candidates)
+        state["candidate_index"] = index
+        self._apply_completion_value(state, candidates[index])
+        return True
+
+    def _apply_completion_value(self, state, candidate):
+        candidate = str(candidate)
+        prefix, suffix = state["prefix"], state["suffix"]
+        draft = prefix + candidate + suffix
+        self._completion_applying = True
+        try:
+            self.buffer.draft = draft[:self.buffer.COMMAND_LIMIT]
+            self.buffer.cursor = min(
+                len(self.buffer.draft), len(prefix) + len(candidate))
+            self.buffer.history_index = len(self.buffer.history)
+            self._edited()
+        finally:
+            self._completion_applying = False
+        state["applied_value"] = candidate
+        state["current_draft"] = self.buffer.draft
+        state["current_cursor"] = self.buffer.cursor
 
     def _paste(self):
         if self._ctrl_down():
@@ -1220,7 +1394,7 @@ class ConsoleDialog(QtDialog):
             return
         if self._find_active:
             return
-        if dpg.is_key_down(dpg.mvKey_LShift) or dpg.is_key_down(dpg.mvKey_RShift):
+        if QKeyboard.modifiers(backend=dpg) & Qt.ShiftModifier:
             _win_clipboard_text_set(self.buffer.output + self.buffer.draft)
         else:
             self._interrupt()
@@ -1249,8 +1423,17 @@ class ConsoleDialog(QtDialog):
                 return
             self.view.after(0, self._open_find)
 
+    def _f3_shortcut(self, sender=None, app_data=None, user_data=None):
+        # Preserve F3/Shift+F3 transcript-search repeat while Find is active;
+        # otherwise use the native CMD/DOSKEY F3 template operation.
+        if self._find_active:
+            direction = -1 if self._shift_down() else 1
+            self.view.after(0, self._find_next, direction)
+        else:
+            self.view.after(0, self._template_remainder)
+
     def _find_repeat_shortcut(self, sender=None, app_data=None, user_data=None):
-        direction = -1 if (dpg.is_key_down(dpg.mvKey_LShift) or dpg.is_key_down(dpg.mvKey_RShift)) else 1
+        direction = -1 if (QKeyboard.modifiers(backend=dpg) & Qt.ShiftModifier) else 1
         self.view.after(0, self._find_next, direction)
 
     def _open_find(self):
@@ -1290,7 +1473,7 @@ class ConsoleDialog(QtDialog):
             self._open_find()
             return
         if self._find_dirty and self._render_rows:
-            columns = max(8, int(max(40, dpg.get_item_width(self.content) - 24) / self._char_width))
+            columns = max(8, int(max(40, self._content_surface.globalGeometry(clipped=True).width() - 24) / self._char_width))
             self._rebuild_find_matches(columns)
         if not self._find_matches:
             self._last_paint = None
@@ -1306,6 +1489,10 @@ class ConsoleDialog(QtDialog):
             return
         if self._find_active:
             self._close_find()
+            return
+        # CMD-compatible Escape clears the active input line first. An empty
+        # floating console keeps the historical Escape-to-close behavior.
+        if self._clear_command_line():
             return
         super()._close_from_escape()
 
@@ -1333,10 +1520,27 @@ class ConsoleDialog(QtDialog):
         self._edited()
 
     def _wheel(self, sender, delta):
-        if not self.winfo_exists() or not dpg.is_item_hovered(self.content):
+        if not self.winfo_exists():
             return
-        if delta > 0:
-            self._follow_tail = False
+        surface = getattr(self, "_content_surface", None)
+        if surface is not None:
+            if not surface.underMouse():
+                return
+        else:
+            try:
+                if not dpg.is_item_hovered(self.content):
+                    return
+            except Exception:
+                return
+        # Wheel motion always means the user owns scroll position for a short
+        # quiet period. Background SSH output may grow the canvas during that
+        # time, but must not move the viewport. Once interaction settles, the
+        # renderer may re-enable follow-tail only if the viewport is genuinely
+        # back at the bottom.
+        self._manual_scroll_until = time.monotonic() + 0.35
+        self._follow_tail = False
+        self._scroll_pending = False
+        self._cursor_scroll_pending = False
 
     def _refresh(self):
         if not self.winfo_exists():
@@ -1347,7 +1551,6 @@ class ConsoleDialog(QtDialog):
             self.buffer.set_output("Console unavailable: {}".format(exc))
             if callable(self.error_callback):
                 self.error_callback(str(exc))
-        self.view.after(100, self._refresh)
 
     def _set_output(self, output):
         raw = str(output or "")
@@ -1377,7 +1580,6 @@ class ConsoleDialog(QtDialog):
         if not self.winfo_exists():
             return
         self._paint()
-        self.view.after(33, self._paint_tick)
 
     def _paint(self):
         renderer = getattr(self, "_renderer", None)
@@ -1412,9 +1614,9 @@ class ConsoleDialog(QtDialog):
             overlay.destroy()
         super().destroy()
         def cleanup():
-            for item in (getattr(self, "_terminal_handlers", None), getattr(self, "_theme", None)):
-                if item and dpg.does_item_exist(item):
-                    dpg.delete_item(item)
+            handlers = getattr(self, "_terminal_handlers", None)
+            if handlers is not None and hasattr(handlers, "delete"):
+                handlers.delete()
         self.view.after(0, cleanup)
 
     def close(self, wait=True, timeout=1.0):
@@ -1433,14 +1635,25 @@ class ConsoleDockPanel(ConsoleDialog):
     """
 
     def __init__(self, view, parent, output_callback, command_callback,
-                 interrupt_callback, error_callback=None):
+                 interrupt_callback, error_callback=None, completion_callback=None,
+                 completion_list_callback=None):
+        # ConsoleDockPanel intentionally reuses ConsoleDialog's terminal/editor
+        # implementation without constructing a top-level QtDialog. Since
+        # QtDialog now participates in QObject ownership, initialize only the
+        # QObject side here so bound-method signal connections (QTimer, etc.)
+        # have a valid receiver lifecycle.
+        QObject.__init__(self, after=view.after)
         self.view = view
         self.output_callback, self.command_callback = output_callback, command_callback
         self.interrupt_callback, self.error_callback = interrupt_callback, error_callback
+        self.completion_callback = completion_callback
+        self.completion_list_callback = completion_list_callback
         self.buffer = TerminalBuffer()
         self._last_output = None
         self._follow_tail = True
         self._scroll_pending = False
+        self._cursor_scroll_pending = False
+        self._manual_scroll_until = 0.0
         self._surrogate = None
         self._last_paint = None
         self._line_height = 17
@@ -1468,72 +1681,104 @@ class ConsoleDockPanel(ConsoleDialog):
         self._click_count = 0
         self._context_menu_pending = False
         self._suppress_left_click_until = 0.0
+        self._completion_request_serial = 0
+        self._completion_pending = None
+        self._completion_state = None
+        self._completion_applying = False
+        self._completion_queued_directions = []
         self._destroyed = False
         self.preferred_size = (760, 220)
         self.shortcuts = {}
 
-        self._theme = terminal_theme()
-        self.tag = self.content = dpg.add_child_window(
-            parent=parent, width=-1, height=-1, border=True,
-            no_scrollbar=False, no_scroll_with_mouse=False,
-        )
-        dpg.bind_item_theme(self.content, self._theme)
+        self._theme = terminal_theme(parent=self, backend=dpg)
+        self._content_frame = QFrame(
+            parent=parent, width=-1, height=-1, frame_shape=QFrame.StyledPanel,
+            no_scrollbar=False, no_scroll_with_mouse=False, backend=dpg)
+        self.tag = self.content = self._content_frame.tag
+        self._content_surface = self._content_frame
+        self._content_surface.setTheme(self._theme)
         self._scroller_arrow_overlay = DpgScrollerArrowOverlay(
             dpg, self.content, f"{self.tag}_scroller", vertical=True, horizontal=False)
-        with dpg.drawlist(parent=self.content, width=600, height=20) as self.canvas:
-            self._line_items = []
-            self._current_line_fill = dpg.draw_rectangle(
-                (0, 0), (0, 0), color=CURRENT_LINE, fill=CURRENT_LINE)
-            self._caret = dpg.draw_rectangle(
-                (0, 0), (7, 2), color=COMMAND, fill=COMMAND)
+        self._canvas_widget = QCanvas(
+            width=600, height=20, parent=self.content, backend=dpg)
+        self.canvas = self._canvas_widget.tag
+        self._line_items = []
+        painter = QPainter(self._canvas_widget)
+        self._current_line_fill = painter.drawRect(
+            (0, 0), (0, 0), color=CURRENT_LINE, fill=CURRENT_LINE)
+        self._caret = painter.drawRect(
+            (0, 0), (7, 2), color=COMMAND, fill=COMMAND)
 
         self._create_context_menu()
         self.output = self.input = self.canvas
 
-        with dpg.handler_registry() as self._terminal_handlers:
-            for key, callback in (
-                    (dpg.mvKey_Back, self._backspace),
-                    (dpg.mvKey_V, self._paste),
-                    (dpg.mvKey_Tab, self._tab),
-                    (dpg.mvKey_Left, self._left),
-                    (dpg.mvKey_Right, self._right),
-                    (dpg.mvKey_Up, self._up_key),
-                    (dpg.mvKey_Down, self._down_key),
-                    (dpg.mvKey_Home, self._home),
-                    (dpg.mvKey_End, self._end),
-                    (dpg.mvKey_Delete, self._delete),
-            ):
-                dpg.add_key_press_handler(
-                    key=key, callback=self._dock_key_callback,
-                    user_data=callback)
-            dpg.add_key_press_handler(
-                key=dpg.mvKey_Return, callback=self._dock_return_callback)
-            dpg.add_key_press_handler(
-                key=dpg.mvKey_Escape, callback=self._dock_escape_callback)
-            dpg.add_key_press_handler(
-                key=dpg.mvKey_C, callback=self._dock_ctrl_c_callback)
-            dpg.add_key_press_handler(
-                key=dpg.mvKey_A, callback=self._dock_ctrl_a_callback)
-            dpg.add_key_press_handler(
-                key=dpg.mvKey_F, callback=self._dock_find_callback)
-            dpg.add_key_press_handler(
-                key=dpg.mvKey_F3, callback=self._dock_find_repeat_callback)
-            dpg.add_mouse_wheel_handler(callback=self._wheel)
-            dpg.add_mouse_drag_handler(
-                button=dpg.mvMouseButton_Left, threshold=1.0,
-                callback=self._mouse_drag)
-            dpg.add_mouse_release_handler(
-                button=dpg.mvMouseButton_Left, callback=self._mouse_release)
-            dpg.add_mouse_release_handler(
-                button=dpg.mvMouseButton_Right, callback=self._right_release_fallback)
-            dpg.add_mouse_click_handler(
-                button=dpg.mvMouseButton_Left, callback=self._mouse_click)
+        self._terminal_handlers = QGlobalInputBinding(
+            backend=dpg, parent=self, after=self.view.after)
+        for key, callback in (
+                (Qt.Key_Backspace, self._backspace),
+                (Qt.Key_V, self._paste),
+                (Qt.Key_Tab, self._tab),
+                (Qt.Key_Left, self._left),
+                (Qt.Key_Right, self._right),
+                (Qt.Key_Up, self._up_key),
+                (Qt.Key_Down, self._down_key),
+                (Qt.Key_Home, self._home),
+                (Qt.Key_End, self._end),
+                (Qt.Key_Delete, self._delete),
+        ):
+            self._terminal_handlers.onKeyPress(
+                key, self._dock_key_callback, user_data=callback)
+        self._terminal_handlers.onKeyPress(
+            Qt.Key_Insert, self._dock_key_callback, user_data=self._toggle_overwrite)
+        self._terminal_handlers.onKeyPress(
+            Qt.Key_F1, self._dock_key_callback, user_data=self._template_char)
+        self._terminal_handlers.onKeyPress(
+            Qt.Key_F5, self._dock_key_callback, user_data=self._template_full)
+        self._terminal_handlers.onKeyPress(
+            Qt.Key_F8, self._dock_key_callback, user_data=self._history_prefix)
+        for key, callback in (
+                (Qt.Key_E, self._line_end),
+                (Qt.Key_B, self._line_left),
+                (Qt.Key_P, self._up_key),
+                (Qt.Key_N, self._down_key),
+                (Qt.Key_R, self._history_contains),
+                (Qt.Key_W, self._kill_word_left),
+                (Qt.Key_U, self._kill_to_start),
+                (Qt.Key_K, self._kill_to_end),
+                (Qt.Key_Y, self._yank),
+                (Qt.Key_D, self._line_delete),
+                (Qt.Key_H, self._line_backspace),
+                (Qt.Key_L, self._clear_console)):
+            self._terminal_handlers.onKeyPress(
+                key, self._dock_ctrl_edit_callback, user_data=callback)
+        self._terminal_handlers.onKeyPress(Qt.Key_Return, self._dock_return_callback)
+        self._terminal_handlers.onKeyPress(Qt.Key_Escape, self._dock_escape_callback)
+        self._terminal_handlers.onKeyPress(Qt.Key_C, self._dock_ctrl_c_callback)
+        self._terminal_handlers.onKeyPress(Qt.Key_A, self._dock_ctrl_a_callback)
+        self._terminal_handlers.onKeyPress(Qt.Key_F, self._dock_find_callback)
+        self._terminal_handlers.onKeyPress(Qt.Key_F3, self._dock_find_repeat_callback)
+        self._terminal_handlers.onMouseWheel(self._wheel)
+        self._terminal_handlers.onMouseDrag(
+            Qt.LeftButton, self._mouse_drag, threshold=1.0)
+        self._terminal_handlers.onMouseRelease(Qt.LeftButton, self._mouse_release)
+        self._terminal_handlers.onMouseRelease(
+            Qt.RightButton, self._right_release_fallback)
+        self._terminal_handlers.onMouseClick(Qt.LeftButton, self._mouse_click)
+        self._terminal_handlers.activate()
 
         self._refresh()
-        self.view.after(0, self._paint_tick)
+        self._paint_tick()
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setInterval(100)
+        self._refresh_timer.timeout.connect(self._refresh)
+        self._refresh_timer.start()
+        self._paint_timer = QTimer(self)
+        self._paint_timer.setInterval(33)
+        self._paint_timer.timeout.connect(self._paint_tick)
+        self._paint_timer.start()
 
     def winfo_exists(self):
-        return (not self._destroyed) and dpg.does_item_exist(self.tag)
+        return (not self._destroyed) and self._content_frame.exists()
 
     def keyboard_active(self):
         # This predicate is also queried from the native WM_CHAR hook.  Keep it
@@ -1543,24 +1788,63 @@ class ConsoleDockPanel(ConsoleDialog):
             not self._destroyed
             and getattr(self.view, "_console_keyboard_panel", None) is self
             and getattr(self.view, "_console_dock_visible", False)
+            and getattr(self.view, "_console_dock_mode", "docked") == "docked"
         )
 
-    def focus_input(self, follow_tail=True):
+    def event(self, event):
+        """Consume QApplication keyboard routing while the terminal owns input.
+
+        The docked terminal already has Dear PyGui key handlers for editing and
+        Enter submission, plus the Win32 WM_CHAR bridge for text.  QApplication
+        must still see the Console as the logical focus object so the same
+        physical Enter cannot bubble into a previously focused Explorer view.
+        Do not execute the key here: consuming it prevents background widgets
+        from receiving it without submitting the terminal command twice.
+        """
+        if (self.keyboard_active()
+                and event.type() in (
+                    QEvent.KeyPress, QEvent.KeyRelease,
+                    QEvent.ShortcutOverride)):
+            return True
+        return QObject.event(self, event)
+
+    def focus_input(self, follow_tail=True, focus_window=True):
         if not self.winfo_exists():
             return
+        self._caret_blink_started = time.monotonic()
+        was_active = self.keyboard_active()
         setter = getattr(self.view, "_set_console_keyboard_active", None)
         if callable(setter):
             setter(True, self)
         if follow_tail:
             self._follow_tail = True
             self._scroll_pending = True
-        try:
-            dpg.focus_item(self.tag)
-        except Exception:
-            pass
+            self._manual_scroll_until = 0.0
+        # The physical click already focuses the docked surface. Only issue a
+        # DPG focus request when keyboard ownership is actually being acquired;
+        # repeating it while already active is a common source of scroll jumps.
+        if focus_window and not was_active:
+            frame = getattr(self, "_content_frame", None)
+            if frame is not None:
+                frame.setFocus()
+            else:
+                # Compatibility with embedded hosts created before QFrame was
+                # retained as an object; current ConsoleDockPanel owns a frame.
+                dpg.focus_item(self.tag)
 
     def _dock_key_callback(self, sender=None, app_data=None, user_data=None):
         if self.keyboard_active() and callable(user_data):
+            # Keep the queued callback contract deliberately one-argument: the
+            # second ownership check in _run_dock_key prevents a stale key from
+            # editing the console after focus has moved to another widget.
+            self.view.after(0, self._run_dock_key, user_data)
+
+    def _run_dock_key(self, callback):
+        if self.keyboard_active():
+            callback()
+
+    def _dock_ctrl_edit_callback(self, sender=None, app_data=None, user_data=None):
+        if self.keyboard_active() and self._ctrl_down() and callable(user_data):
             self.view.after(0, user_data)
 
     def _dock_return_callback(self, sender=None, app_data=None, user_data=None):
@@ -1575,6 +1859,8 @@ class ConsoleDockPanel(ConsoleDialog):
             self.view.after(0, menu.hide)
         elif self._find_active:
             self.view.after(0, self._close_find)
+        elif self.buffer.draft:
+            self.view.after(0, self._clear_command_line)
 
     def _dock_ctrl_c_callback(self, sender=None, app_data=None, user_data=None):
         if self.keyboard_active() and self._ctrl_down():
@@ -1582,7 +1868,7 @@ class ConsoleDockPanel(ConsoleDialog):
 
     def _dock_ctrl_a_callback(self, sender=None, app_data=None, user_data=None):
         if self.keyboard_active() and self._ctrl_down():
-            self.view.after(0, self._select_all)
+            self.view.after(0, self._control_a)
 
     def _dock_find_callback(self, sender=None, app_data=None, user_data=None):
         if self.keyboard_active() and self._ctrl_down():
@@ -1591,10 +1877,11 @@ class ConsoleDockPanel(ConsoleDialog):
     def _dock_find_repeat_callback(self, sender=None, app_data=None, user_data=None):
         if not self.keyboard_active():
             return
-        direction = -1 if (
-            dpg.is_key_down(dpg.mvKey_LShift)
-            or dpg.is_key_down(dpg.mvKey_RShift)) else 1
-        self.view.after(0, self._find_next, direction)
+        if self._find_active:
+            direction = -1 if (QKeyboard.modifiers(backend=dpg) & Qt.ShiftModifier) else 1
+            self.view.after(0, self._find_next, direction)
+        else:
+            self.view.after(0, self._template_remainder)
 
     def _close_from_escape(self):
         menu = getattr(self, "_context_menu_obj", None)
@@ -1602,11 +1889,20 @@ class ConsoleDockPanel(ConsoleDialog):
             menu.hide()
         elif self._find_active:
             self._close_find()
+        else:
+            self._clear_command_line()
 
     def destroy(self):
         if self._destroyed:
             return
         self._destroyed = True
+        for timer_name in ("_refresh_timer", "_paint_timer"):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                try:
+                    timer.delete()
+                except Exception:
+                    pass
         setter = getattr(self.view, "_set_console_keyboard_active", None)
         if callable(setter):
             setter(False, self)
@@ -1621,15 +1917,22 @@ class ConsoleDockPanel(ConsoleDialog):
         overlay = getattr(self, "_scroller_arrow_overlay", None)
         if overlay is not None:
             overlay.destroy()
-        for item in (
-                getattr(self, "_terminal_handlers", None),
-                getattr(self, "tag", None),
-                getattr(self, "_theme", None)):
+        handlers = getattr(self, "_terminal_handlers", None)
+        if handlers is not None and hasattr(handlers, "delete"):
             try:
-                if item and dpg.does_item_exist(item):
-                    dpg.delete_item(item)
+                handlers.delete()
             except Exception:
                 pass
+        frame = getattr(self, "_content_frame", None)
+        if frame is not None:
+            try:
+                frame.delete()
+            except Exception:
+                pass
+        # Match the QObject lifetime initialized above. Call the base QObject
+        # implementation explicitly because QtDialog.delete() delegates back to
+        # destroy(), which would recurse for this embedded panel.
+        QObject.delete(self)
 
     def close(self, wait=True, timeout=1.0):
         self.destroy()

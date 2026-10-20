@@ -3,7 +3,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from WinUx.components.explorer_native_hook import ExplorerNativeHook
+from WinUx.ui.components.explorer_native_hook import ExplorerNativeHook
 
 
 class NativeHookTests(unittest.TestCase):

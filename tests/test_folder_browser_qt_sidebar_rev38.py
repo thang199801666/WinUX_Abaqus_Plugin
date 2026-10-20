@@ -5,25 +5,27 @@ STYLE = ROOT / "WinUx" / "dialogs" / "folder_browser_style.py"
 FORM = ROOT / "WinUx" / "dialogs" / "local_folder_form.py"
 
 
-def test_sidebar_branch_indicator_is_geometric_not_font_glyph():
-    style = STYLE.read_text(encoding="utf-8")
+def test_sidebar_branch_indicator_is_owned_by_qtreewidget_geometry():
     form = FORM.read_text(encoding="utf-8")
-    assert "def create_branch_indicator" in style
-    assert "dpg.draw_triangle" in style
-    assert "paint_branch_indicator(indicator, shown)" in form
+    tree = (ROOT / "DearUIQt" / "modelview" / "tree_widget.py").read_text(encoding="utf-8")
+    assert "QTreeWidget(" in form
+    assert "draw_triangle" in tree
+    assert "item.isExpanded()" in tree
     assert 'label=chr(GLYPHS["Expanded"])' not in form
 
 
-def test_sidebar_place_selection_uses_full_row_overlay():
+def test_sidebar_place_selection_uses_qtreewidget_full_row_overlay():
     form = FORM.read_text(encoding="utf-8")
-    assert "Full-row background selection/hover" in form
+    tree = (ROOT / "DearUIQt" / "modelview" / "tree_widget.py").read_text(encoding="utf-8")
     assert "browser_sidebar_item_container_theme()" in form
-    assert 'label="", width=0, height=METRICS.sidebar_row_height' in form
-    assert '(METRICS.sidebar_row_height - 16) // 2' in form
-    assert 'self._sidebar_text_y(display_label)' in form
+    assert "item.setContainerTheme(browser_sidebar_item_container_theme())" in form
+    assert "add_selectable(" in tree
+    assert "add_drawlist(" in tree
+    assert "height=self._row_height" in tree
 
 
-def test_sidebar_drive_label_is_separate_from_selection_hit_target():
+def test_sidebar_drive_label_is_model_data_not_a_second_hit_target():
     form = FORM.read_text(encoding="utf-8")
-    assert "label_item = dpg.add_text" in form
-    assert "self._set_place_label(label_item, name)" in form
+    assert "def _set_place_label(self, item, text):" in form
+    assert "item.setText(0, self._elide_sidebar_label(text))" in form
+    assert "self._set_place_label(item, name)" in form

@@ -1,9 +1,9 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PALETTE = ROOT / "WinUx" / "components" / "qt_style.py"
-ITEMS = ROOT / "WinUx" / "widgets" / "item_views.py"
-THEMES = ROOT / "WinUx" / "components" / "explorer_themes.py"
+PALETTE = ROOT / "WinUx" / "ui" / "framework" / "qt" / "palette.py"
+ITEMS = ROOT / "WinUx" / "ui" / "framework" / "qt" / "item_themes.py"
+THEMES = ROOT / "WinUx" / "ui" / "components" / "explorer_themes.py"
 FOLDER = ROOT / "WinUx" / "dialogs" / "folder_browser_style.py"
 
 

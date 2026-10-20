@@ -365,7 +365,7 @@ def combine_xy_series(x_series, y_series, reverse="As is"):
 
 
 def build_combined_curves(extracted, selection):
-    """Build Cartesian X×Y combinations in the user's selection order."""
+    """Build Cartesian XxY combinations in the user's selection order."""
     series_by_id = {
         str(item.get("id")): item
         for item in (extracted or {}).get("series", [])

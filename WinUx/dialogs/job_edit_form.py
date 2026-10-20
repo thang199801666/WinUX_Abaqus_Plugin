@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import time
 from datetime import datetime
-import dearpygui.dearpygui as dpg
-from .qt_dialog import QtDialog
+from DearUIQt.dialogs.qt_dialog import QtDialog
 from .logic.job_schedule import JobEditScheduleLogic
 
 
 class JobEditDialog(JobEditScheduleLogic, QtDialog):
     """Dear PyGui editor, retaining the existing schedule parsing contract."""
+
+    REUSABLE_HOST = True
 
     def __init__(self, view, values, settings=None, on_result=None):
         self.on_result = on_result
@@ -52,34 +53,34 @@ class JobEditDialog(JobEditScheduleLogic, QtDialog):
         self.error = self.status_text(error=True)
         self.save_button = self.button_box([("Save", self._save, "primary", True),
             ("Cancel", lambda: self.finish(None), "secondary", False)])[0]
-        self._tick()
+        self._clock_timer = self.create_timer(1000, lambda: self._tick(schedule=False))
+        self._tick(schedule=False)
 
     def _tick(self, schedule=True):
         if not self.winfo_exists():
             return
-        after_mode = dpg.get_value(self.mode) == "Delete After"
-        dpg.configure_item(self.after, enabled=after_mode)
-        dpg.configure_item(self.at, enabled=not after_mode)
+        after_mode = self.control_value(self.mode) == "Delete After"
+        self.set_control_enabled(self.after, after_mode)
+        self.set_control_enabled(self.at, not after_mode)
         try:
             if after_mode:
-                dpg.set_value(self.at, self._delete_at_from_duration(dpg.get_value(self.after)))
-            elif self._parse_delete_at(dpg.get_value(self.at)) <= datetime.now():
+                self.set_control_value(
+                    self.at, self._delete_at_from_duration(self.control_value(self.after, "")))
+            elif self._parse_delete_at(self.control_value(self.at, "")) <= datetime.now():
                 raise ValueError("Delete At must be in the future")
             error = ""
         except ValueError as exc:
             error = str(exc)
         self.set_status_text(self.error, error, error=True)
-        dpg.configure_item(self.save_button, enabled=not error)
-        if schedule:
-            self.view.after(1000, self._tick)
+        self.set_control_enabled(self.save_button, not error)
 
     def _save(self):
         self._tick(schedule=False)
-        if dpg.get_value(self.error):
+        if self.control_value(self.error, ""):
             return
-        mode = dpg.get_value(self.mode)
-        after = dpg.get_value(self.after).strip()
-        at = self._delete_at_from_duration(after) if mode == "Delete After" else self._parse_delete_at(dpg.get_value(self.at)).strftime(self.DELETE_AT_FORMAT)
+        mode = self.control_value(self.mode)
+        after = str(self.control_value(self.after, "") or "").strip()
+        at = self._delete_at_from_duration(after) if mode == "Delete After" else self._parse_delete_at(self.control_value(self.at, "")).strftime(self.DELETE_AT_FORMAT)
         self.finish({"mode": mode, "delete_after_enabled": mode == "Delete After",
                      "delete_after": after, "delete_at_enabled": mode == "Delete At", "delete_at": at})
 
@@ -97,7 +98,7 @@ class JobEditDialog(JobEditScheduleLogic, QtDialog):
 
     def wait(self, timeout=None):
         deadline = None if timeout is None else time.monotonic() + timeout
-        while not self.result["done"] and self.winfo_exists() and dpg.is_dearpygui_running():
+        while not self.result["done"] and self.winfo_exists() and self.runtime_running():
             if deadline is not None and time.monotonic() >= deadline:
                 break
             self.view.update()

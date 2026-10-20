@@ -6,10 +6,13 @@ import ast
 ROOT = Path(__file__).resolve().parents[1]
 VIEW = ROOT / "WinUx" / "view.py"
 UI = ROOT / "WinUx" / "ui"
-SPLITTER = UI / "splitter_layout.py"
-PLOT = UI / "plot_docking.py"
-CONSOLE = UI / "console_docking.py"
-POINTER = UI / "pointer_routing.py"
+FRAMEWORK = UI / "framework"
+BEHAVIORS = UI / "behaviors"
+SPLITTER = BEHAVIORS / "splitter_behavior.py"
+SPLITTER_ADAPTER = BEHAVIORS / "splitter_layout.py"
+PLOT = BEHAVIORS / "plot_docking.py"
+CONSOLE = BEHAVIORS / "console_docking.py"
+POINTER = BEHAVIORS / "pointer_routing.py"
 
 
 def _method_names(path, class_name):
@@ -35,11 +38,13 @@ def test_view_facade_composes_ui_behavior_mixins():
 
 def test_splitter_layout_owns_splitter_and_geometry_behavior():
     source = SPLITTER.read_text(encoding="utf-8")
-    assert "class SplitterLayoutMixin" in source
+    assert "class SplitterLayoutBehaviorMixin" in source
     assert "def _pre_dispatch_splitter_input" in source
     assert "def _apply_split_layout" in source
     assert "def _drag_job_plot_splitter" in source
     assert "acquire_pointer_input(owner)" in source
+    adapter = SPLITTER_ADAPTER.read_text(encoding="utf-8")
+    assert "class SplitterLayoutMixin(SplitterLayoutBehaviorMixin)" in adapter
 
 
 def test_plot_and_console_docking_have_separate_owners():
@@ -64,7 +69,7 @@ def test_pointer_routing_is_separate_from_view_facade():
 
 def test_extracted_ui_mixins_do_not_duplicate_method_ownership():
     owners = {
-        "SplitterLayoutMixin": SPLITTER,
+        "SplitterLayoutBehaviorMixin": SPLITTER,
         "PlotDockingMixin": PLOT,
         "ConsoleDockingMixin": CONSOLE,
         "PointerRoutingMixin": POINTER,

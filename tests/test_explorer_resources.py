@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from WinUx.components.explorer_themes import ListViewTheme, ListViewThemeManager
+from WinUx.ui.components.explorer_themes import ListViewTheme, ListViewThemeManager
 from WinUx.platform.windows_cursors import WindowsCursorFile
 
 

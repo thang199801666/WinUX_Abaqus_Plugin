@@ -1,8 +1,8 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-LAYOUT = (ROOT / "WinUx" / "components" / "explorer_layout.py").read_text(encoding="utf-8")
-LISTVIEW = (ROOT / "WinUx" / "components" / "explorer_list_view.py").read_text(encoding="utf-8")
+LAYOUT = (ROOT / "WinUx" / "ui" / "components" / "explorer_layout.py").read_text(encoding="utf-8")
+LISTVIEW = (ROOT / "WinUx" / "ui" / "components" / "explorer_list_view.py").read_text(encoding="utf-8")
 
 
 def test_auto_width_uses_local_geometry_handlers():

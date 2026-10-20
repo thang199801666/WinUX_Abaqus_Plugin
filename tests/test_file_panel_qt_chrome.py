@@ -1,10 +1,10 @@
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-TOOLBAR = ROOT / "WinUx" / "components" / "toolbar.py"
-FILE_PANEL = ROOT / "WinUx" / "components" / "file_panel.py"
+TOOLBAR = ROOT / "WinUx" / "ui" / "components" / "toolbar.py"
+FILE_PANEL = ROOT / "WinUx" / "ui" / "components" / "file_panel.py"
 VIEW = ROOT / "WinUx" / "view.py"
-STYLE = ROOT / "WinUx" / "widgets" / "imgui_qt_style.py"
+STYLE = ROOT / "WinUx" / "ui" / "framework" / "qt" / "style.py"
 
 
 def test_file_toolbar_uses_shared_imgui_qt_toolbar_path_and_status_themes():
