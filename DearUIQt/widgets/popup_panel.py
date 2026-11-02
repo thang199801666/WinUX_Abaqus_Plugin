@@ -52,7 +52,7 @@ class QPopupPanel(QWidget):
 
     def configuredSize(self):
         """Return the requested panel size even before its first rendered frame."""
-        return QSize(self._configured_size)
+        return QSize(self._configured_size.width(), self._configured_size.height())
 
     def effectiveSize(self):
         """Return rendered size when available, otherwise configured size."""

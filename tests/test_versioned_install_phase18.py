@@ -8,6 +8,8 @@ import winux_launcher
 import winux_update_installer
 import winux_update_manifest
 import winux_updater
+from winux_runtime import installation_state as runtime_state
+from winux_runtime.update.manifest import REQUIRED_FILES as RUNTIME_REQUIRED_FILES
 
 
 def _deployment(root, version, marker=None):
@@ -28,6 +30,11 @@ def _deployment(root, version, marker=None):
     (root / "WinUx" / "__main__.py").write_text("# app\n")
     (root / "DearUIQt").mkdir(exist_ok=True)
     (root / "DearUIQt" / "__init__.py").write_text("# dear ui qt\n")
+    for name in RUNTIME_REQUIRED_FILES:
+        path = root / name
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# runtime fixture\n")
     if marker:
         (root / marker).write_text(marker + "\n")
     winux_update_manifest.write_manifest(str(root))

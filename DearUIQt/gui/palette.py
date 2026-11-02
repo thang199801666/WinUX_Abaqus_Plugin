@@ -51,6 +51,14 @@ class QtFusionPalette:
     HIGHLIGHT_TEXT = (255, 255, 255, 255)
     HEADER_HOVER = (232, 240, 247, 255)
     HEADER_PRESSED = (214, 230, 242, 255)
+    # Data-table chrome, shared with the Job Schedule reference appearance.
+    # Do not reuse TOOLBAR/BORDER: those roles also style unrelated controls.
+    TABLE_HEADER = (237, 242, 248, 255)
+    TABLE_HEADER_TEXT = (45, 55, 70, 255)
+    TABLE_ROW = (255, 255, 255, 255)
+    TABLE_ROW_ALT = (247, 249, 252, 255)
+    TABLE_BORDER = (205, 212, 221, 255)
+    TABLE_GRID = (229, 233, 239, 255)
     MENU_HOVER = (229, 241, 251, 255)
     MENU_ACTIVE = (204, 228, 247, 255)
     TAB_ACTIVE_LINE = HIGHLIGHT
@@ -68,12 +76,12 @@ class QtFusionPalette:
 
 
 class QtFusionMetrics:
+    TABLE_CELL_PADDING = (6, 3)
     # Qt Fusion uses compact square-ish controls; keep radii intentionally low.
     WINDOW_ROUNDING = 3
     POPUP_ROUNDING = 2
-    FRAME_ROUNDING = 2
-    # Windows 11-style command buttons use a noticeably softer radius while
-    # editors/list cells retain the tighter Qt/Fusion frame radius above.
+    FRAME_ROUNDING = 5
+    # Editors and command buttons share a subtle Windows 11-style radius.
     BUTTON_ROUNDING = 5
     CHILD_ROUNDING = 2
     SCROLLBAR_ROUNDING = 2

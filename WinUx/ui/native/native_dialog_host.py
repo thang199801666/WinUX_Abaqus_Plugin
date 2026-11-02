@@ -24,7 +24,7 @@ import threading
 from ctypes import wintypes
 
 from ...preferences.dialog_geometry import DialogGeometryPreferences
-from ...resources import apply_tk_app_icon
+from ...platform.resources import apply_tk_app_icon
 
 
 GWLP_HWNDPARENT = -8
@@ -1008,9 +1008,8 @@ def prepare_owned_dialog_stack(owner_hwnd, dialog_hwnd):
     viewport.  Windows honours the GWLP_HWNDPARENT relationship, but on some
     desktops activating the cross-process owned HWND can leave its owner below
     an unrelated Explorer/browser/Abaqus window.  Qt keeps the owner/popup
-    stack together.  Reproduce that behaviour without TOPMOST: only when the
-    owner or dialog already owns the foreground slot, raise the owner once and
-    then the dialog, both with SWP_NOACTIVATE.
+    stack together. Repair only an actually obscured owner, without TOPMOST,
+    activation or redundant reordering of an already correct window stack.
 
     This helper never steals focus from another application and never changes
     size, position, show state or the TOPMOST band.
@@ -1022,40 +1021,18 @@ def prepare_owned_dialog_stack(owner_hwnd, dialog_hwnd):
         if owner_hwnd == dialog_hwnd:
             return False
         user32 = ctypes.windll.user32
-        user32.IsWindow.argtypes = [wintypes.HWND]
-        user32.IsWindow.restype = wintypes.BOOL
         user32.IsWindowVisible.argtypes = [wintypes.HWND]
         user32.IsWindowVisible.restype = wintypes.BOOL
-        user32.GetForegroundWindow.argtypes = []
-        user32.GetForegroundWindow.restype = wintypes.HWND
-        user32.SetWindowPos.argtypes = [
-            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, wintypes.UINT]
-        user32.SetWindowPos.restype = wintypes.BOOL
         owner = wintypes.HWND(owner_hwnd)
-        dialog = wintypes.HWND(dialog_hwnd)
-        if not user32.IsWindow(owner) or not user32.IsWindow(dialog):
-            return False
-        if not user32.IsWindowVisible(owner):
-            return False
-        current = int(user32.GetForegroundWindow() or 0)
-        if current not in (0, owner_hwnd, dialog_hwnd):
-            return False
-        if current == owner_hwnd:
-            # The owner is already at the foreground slot. Raising it again
-            # sends synchronous WM_WINDOWPOS* traffic to its GUI thread and
-            # can stall the child for hundreds of ms while WinUx is rendering.
-            # Activating the owned dialog naturally keeps it above this owner.
-            return True
-        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-        # HWND_TOP is a transient normal-band reorder, never HWND_TOPMOST.
-        # Post cross-thread owner work rather than waiting for its message
-        # pump. The dialog's own-thread placement still follows immediately.
-        if not user32.SetWindowPos(owner, wintypes.HWND(0), 0, 0, 0, 0,
-                                   flags | SWP_ASYNCWINDOWPOS):
-            return False
-        user32.SetWindowPos(dialog, wintypes.HWND(0), 0, 0, 0, 0, flags)
-        return True
+        # Do nothing when already correctly stacked. Unconditionally raising
+        # owner then child caused extra WM_WINDOWPOS/non-client repaint traffic
+        # on every activation, even though no desktop window obscured WinUx.
+        # Keep cross-thread repair asynchronous so the child never waits for
+        # the parent's render loop; neither window is activated by the repair.
+        from DearUIQt.backends.native_windows import NativeWindowBackend
+        return NativeWindowBackend().preserveOwnerPresentation(
+            owner_hwnd, dialog_hwnd,
+            was_visible=bool(user32.IsWindowVisible(owner)), asynchronous=True)
     except Exception:
         return False
 

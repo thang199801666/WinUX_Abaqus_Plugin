@@ -19,16 +19,16 @@ def prepare_common_form_imports():
     # explicitly opt back into legacy main-context dialogs; only then can the
     # lightweight forms be excluded from the hidden worker warm set.
     modules = [
-        "blocking_form", "login_form", "local_folder_form", "local_file_form",
+        "blocking_form", "login_form", "selectors.local_folder_form", "selectors.local_file_form",
     ]
     use_inprocess = str(os.environ.get("WINUX_INPROCESS_DIALOGS", "0")).strip().lower() \
         not in {"0", "false", "off", "no"}
     if not use_inprocess:
         # Default native-top-level mode warms these forms off the click path.
         modules.extend((
-            "settings_form", "job_schedule_form", "bookmarks_form",
-            "site_manager_form", "sync_preview_form", "diagnostics_form",
-            "transfer_center_form",
+            "settings.settings_form", "jobs.job_schedule_form", "bookmarks_form",
+            "site_manager_form", "transfer.sync_preview_form", "diagnostics_form",
+            "transfer.transfer_center_form",
         ))
     for module in modules:
         import_module("." + module, __package__)
@@ -55,7 +55,7 @@ def create_form(kind, payload, view, emit):
             lambda values: emit("save", values=values), lambda values: emit("delete", values=values),
             lambda values: emit("connect", values=values))
     elif kind == "sync":
-        from .sync_preview_form import SyncPreviewDialog
+        from .transfer.sync_preview_form import SyncPreviewDialog
         form = SyncPreviewDialog(view, payload.get("rows", []), payload.get("local_path", ""), payload.get("server_path", ""),
             lambda: emit("refresh"), lambda rows: emit("transfer", rows=rows))
     elif kind == "server_path":
@@ -63,14 +63,18 @@ def create_form(kind, payload, view, emit):
         form = ServerPathDialog(view, payload.get("initial", "/"), lambda path: [], on_selected=result)
         form.request_search = lambda generation, value: emit("search", generation=generation, value=value)
     elif kind == "local_folder":
-        from .local_folder_form import LocalFolderDialog
-        form = LocalFolderDialog(view, payload.get("initial", ""), on_result=result)
+        from .selectors.local_folder_form import LocalFolderDialog
+        form = LocalFolderDialog(view, payload.get("initial", ""), on_result=result,
+            multiple=payload.get("multiple", False), show_hidden=payload.get("show_hidden", False),
+            title=payload.get("title"))
     elif kind == "local_file":
-        from .local_file_form import LocalFileDialog
+        from .selectors.local_file_form import LocalFileDialog
         form = LocalFileDialog(
             view, payload.get("initial", ""), on_result=result,
             extensions=payload.get("extensions", ()), save=payload.get("save", False),
-            default_filename=payload.get("default_filename", ""))
+            default_filename=payload.get("default_filename", ""),
+            multiple=payload.get("multiple", False), show_hidden=payload.get("show_hidden", False),
+            title=payload.get("title"))
     elif kind == "plotdigitizer":
         from ..plotdigitizer.ui import PlotDigitizerDialog
         from ..plotdigitizer.application import reference_candidate
@@ -91,21 +95,21 @@ def create_form(kind, payload, view, emit):
                 emit("cancel")
         form = ProgressDialog(view, payload.get("operation", "Transfer"), CancelEvent())
     elif kind == "job_edit":
-        from .job_edit_form import JobEditDialog
+        from .jobs.job_edit_form import JobEditDialog
         form = JobEditDialog(view, payload.get("values", []), payload.get("settings", {}), on_result=result)
     elif kind == "job_manager":
-        from .job_manager_form import JobManagerDialog
+        from .jobs.job_manager_form import JobManagerDialog
         form = JobManagerDialog(view, payload.get("paths", []),
             lambda form, jobs: emit("run", jobs=jobs), lambda form, paths: emit("estimate"))
     elif kind == "job_schedule":
-        from .job_schedule_form import JobScheduleDialog
+        from .jobs.job_schedule_form import JobScheduleDialog
         state["rows"] = payload.get("rows", [])
         def provider():
             emit("refresh")
             return state["rows"]
         form = JobScheduleDialog(view, provider, lambda action, kind, key: emit("action", action=action, kind=kind, key=key))
     elif kind == "settings":
-        from .settings_form import SettingsDialog
+        from .settings.settings_form import SettingsDialog
         form = SettingsDialog(view, on_install_update=lambda: emit("install_update"),
                               on_settings_saved=lambda values: emit("settings_saved", values=values))
     elif kind == "diagnostics":
@@ -116,22 +120,23 @@ def create_form(kind, payload, view, emit):
             return state["report"]
         form = DiagnosticsDialog(view, report_provider=provider)
     elif kind == "odb_check":
-        from .odb_check_form import ODBCheckDialog
+        from .odb.odb_check_form import ODBCheckDialog
         form = ODBCheckDialog(view, payload.get("result", {}))
     elif kind == "odb_extract":
-        from .odb_extract_form import ODBExtractDialog
+        from .odb.odb_extract_form import ODBExtractDialog
         form = ODBExtractDialog(view, payload.get("catalog", {}), on_result=result)
     elif kind == "reference_chart":
-        from .reference_chart_form import ReferenceChartDialog
+        from .reference.reference_chart_form import ReferenceChartDialog
         form = ReferenceChartDialog(
             view, payload.get("series", []), on_result=result,
             history_outputs=payload.get("history_outputs", []))
     elif kind == "odb_xy":
-        from .odb_extract_form import ODBXYResultDialog
+        from .odb.odb_extract_form import ODBXYResultDialog
         form = ODBXYResultDialog(view, payload.get("result", {}))
     elif kind == "console":
-        from .console_form import ConsoleDialog
-        state["output"] = ""
+        from .console.console_form import ConsoleDialog
+        state["output"] = str(payload.get("output", ""))
+        state["raw_output"] = payload.get("raw_output", "")
         completion_waiters = {}
         completion_counter = [0]
         def request_completion(draft, cursor, done):
@@ -147,7 +152,12 @@ def create_form(kind, payload, view, emit):
         form = ConsoleDialog(view, lambda: state["output"],
             lambda command: emit("command", value=command), lambda: emit("interrupt"),
             completion_callback=request_completion,
-            completion_list_callback=show_completion_list)
+            completion_list_callback=show_completion_list,
+            raw_output_callback=lambda: state["raw_output"],
+            raw_input_callback=lambda data: emit("input", value=data),
+            resize_callback=lambda columns, rows: emit(
+                "resize", columns=int(columns), rows=int(rows)),
+            refresh_callback=lambda: emit('refresh'))
         form._completion_waiters = completion_waiters
     elif kind == "console_dock":
         from .native_dock_forms import ConsoleDockForm
@@ -156,7 +166,7 @@ def create_form(kind, payload, view, emit):
         from .native_dock_forms import PlotDockForm
         form = PlotDockForm(view, payload, emit)
     elif kind == "transfer_center":
-        from .transfer_center_form import TransferCenterDialog
+        from .transfer.transfer_center_form import TransferCenterDialog
         form = TransferCenterDialog(view, on_cancel_all=lambda: emit("cancel_all"),
             on_clear_finished=lambda: emit("clear_finished"), on_row_action=lambda row_id: emit("row_action", row_id=row_id))
     else:
@@ -167,6 +177,14 @@ def create_form(kind, payload, view, emit):
 
 
 def deliver_command(form, command, args):
+    if getattr(form, "_floating_kind", None) == "console":
+        state = form._remote_state
+        if command == "output":
+            state["output"] = str(args[0])
+        elif command == "raw_output":
+            state["raw_output"] = args[0]
+            form._update_raw_terminal()
+            return
     if command == "dialog_accept":
         form.accept()
         return

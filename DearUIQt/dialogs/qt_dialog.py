@@ -21,7 +21,8 @@ from ..input_gate import (
     _mouse_button_down,
 )
 from ..dispatch import LatestCallQueue
-from ..gui.style import METRICS, form_row_theme, form_label_cell_theme, aligned_cell_theme
+from ..gui.style import (METRICS, form_row_theme, form_label_cell_theme,
+                         aligned_cell_theme, transparent_header_cell_theme)
 from ..core import Qt, QObject, QSize, QEvent, QKeyEvent, QCloseEvent, QMouseEvent
 from ..widgets.widget import QWidget
 from ..widgets.buttons import QPushButton, QLabel
@@ -141,6 +142,7 @@ class QtDialog(DialogBase, QObject):
         # hand-off happens before hide/destroy, while a guarded verification
         # runs only after the renderer has actually removed the secondary HWND.
         self._native_owner_close_lease = None
+        self._native_owner_open_lease = None
         self._native_owner_repair_generation = 0
         owner_parent = parent if isinstance(parent, QObject) else None
         self._requested_parent = parent
@@ -235,6 +237,10 @@ class QtDialog(DialogBase, QObject):
         with dpg.window(tag=self.tag, label=title, width=width, height=height,
                         show=not self._construction_deferred,
                         modal=self.modal and not use_native, no_collapse=True, no_scrollbar=True,
+                        # Native dialogs have an OS caption. Disable ImGui's
+                        # client-area window drag; Windows still owns caption
+                        # dragging (including move/resize and snap behavior).
+                        no_move=use_native,
                         no_scroll_with_mouse=True, no_resize=not self._resizable,
                         min_size=(fixed_size if fixed_size is not None else
                                   (DialogMetrics.MIN_DIALOG_WIDTH, self._minimum_dialog_height)),
@@ -255,12 +261,16 @@ class QtDialog(DialogBase, QObject):
                     self.footer = dpg.add_group()
         dpg.bind_item_theme(self.tag, dialog_theme())
         self._content_widget.setTheme(body_theme())
+        from ..backends.shared_scrollers import register_scroll_surface
+        register_scroll_surface(self._content_widget.backend, self.content)
         if footer:
             dpg.bind_item_theme(self.footer_shell, footer_theme())
         if use_native:
+            # HWND ownership can be prepared now; native modality must wait
+            # until the replacement HWND has actually taken foreground.
             native_backend.configure(
                 self.tag, owner=self._modal_native_parent() if self.modal else None,
-                modal=self.modal, owner_hwnd=self._native_main_owner_hwnd())
+                modal=False, owner_hwnd=self._native_main_owner_hwnd())
         self._bind_resize_handler()
         if owner_parent is not None:
             self.setParent(owner_parent)
@@ -324,6 +334,81 @@ class QtDialog(DialogBase, QObject):
         except Exception:
             return 0
 
+    def _guard_native_modal_owner_visibility(self, owner_hwnd, generation):
+        """Keep the existing main HWND visible while an owned dialog is open.
+
+        Multi-viewport transitions can temporarily hide the GLFW owner when a
+        secondary HWND is presented. Re-show only an owner that was already
+        visible at dialog launch; never activate it above the dialog and never
+        un-minimize a window the user explicitly minimized.
+        """
+        if (generation != getattr(self, "_modal_owner_visibility_generation", 0)
+                or not self.winfo_exists() or not self.isVisible()):
+            return
+        try:
+            import ctypes
+            import os
+            from ctypes import wintypes
+            if os.name == "nt" and owner_hwnd:
+                user32 = ctypes.windll.user32
+                owner = wintypes.HWND(int(owner_hwnd))
+                if user32.IsWindow(owner) and not user32.IsIconic(owner):
+                    # On the first secondary viewport creation DWM can cloak
+                    # the GLFW owner while leaving WS_VISIBLE set.  Looking at
+                    # IsWindowVisible() alone therefore misses the exact cold
+                    # first-show failure seen by WinUx.  Remove only an active
+                    # DWM cloak; never activate or restore the owner.
+                    try:
+                        dwm = ctypes.windll.dwmapi
+                        cloaked = wintypes.DWORD(0)
+                        result = dwm.DwmGetWindowAttribute(
+                            owner, 14, ctypes.byref(cloaked), ctypes.sizeof(cloaked))
+                        if result == 0 and cloaked.value:
+                            state = wintypes.BOOL(False)
+                            dwm.DwmSetWindowAttribute(
+                                owner, 13, ctypes.byref(state), ctypes.sizeof(state))
+                    except (AttributeError, OSError):
+                        pass
+                    if not user32.IsWindowVisible(owner):
+                        user32.ShowWindow(owner, 4)  # SW_SHOWNOACTIVATE
+                    # WS_VISIBLE does not mean the owner is on screen: a later
+                    # platform activation can put another application between
+                    # the dialog and WinUx. The first-present repair alone
+                    # cannot cover that transition. Repair the pair only while
+                    # this dialog owns foreground, never after an Alt-Tab.
+                    backend = self._native_window_backend
+                    user32.GetForegroundWindow.restype = wintypes.HWND
+                    if (backend is not None
+                            and not getattr(self, "_native_presentation_pending", False)):
+                        # Startup hosts/platform reconciliation may finish after
+                        # the first few rendered frames. The launch-time lease
+                        # still permits repair only until the next user input.
+                        if self.modal:
+                            activated = backend.activateOwnedWindow(
+                                self.tag, opening=self._native_owner_open_lease)
+                            self._arm_native_modality(activated)
+                        else:
+                            backend.repairOwnedInteraction(self.tag)
+                    if (backend is not None and int(user32.GetForegroundWindow() or 0)
+                            == int(backend.winId(self.tag) or 0)):
+                        self._recover_native_owner_presentation()
+        except Exception:
+            pass
+        # Check every rendered frame while the dialog is alive. The renderer
+        # can apply the first secondary-window transition after an idle timer,
+        # so a 100 ms polling gap is long enough for the owner to visibly
+        # disappear.  after_render keeps this synchronized to presentation and
+        # does no work once the dialog closes or the generation changes.
+        schedule = getattr(self.view, "after_render", None)
+        if callable(schedule):
+            schedule(self._guard_native_modal_owner_visibility,
+                     owner_hwnd, generation)
+        else:
+            schedule = getattr(self.view, "after", None)
+            if callable(schedule):
+                schedule(16, self._guard_native_modal_owner_visibility,
+                         owner_hwnd, generation)
+
     def _synchronize_native_owner_once(self, remaining=3):
         """Attach the native viewport once its HWND exists, then stop touching it.
 
@@ -366,24 +451,48 @@ class QtDialog(DialogBase, QObject):
                 return False
         except Exception:
             return False
+        if ready and getattr(self, "NATIVE_DEFER_CLOSE", False):
+            install_close = getattr(backend, "setCloseRequestHandler", None)
+            if callable(install_close):
+                install_close(self.tag, self._queue_native_close_request)
         if ready is None and remaining > 0:
             schedule = getattr(self.view, "after_render", None)
             if callable(schedule):
                 schedule(self._prepare_native_first_click_once, remaining - 1)
         return ready
 
+    def _queue_native_close_request(self):
+        """Transfer a cancelable Win32 close request to the normal UI queue."""
+        if self._closed or getattr(self, "_native_close_request_pending", False):
+            return
+        self._native_close_request_pending = True
+
+        def deliver():
+            self._native_close_request_pending = False
+            if not self._closed and self.winfo_exists() and self.isVisible():
+                handler = getattr(self, "_close_from_native", self.reject)
+                handler()
+
+        self.view.after(0, deliver)
+
     def _queue_native_first_button_recovery(self, screen_point):
         """Recover a lost first native click without duplicating normal delivery.
 
         The HWND hook observes the first client mouse-up after a visibility
-        lease. Dear PyGui callbacks are drained before ``view.after`` callbacks,
-        so a normally delivered QPushButton click increments the activation
-        serial first and this fallback becomes a no-op.
+        lease. Wait across the next rendered input batch so normal QPushButton
+        delivery increments the activation serial before fallback is considered.
         """
         baseline = int(getattr(self, "_button_activation_serial", 0))
-        schedule = getattr(self.view, "after", None)
+        schedule = getattr(self.view, "after_render", None)
         if callable(schedule):
-            schedule(0, self._recover_native_first_button_click, tuple(screen_point), baseline)
+            # WM_LBUTTONUP can arrive during GLFW polling before ImGui has
+            # produced its ordinary button/pointer callbacks. after(0) can run
+            # ahead of those callbacks and click a destructive button twice.
+            schedule(self._recover_native_first_button_click, tuple(screen_point), baseline)
+        else:
+            schedule = getattr(self.view, "after", None)
+            if callable(schedule):
+                schedule(16, self._recover_native_first_button_click, tuple(screen_point), baseline)
 
     def _recover_native_first_button_click(self, screen_point, baseline_serial):
         if (not self.winfo_exists() or not self.isVisible()
@@ -392,19 +501,28 @@ class QtDialog(DialogBase, QObject):
         for button in reversed(tuple(self._control_wrappers.values())):
             if (isinstance(button, QPushButton)
                     and self._button_contains_global_point(button, screen_point)):
+                target = getattr(self, "_button_pointer_target", None)
+                if target is not None and target is not button:
+                    return False  # A drag from another button is not a click.
+                # The routed release may still be queued. Consume its pending
+                # press before emulating activation, otherwise that later
+                # release can activate this same destructive button again.
+                self._button_pointer_target = None
+                if target is not None and not target._deleted:
+                    target._end_pointer_click(False)
                 self._initial_pointer_activity = True
                 return bool(button.click())
         return False
 
     def _activate_native_modal_once(self, remaining=2):
-        """Make the first visible native modal immediately click-ready.
+        """Make a newly shown native dialog immediately click-ready.
 
         ``dpg.focus_item`` focuses ImGui navigation, not necessarily the Win32
         secondary viewport HWND.  When USER32 still considers the owner the
         foreground window, the first mouse press on the dialog can otherwise
         become an activation-only click.
         """
-        if (not self.modal or self._native_window_backend is None
+        if (self._native_window_backend is None
                 or not self.winfo_exists() or not self.isVisible()):
             return False
         try:
@@ -418,7 +536,9 @@ class QtDialog(DialogBase, QObject):
                     click_ready = preserve(self.tag)
             else:
                 click_ready = True
-            activated = self._native_window_backend.activateOwnedWindow(self.tag)
+            activated = self._native_window_backend.activateOwnedWindow(
+                self.tag, opening=self._native_owner_open_lease)
+            self._arm_native_modality(activated)
         except Exception:
             return False
         if (click_ready is None or activated is None) and remaining > 0:
@@ -428,6 +548,19 @@ class QtDialog(DialogBase, QObject):
         if click_ready is False:
             return False
         return activated
+
+    def _arm_native_modality(self, activated):
+        """Disable the owner only after its replacement actually has focus.
+
+        A refused native activation is not a successful hand-off. Disabling
+        the foreground owner then makes USER32 activate an unrelated desktop
+        window and puts WinUx behind it. Logical modality already blocks the
+        main UI; retry native modality when the dialog really becomes active.
+        """
+        if (activated is True and self.modal
+                and not getattr(self, "_native_modality_armed", False)):
+            self._native_window_backend.setModal(self.tag, True)
+            self._native_modality_armed = True
 
     def _apply_native_resize_policy_once(self, remaining=3):
         """Apply QDialog's resize policy to the actual Win32 viewport frame.
@@ -455,8 +588,7 @@ class QtDialog(DialogBase, QObject):
             if resize_applied and caption_applied:
                 # The frame metrics may have changed after removing caption
                 # controls/resize borders. Recenter the decorated HWND once.
-                if self.modal:
-                    backend.centerOverOwner(self.tag)
+                backend.centerOverOwner(self.tag)
                 return
         except Exception:
             return
@@ -481,12 +613,12 @@ class QtDialog(DialogBase, QObject):
         return None
 
     def center(self):
-        """Center a modal on its owner (not on the entire desktop/viewport).
+        """Center a dialog on its owner (not on the entire desktop/viewport).
 
         Native windows must receive their final client origin before their
         first render; centering a visible HWND afterwards causes a flash/jump.
         """
-        if not self.modal or bool(getattr(self.view, "is_standalone_ui_host", False)):
+        if bool(getattr(self.view, "is_standalone_ui_host", False)):
             return super().center()
         self._native_center_prepared = False
         if self._native_window_backend is not None:
@@ -521,7 +653,7 @@ class QtDialog(DialogBase, QObject):
 
     def _schedule_native_modal_center(self):
         """Align the actual decorated HWND after its viewport is rendered."""
-        if not self.modal or self._native_window_backend is None:
+        if self._native_window_backend is None:
             return
         if getattr(self, "_native_center_prepared", False):
             return
@@ -647,13 +779,20 @@ class QtDialog(DialogBase, QObject):
                     layout.activate()
                 except Exception:
                     pass
+            status = getattr(self, "_footer_status", None)
+            status_above = getattr(self, "_footer_status_above", False)
+            footer_height = DialogMetrics.FOOTER_HEIGHT
+            if status_above and status is not None:
+                has_status = bool(dpg.get_value(status))
+                self._configure_layout_item(self._footer_status_host, show=has_status)
+                if has_status:
+                    footer_height += 36
             self._configure_layout_item(
                 self.content, width=-1,
-                height=-(DialogMetrics.FOOTER_HEIGHT+1) if self.has_footer else -1)
+                height=-(footer_height+1) if self.has_footer else -1)
             if self.has_footer:
                 self._configure_layout_item(
-                    self.footer_shell, width=-1, height=DialogMetrics.FOOTER_HEIGHT)
-            status = getattr(self, "_footer_status", None)
+                    self.footer_shell, width=-1, height=footer_height)
             if status is not None:
                 try:
                     dialog_width = int(dpg.get_item_width(self.tag) or 0)
@@ -669,6 +808,8 @@ class QtDialog(DialogBase, QObject):
                     - getattr(self, "_footer_left_width", 0)
                     - self._footer_right_width - 60,
                 )
+                if status_above:
+                    wrap = max(80, dialog_width - 40)
                 self._configure_layout_item(status, wrap=wrap)
 
     def after_first_present(self, callback, *args):
@@ -866,6 +1007,8 @@ class QtDialog(DialogBase, QObject):
     def _show_now(self):
         if not self.winfo_exists():
             return False
+        if self._wait_for_native_popup_teardown():
+            return True
         self._cancel_native_owner_repair()
         # Match Qt modality: a modeless QDialog is still a foreground pointer
         # surface, but it must not globally disable background interaction.
@@ -890,6 +1033,7 @@ class QtDialog(DialogBase, QObject):
             _DIALOGS.append(self)
         already_visible = bool(self._visible_state)
         if not already_visible:
+            self._native_modality_armed = False
             self._initial_pointer_activity = False
             # Cancel focus repairs still queued for a previous visibility lease.
             self._pointer_interaction_serial += 1
@@ -905,28 +1049,75 @@ class QtDialog(DialogBase, QObject):
                 current_focus = None
             if current_focus != self.tag and not self._item_belongs_to(current_focus, self.tag):
                 self._focus_restore_item = current_focus
-            if self.modal and not bool(getattr(self.view, "is_standalone_ui_host", False)):
+            if not bool(getattr(self.view, "is_standalone_ui_host", False)):
                 # Resolve the launcher *before* making this dialog active;
                 # otherwise activeWindow() would incorrectly point to self.
                 self.center()
                 if self._native_window_backend is not None:
                     self._native_window_backend.configure(
-                        self.tag, owner=self._modal_native_parent(), modal=True,
+                        self.tag, owner=self._modal_native_parent(), modal=False,
                         owner_hwnd=self._native_main_owner_hwnd())
+                    self._native_owner_open_lease = (
+                        self._native_window_backend.beginOwnerOpen(self.tag))
+            self._native_presentation_pending = False
+            if (self._native_window_backend is not None
+                    and not bool(getattr(self.view, "is_standalone_ui_host", False))):
+                from ..backends.native_presentation import presentation_for
+                presentation = presentation_for(get_backend(), create=True)
+                if presentation is not None:
+                    self._native_presentation_pending = True
+                    # A cold native viewport is DWM-cloaked for its first
+                    # layout frames. Disabling the active owner now leaves
+                    # Windows with no visible activation target and can expose
+                    # another application for one frame. Logical/input modality
+                    # stays registered; native owner disabling starts only once
+                    # the dialog has been revealed and activated.
+                    self._native_window_backend.setModal(self.tag, False)
+                    presentation.prepare(
+                        self.tag, self._prepare_native_hidden,
+                        presented=self._native_first_present_ready,
+                        **({'reuse_geometry': True} if getattr(self, 'NATIVE_REUSE_PRESENTATION', False) else {}))
+            # Capture owner visibility *before* showing the secondary viewport.
+            # When the renderer hides the GLFW primary while creating an owned
+            # HWND, keep the parent visible behind its modal until dismissal.
+            if self._native_window_backend is not None:
+                try:
+                    import ctypes
+                    import os
+                    from ctypes import wintypes
+                    owner_hwnd = self._native_main_owner_hwnd()
+                    user32 = ctypes.windll.user32 if os.name == "nt" else None
+                    owner = wintypes.HWND(owner_hwnd) if owner_hwnd else None
+                    if (user32 is not None and owner is not None
+                            and user32.IsWindowVisible(owner)
+                            and not user32.IsIconic(owner)):
+                        generation = getattr(self, "_modal_owner_visibility_generation", 0) + 1
+                        self._modal_owner_visibility_generation = generation
+                        schedule = getattr(self.view, "after_render", None)
+                        if callable(schedule):
+                            schedule(self._guard_native_modal_owner_visibility,
+                                     owner_hwnd, generation)
+                        immediate = getattr(self.view, "after", None)
+                        if callable(immediate):
+                            immediate(0, self._guard_native_modal_owner_visibility,
+                                      owner_hwnd, generation)
+                except Exception:
+                    pass
             dpg.show_item(self.tag)
             self._visible_state = True
             self._sync_owned_widget_visibility()
             # QWidget::show() emits Show only on the hidden->visible edge.
             self.sendEvent(QEvent(QEvent.Show))
         if not already_visible:
-            if self._native_window_backend is not None:
+            if (self._native_window_backend is not None
+                    and not getattr(self, "_native_presentation_pending", False)):
                 self.after_first_present(self._synchronize_native_owner_once)
                 self.after_first_present(self._prepare_native_first_click_once)
-                if self.modal:
-                    self.after_first_present(self._activate_native_modal_once)
+                self.after_first_present(self._activate_native_modal_once)
                 if not self._resizable:
                     self.after_first_present(self._apply_native_resize_policy_once)
-            self._schedule_native_modal_center()
+            if not getattr(self, "_native_presentation_pending", False):
+                self._schedule_native_modal_center()
         dpg.focus_item(self.tag)
         self._activation_owned = True
         # Like QWidget::show(), a re-shown QDialog restores child focus rather
@@ -935,7 +1126,8 @@ class QtDialog(DialogBase, QObject):
         # after(0) can run in this same bounded dispatcher turn, before the
         # platform window/control geometry exists, leaving a queued focus request
         # to compete with the user's first mouse activation.
-        self.after_first_present(self._apply_initial_focus_if_idle)
+        if not getattr(self, "_native_presentation_pending", False):
+            self.after_first_present(self._apply_initial_focus_if_idle)
         try:
             from ..core.application import QApplication
             application = QApplication.instance()
@@ -950,6 +1142,72 @@ class QtDialog(DialogBase, QObject):
         except Exception:
             pass
         return True
+
+    def _wait_for_native_popup_teardown(self):
+        """Apply native window handoff once, for every QDialog subclass.
+
+        Keep action callbacks synchronous so they snapshot selection/arguments
+        before another input event. Only defer native presentation, not command
+        semantics, until closing menu/dialog HWNDs have actually disappeared.
+        """
+        if (self._native_window_backend is None
+                or bool(getattr(self.view, "is_standalone_ui_host", False))):
+            return False
+        from ..backends.native_presentation import presentation_for
+        presentation = presentation_for(get_backend())
+        handles = presentation.retiring_windows() if presentation is not None else ()
+        if not handles:
+            return False
+        if getattr(self, "_native_show_wait_token", None) is None:
+            token = self._native_show_wait_token = object()
+
+            def show_after_hide():
+                if getattr(self, "_native_show_wait_token", None) is not token:
+                    return
+                self._native_show_wait_token = None
+                if self.winfo_exists() and not self._closed:
+                    self._show_now()
+
+            presentation.after_windows_hidden(handles, show_after_hide)
+        return True
+
+    def _prepare_native_hidden(self):
+        """Finalize ownership, native chrome and centering before DWM exposure."""
+        backend = self._native_window_backend
+        if backend is None or not self.winfo_exists() or not self.isVisible():
+            return False
+        backend.synchronizeOwner(self.tag)
+        resized = backend.setResizable(self.tag, self._resizable)
+        maximize = getattr(self, "ALLOW_MAXIMIZE", None)
+        caption = backend.setCaptionButtons(
+            self.tag, allow_minimize=bool(getattr(self, "ALLOW_MINIMIZE", False)),
+            allow_maximize=self._resizable if maximize is None else bool(maximize) and self._resizable)
+        centered = backend.centerOverOwner(self.tag)
+        self._native_center_prepared = bool(centered)
+        return bool(resized and caption and centered)
+
+    def _recover_native_owner_presentation(self):
+        """Use the same owner-presentation policy for every native dialog."""
+        backend = self._native_window_backend
+        if backend is None:
+            return
+        try:
+            backend.preserveOwnerPresentation(
+                self._native_main_owner_hwnd(), int(backend.winId(self.tag) or 0))
+        except (AttributeError, OSError, ValueError):
+            pass
+
+    def _native_first_present_ready(self):
+        self._native_presentation_pending = False
+        if not self.winfo_exists() or not self.isVisible():
+            return
+        self._prepare_native_first_click_once()
+        self._activate_native_modal_once()
+        # Establish the dialog's final native activation/Z-order before doing
+        # any owner repair. The provisional pre-activation order is not a
+        # reason to move or repaint the already-presented main window.
+        self._recover_native_owner_presentation()
+        self._apply_initial_focus_if_idle()
 
     def raise_(self):
         """Qt-style raise/activate facade for a native-immediate-mode window."""
@@ -1002,6 +1260,7 @@ class QtDialog(DialogBase, QObject):
     setFocus = activateWindow
 
     def hide(self):
+        self._native_show_wait_token = None
         if self.isConstructing():
             # A hide/close request before the queued first show must cancel that
             # visibility lease; otherwise the deferred callback could resurrect
@@ -1037,6 +1296,11 @@ class QtDialog(DialogBase, QObject):
             # Qt releases QWidget mouse grabs as the top-level is deactivated.
             release_pointer_input()
         dpg.hide_item(self.tag)
+        from ..backends.native_presentation import presentation_for
+        presentation = presentation_for(get_backend())
+        if presentation is not None:
+            presentation.cancel(self.tag)
+        self._native_presentation_pending = False
         self._visible_state = False
         self._sync_owned_widget_visibility()
         unregister_escape_target(self.tag)
@@ -1096,6 +1360,14 @@ class QtDialog(DialogBase, QObject):
         if key == getattr(dpg, "mvKey_Escape", None):
             self.reject()
             return True
+        if key in tuple(value for value in (
+                getattr(dpg, "mvKey_Spacebar", None), getattr(dpg, "mvKey_Space", None))
+                if value is not None):
+            focused = dpg.get_focused_item()
+            button = self._control_wrappers.get(focused)
+            if isinstance(button, QPushButton) and button.isEnabled():
+                button.click()
+                return True
         if key in tuple(value for value in (
                 getattr(dpg, "mvKey_Return", None),
                 getattr(dpg, "mvKey_Enter", None),
@@ -1164,9 +1436,16 @@ class QtDialog(DialogBase, QObject):
             return self._native_window_backend.containsGlobalPoint(self.tag, (x, y))
         if not self.isActiveWindow():
             return False
-        left, top = dpg.get_item_rect_min(self.tag)
-        width, height = dpg.get_item_rect_size(self.tag)
-        return left <= x < left + width and top <= y < top + height
+        # DPG 2.x window/primary-window states can omit rect_min. The application
+        # input bridge then silently skips this dialog, while QPushButton's
+        # native callback is intentionally suppressed to prevent double clicks.
+        # Reconstruct window bounds just as QWidget.globalGeometry() does.
+        from ..backends.dearpygui_scroller import dpg_window_rect
+        bounds = dpg_window_rect(dpg, self.tag, clip=False)
+        if bounds is None:
+            return False
+        left, top, right, bottom = bounds
+        return left <= x < right and top <= y < bottom
 
     def _button_contains_global_point(self, button, point):
         if (button._deleted or not self.isVisible()
@@ -1467,7 +1746,8 @@ class QtDialog(DialogBase, QObject):
     def action_width(label):
         return max(DialogMetrics.BUTTON_WIDTH, len(label) * 7 + 16)
 
-    def button_box(self, actions, left_actions=(), status_item=None, status_left_padding=0, button_gap=None):
+    def button_box(self, actions, left_actions=(), status_item=None, status_left_padding=0, button_gap=None,
+                   status_above_buttons=False):
         """QDialogButtonBox-like layout with auxiliary actions on the left.
 
         The old footer placed status text and auxiliary buttons in the same
@@ -1490,6 +1770,17 @@ class QtDialog(DialogBase, QObject):
         self._footer_left_width = left_width
         self._footer_right_width = right_width
         self._footer_status = status_item
+        self._footer_status_above = bool(status_above_buttons and status_item is not None)
+        if self._footer_status_above:
+            # A dedicated full-width row keeps multi-line feedback away from
+            # auxiliary actions and preserves the buttons' shared baseline.
+            self._footer_status_host = dpg.add_child_window(
+                parent=self.footer, width=-1, height=32, border=False,
+                no_scrollbar=True, no_scroll_with_mouse=True,
+                show=bool(dpg.get_value(status_item)))
+            dpg.bind_item_theme(self._footer_status_host, transparent_header_cell_theme(dpg))
+            dpg.move_item(status_item, parent=self._footer_status_host)
+            status_item = None
         minimum_width = max(
             DialogMetrics.MIN_DIALOG_WIDTH,
             left_width + right_width + (160 if status_item is not None else 40) + 32,
@@ -2774,6 +3065,7 @@ class QtDialog(DialogBase, QObject):
             return
         if self._destroy_scheduled:
             return
+        self._native_show_wait_token = None
         try:
             from ..core.application import QApplication
             application = QApplication.instance()

@@ -11,7 +11,7 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
 
-from ..resources import apply_tk_app_icon
+from ..platform.resources import apply_tk_app_icon
 from DearUIQt.gui import QtFusionPalette, QtFusionMetrics, color_hex
 from DearUIQt.interop import (
     QNativeScrollerMetrics, configure_ttk_scroller_styles, make_ttk_scroller,

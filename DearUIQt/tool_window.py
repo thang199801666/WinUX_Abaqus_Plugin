@@ -14,14 +14,14 @@ class ToolWindow(QtDialog):
 
     Embedded tools retain the normal ``QtDialog`` lifecycle.  Detached
     tools running in their own DearPyGui context use a standalone lifecycle
-    that deliberately does *not* enter the shared modal/input registry.  This is
-    essential: that registry exists to block click-through into a host application
-    viewport and must never gate the only window in an independent process.
+    that deliberately does *not* enter the shared modal registry. Modeless
+    pointer registration still delivers QPushButton events without blocking
+    the only window in an independent process.
     """
 
-    def __init__(self, view, title, width=900, height=640, *, footer=True):
+    def __init__(self, view, title, width=900, height=640, *, footer=True, native=None):
         self._standalone_surface = bool(getattr(view, "is_standalone_ui_host", False))
-        super().__init__(view, title, width, height, modal=False, footer=footer)
+        super().__init__(view, title, width, height, modal=False, footer=footer, native=native)
 
     def show(self):
         if not getattr(self, "_standalone_surface", False):
@@ -41,6 +41,18 @@ class ToolWindow(QtDialog):
         if not already_visible:
             dpg.show_item(self.tag)
             self.sendEvent(QEvent(QEvent.Show))
+        self._visible_state = True
+        self._sync_owned_widget_visibility()
+        # Standalone tools must stay out of the *modal* registry, but still
+        # participate in QApplication's modeless pointer routing. Otherwise
+        # dialog QPushButtons suppress native callbacks with no Qt receiver to
+        # deliver the click (e.g. Plot Digitizer's Extract Points button).
+        from .core.application import QApplication
+        application = QApplication.instance()
+        if application is not None:
+            application._set_active_window(self)
+            application._set_focus_widget(self)
+            application.registerPointerTarget(self)
         try:
             dpg.focus_item(self.tag)
         except Exception:
@@ -80,6 +92,13 @@ class ToolWindow(QtDialog):
         except Exception:
             pass
         dpg.hide_item(self.tag)
+        self._visible_state = False
+        self._sync_owned_widget_visibility()
+        from .core.application import QApplication
+        application = QApplication.instance()
+        if application is not None:
+            application.unregisterPointerTarget(self)
+            application._widget_hidden(self)
         unregister_escape_target(self.tag)
         self.sendEvent(QEvent(QEvent.Hide))
         return True

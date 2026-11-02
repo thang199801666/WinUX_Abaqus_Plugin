@@ -1,4 +1,3 @@
-"""Public local-folder dialog on the shared DearUIQt event loop."""
-from .inprocess_adapters import LocalFolderDialog
-
-__all__ = ["LocalFolderDialog"]
+"""Compatibility alias. Canonical implementation: :mod:`WinUx.dialogs.selectors.local_folder_dialog`."""
+from .._compat import alias_module
+alias_module(__name__, "WinUx.dialogs.selectors.local_folder_dialog")

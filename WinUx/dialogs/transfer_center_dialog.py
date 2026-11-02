@@ -1,4 +1,3 @@
-"""Public Transfer Center API on the shared DearUIQt event loop."""
-from .inprocess_adapters import TransferCenterDialog, TransferTaskHandle, _TransferItemRow
-
-__all__ = ["TransferCenterDialog", "TransferTaskHandle", "_TransferItemRow"]
+"""Compatibility alias. Canonical implementation: :mod:`WinUx.dialogs.transfer.transfer_center_dialog`."""
+from .._compat import alias_module
+alias_module(__name__, "WinUx.dialogs.transfer.transfer_center_dialog")

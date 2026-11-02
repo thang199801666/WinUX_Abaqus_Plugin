@@ -97,6 +97,8 @@ class QAbstractScrollArea(QWidget):
         self._viewport_margins = QMargins()
         self._horizontal_scrollbar = _ScrollBarController(self, Qt.Horizontal)
         self._vertical_scrollbar = _ScrollBarController(self, Qt.Vertical)
+        from ..backends.shared_scrollers import register_scroll_surface
+        register_scroll_surface(backend, tag)
 
     @staticmethod
     def _normalize_policy(policy):

@@ -2,7 +2,7 @@
 
 import os
 
-from .application import run
+from .bootstrap.application import run
 
 
 if __name__ == "__main__":

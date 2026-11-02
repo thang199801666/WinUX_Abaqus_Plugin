@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..sync_preview_form import SyncPreviewDialog as SyncPreviewForm
+from ..transfer.sync_preview_form import SyncPreviewDialog as SyncPreviewForm
 from .common import RetainedTool
 
 

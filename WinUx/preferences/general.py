@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .storage import JsonPreferenceStore
+from ..services.file_color_rules import load_color_rules, normalize_color_rules
 
 
 class GeneralPreferences:
@@ -11,6 +12,8 @@ class GeneralPreferences:
     DEFAULT_AUTO_LOGIN = False
     DEFAULT_CONSOLE_VISIBLE = False
     DEFAULT_SHOW_HIDDEN_FILES = False
+    DEFAULT_FILE_COLORS = True
+    DEFAULT_PRESERVE_FILE_TIMESTAMPS = True
 
     def __init__(self, root=None):
         self._store = JsonPreferenceStore("settings.json", root=root)
@@ -28,16 +31,26 @@ class GeneralPreferences:
             "show_hidden_files": bool(
                 data.get("show_hidden_files", self.DEFAULT_SHOW_HIDDEN_FILES)
             ),
+            "file_colors": bool(data.get("file_colors", self.DEFAULT_FILE_COLORS)),
+            "file_color_rules": load_color_rules(data.get("file_color_rules")),
+            "preserve_file_timestamps": bool(data.get('preserve_file_timestamps', self.DEFAULT_PRESERVE_FILE_TIMESTAMPS)),
         }
 
     def load_auto_login(self):
         return bool(self.load()["auto_login"])
 
-    def save(self, *, auto_login, show_hidden_files=None):
+    def save(self, *, auto_login, show_hidden_files=None, file_colors=None, file_color_rules=None,
+             preserve_file_timestamps=None):
         data = self._store.load()
         data["auto_login"] = bool(auto_login)
         if show_hidden_files is not None:
             data["show_hidden_files"] = bool(show_hidden_files)
+        if file_colors is not None:
+            data["file_colors"] = bool(file_colors)
+        if file_color_rules is not None:
+            data["file_color_rules"] = normalize_color_rules(file_color_rules)
+        if preserve_file_timestamps is not None:
+            data['preserve_file_timestamps'] = bool(preserve_file_timestamps)
         self._store.save(data)
 
     def save_auto_login(self, enabled):
@@ -58,3 +71,17 @@ class GeneralPreferences:
         data = self._store.load()
         data["console_visible"] = bool(visible)
         self._store.save(data)
+    def load_dock_state(self):
+        """Return the last persisted QMainWindow-like dock layout state."""
+        data = self._store.load()
+        state = data.get("dock_state", {})
+        return dict(state) if isinstance(state, dict) else {}
+
+    def save_dock_state(self, state):
+        """Persist dock placement without disturbing other general settings."""
+        if not isinstance(state, dict):
+            raise TypeError("dock state must be a dictionary")
+        data = self._store.load()
+        data["dock_state"] = dict(state)
+        self._store.save(data)
+        return True

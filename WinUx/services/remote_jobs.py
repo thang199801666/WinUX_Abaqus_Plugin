@@ -46,7 +46,7 @@ class RemoteJobsMixin:
         return output or error
 
     @_serialized_wire_call
-    def run_interactive_command(self, command, marker, timeout=30):
+    def run_interactive_command(self, command, marker, timeout=30, *, show_echo=True):
         """Run a command through an interactive SSH shell and await its marker."""
         if not self.client:
             raise RuntimeError("Not connected to an SSH server")
@@ -55,8 +55,18 @@ class RemoteJobsMixin:
         with self._shell_condition:
             start = self._shell_output.cursor()
         deadline = time.monotonic() + timeout
-        completion_pattern = re.compile(re.escape(marker) + r":\d+")
-        self.send_shell_command(command)
+        # Wait for the line ending: a recv boundary may split the PID digits.
+        completion_pattern = re.compile(re.escape(marker) + r":\d+(?=[\r\n])")
+        try:
+            return self._wait_interactive_command(
+                command, start, deadline, completion_pattern, show_echo)
+        finally:
+            if not show_echo:
+                self._finish_submission_echo(command)
+
+    def _wait_interactive_command(self, command, start, deadline,
+                                  completion_pattern, show_echo):
+        self.send_shell_command(command, show_echo=show_echo)
         with self._shell_condition:
             while time.monotonic() < deadline:
                 response = self._shell_output.read_since(start)
@@ -66,6 +76,12 @@ class RemoteJobsMixin:
                     break
                 self._shell_condition.wait(min(0.2, deadline - time.monotonic()))
             response = self._shell_output.read_since(start).strip()
+        if not show_echo:
+            # Errors must not reintroduce the private command/UUID through a
+            # dialog or a submission-failed console message.
+            # Real remote errors already pass through the visible transcript;
+            # raw excerpts may contain incomplete/wrapped command echoes.
+            response = ""
         raise RuntimeError(
             "Interactive command did not complete{}".format(
                 ": {}".format(response[-500:]) if response else ""))
@@ -113,11 +129,32 @@ class RemoteJobsMixin:
             preparation,
             " ".join(self._shell_quote(value) for value in arguments),
             self._shell_quote(".winux_{}.log".format(job_name)), marker)
-        output = self.run_interactive_command(command, marker)
+        self.append_console_message(
+            "[WinUx] Submitting Abaqus job: {}\n"
+            "  Input: {}\n  Command: {} | CPUs: {} | Precision: {}\n"
+            "  Overwrite: {}\n  Log: {}".format(
+                job_name, path, executable, cpus,
+                "double" if str(precision).casefold() == "double" else "single",
+                "yes" if overwrite else "no",
+                path.parent / (".winux_{}.log".format(job_name))),
+            replace_prompt=True, restore_prompt=False)
+        try:
+            output = self.run_interactive_command(command, marker, show_echo=False)
+        except Exception as exc:
+            self.append_console_message(
+                "[WinUx] Submission not confirmed: {}\n  {}\n"
+                "  Check the log/server before retrying.".format(job_name, exc),
+                replace_prompt=True)
+            raise
         match = re.search(re.escape(marker) + r":(\d+)", output)
         if not match:
             raise RuntimeError("Interactive shell did not return the job process ID")
         process_id = match.group(1)
+        self.append_console_message(
+            "[WinUx] Launcher started: {} (PID {})\n"
+            "  Analysis/scheduler status: not yet confirmed\n"
+            "  Check Jobs and the log".format(job_name, process_id),
+            replace_prompt=True)
         return "{} ({})".format(job_name, process_id or "started")
 
     @_serialized_wire_call
@@ -229,26 +266,61 @@ class RemoteJobsMixin:
                 "Job {} belongs to {}, but the current SSH user is {}.".format(
                     self.numeric_job_id(job_id), owner, current_username))
         lookup_owner = owner or current_username
-        temp_folder = self._find_job_temp_folder_by_id(
-            job_id, lookup_owner, current_username, current_hostname)
-        first_path = self._find_job_status_file(temp_folder, name) if temp_folder else ""
-        if not first_path and name:
-            first_path = self._find_job_file(
-                job_id, name, ".sta", lookup_owner, current_username, current_hostname)
+        first_path = self._find_job_status_file_fast(
+            job_id, name, lookup_owner, current_username, current_hostname)
         if not first_path:
-            return "No progress information found in the job file."
+            return "Job has not started yet (.sta file not found)."
 
-        file_content = self.run_command(
-            "cat {}".format(self._shell_quote(first_path)))
+        # Read the status and server clock together instead of paying another
+        # SSH round trip for running-job elapsed time.
+        clock_marker = "__WINUX_STATUS_CHECK_TIME__="
+        response = self.run_command(
+            "cat {} && {{ printf '\\n__WINUX_STATUS_CHECK_TIME__='; "
+            "date '+%d-%b-%Y %H:%M:%S' || true; }}".format(self._shell_quote(first_path)))
+        file_content, separator, checked_at = response.rpartition(clock_marker)
+        if not separator:
+            file_content, checked_at = response, ""
         status = self._parse_abaqus_status(file_content)
         if status.get("state") in {"running", "starting", "preprocessing"}:
-            try:
-                checked_at = self.run_command(
-                    "date '+%d-%b-%Y %H:%M:%S'").strip()
-            except Exception:
-                checked_at = ""
-            self._apply_check_time_runtime(status, checked_at)
+            self._apply_check_time_runtime(status, checked_at.strip())
         return self._format_abaqus_status(status)
+
+    def _find_job_status_file_fast(self, job_id, job_name, job_owner,
+                                   current_username, current_hostname):
+        """One bounded Temp lookup; never recursively scan the user's home.
+
+        Only recurse for status files below candidate scheduler directories.
+        Validate their exact ID and live host before accepting any result.
+        """
+        numeric_id = self.numeric_job_id(job_id)
+        roots = self._job_temp_search_roots(job_owner, current_username)
+        predicates = " -o ".join(
+            "-name {}".format(self._shell_quote(pattern)) for pattern in
+            (numeric_id, numeric_id + ".*", numeric_id + "_*", numeric_id + "-*"))
+        command = (
+            "for _winux_root in {}; do "
+            "[ -d \"$_winux_root\" ] || continue; "
+            "find \"$_winux_root\" -mindepth 1 -maxdepth 2 -type d "
+            "\\( {} \\) -exec find {{}} -type f -name '*.sta' "
+            "-printf '%T@\\t%p\\n' \\; 2>/dev/null; done; true"
+        ).format(" ".join(self._shell_quote(root) for root in roots), predicates)
+        candidates = []
+        for line in self.run_command(command).splitlines():
+            stamp, separator, path = line.partition("\t")
+            if not separator:
+                continue
+            try:
+                modified = float(stamp)
+            except ValueError:
+                continue
+            parts = PurePosixPath(path).parts
+            if (not path.endswith(".sta") or not any(
+                    self._component_matches_job_identity(part, numeric_id, current_hostname)
+                    for part in parts[:-1])):
+                continue
+            exact = PurePosixPath(path).name == str(job_name).strip() + ".sta"
+            candidates.append((exact, modified, path))
+        return max(candidates)[2] if candidates else ""
 
     def _find_job_status_file(self, folder, job_name):
         """Return the most appropriate ``.sta`` file in one scheduler folder.

@@ -133,42 +133,56 @@ def make_ttk_scroller(
     return ttk_module.Scrollbar(parent, **kwargs)
 
 
-def dpg_window_rect(dpg, item, *, clip=False):
+def dpg_window_rect(dpg, item, *, clip=False, node_cache=None):
     """Reconstruct window bounds without content padding or scroll offsets.
 
     DPG 2.x window states omit rect_min. Their pos is relative to the nearest
     parent window, whereas a drawlist's rect_min starts inside window padding.
+    ``node_cache`` may reuse native ancestor reads within one synchronous
+    geometry pass only; callers must not retain it across frames or events.
     """
     try:
-        info = dpg.get_item_info(item)
         window_types = ("mvChildWindow", "mvWindowAppItem", "mvWindowApp")
-        if info["type"].split("::")[-1] not in window_types:
+        chain = []
+        current = item
+        while current:
+            cached = node_cache.get(current) if node_cache is not None else None
+            if cached is None:
+                info = dpg.get_item_info(current)
+                state = (dpg.get_item_state(current)
+                         if info['type'].split('::')[-1] in window_types else None)
+                parent = info.get('parent') if 'parent' in info else dpg.get_item_parent(current)
+                if node_cache is not None:
+                    node_cache[current] = (info, state, parent)
+            else:
+                info, state, parent = cached
+            if info['type'].split('::')[-1] in window_types:
+                chain.append((tuple(map(float, state['pos'])), state.get('rect_size')))
+            elif current == item:
+                return None
+            current = parent
+        if not chain:
             return None
-        state = dpg.get_item_state(item)
-        x, y = map(float, state["pos"])
-        width, height = map(float, state["rect_size"])
-        parent = dpg.get_item_parent(item)
-        while parent:
-            parent_info = dpg.get_item_info(parent)
-            kind = parent_info["type"].split("::")[-1]
-            if kind in window_types:
-                px, py = map(float, dpg.get_item_state(parent)["pos"])
-                x += px
-                y += py
-            parent = dpg.get_item_parent(parent)
-        if width > 0.0 and height > 0.0:
-            rect = (x, y, x+width, y+height)
-            if clip:
-                parent = dpg.get_item_parent(item)
-                while parent:
-                    bounds = dpg_window_rect(dpg, parent)
-                    if bounds is not None:
-                        rect = (max(rect[0], bounds[0]), max(rect[1], bounds[1]),
-                                min(rect[2], bounds[2]), min(rect[3], bounds[3]))
-                    parent = dpg.get_item_parent(parent)
-                if rect[2] <= rect[0] or rect[3] <= rect[1]:
-                    return None
-            return rect
+        # Resolve absolute bounds once, root -> leaf. The former clip path
+        # recursively re-walked every ancestor (quadratic native queries).
+        x = y = 0.0
+        bounds = []
+        for position, size in reversed(chain):
+            x += position[0]
+            y += position[1]
+            if size and size[0] > 0 and size[1] > 0:
+                bounds.append((x, y, x + float(size[0]), y + float(size[1])))
+            else:
+                bounds.append(None)
+        rect = bounds[-1]
+        if rect is not None and clip:
+            for parent in bounds[:-1]:
+                if parent is not None:
+                    rect = (max(rect[0], parent[0]), max(rect[1], parent[1]),
+                            min(rect[2], parent[2]), min(rect[3], parent[3]))
+            if rect[2] <= rect[0] or rect[3] <= rect[1]:
+                return None
+        return rect
     except (KeyError, TypeError, ValueError, RuntimeError, AttributeError):
         pass
     return None
@@ -220,7 +234,34 @@ class DpgScrollerArrowOverlay:
         self._captured = False
         self._active_hits = set()
         self._destroyed = False
+        self._chrome_config = {}
+        self._geometry_cache = None
+        self._geometry_nodes = None
         self._ensure_items()
+
+    def _configure_chrome(self, tag, **options):
+        """Only mutate changed properties of this scroller's private items.
+
+        Content/widgets and input ownership are never cached here. Commit the
+        snapshot only after the backend accepts it so failures can be retried.
+        """
+        previous = self._chrome_config.get(tag, {})
+        changed = {key: value for key, value in options.items()
+                   if key not in previous or previous[key] != value}
+        if changed:
+            self.dpg.configure_item(tag, **changed)
+            self._chrome_config.setdefault(tag, {}).update(changed)
+
+    def _window_rect(self, item, *, clip=False):
+        """Reuse geometry only within one update, never across event turns."""
+        cache = self._geometry_cache
+        if cache is None:
+            return dpg_window_rect(self.dpg, item, clip=clip)
+        key = (item, clip)
+        if key not in cache:
+            cache[key] = dpg_window_rect(
+                self.dpg, item, clip=clip, node_cache=self._geometry_nodes)
+        return cache[key]
 
     def _gate(self):
         if self._interaction_gate is None:
@@ -275,14 +316,15 @@ class DpgScrollerArrowOverlay:
         for axis, tag in self._hits.items():
             data = axes.get(axis)
             if data is None:
-                self.dpg.configure_item(tag, show=False)
+                self._configure_chrome(tag, show=False)
                 continue
             x0, y0, x1, y1 = data["hit"]
             ox, oy = self._origin
-            self.dpg.configure_item(tag, pos=(x0-ox, y0-oy),
+            self._configure_chrome(tag, pos=(x0-ox, y0-oy),
                                     width=max(1, round(x1-x0)), height=max(1, round(y1-y0)), show=True)
 
     def _ensure_items(self):
+        self._chrome_config.clear()
         dpg = self.dpg
         try:
             if not dpg.does_item_exist(self.container):
@@ -335,6 +377,18 @@ class DpgScrollerArrowOverlay:
                         thickness=1.0, rounding=rounding, show=False, tag=tag)
                 else:
                     self._parts[key] = tag
+                if key in ("v_thumb", "h_thumb"):
+                    # Explicit circular caps avoid renderer-specific rounded-
+                    # rectangle corner flags leaving long thumbs square-ended.
+                    for end in ("start", "end"):
+                        cap_key = key + "_" + end
+                        cap_tag = self.tag + "_" + cap_key
+                        if not dpg.does_item_exist(cap_tag):
+                            dpg.draw_circle(
+                                (0, 0), 1, parent=self.layer, tag=cap_tag,
+                                color=(0, 0, 0, 0), fill=SharedScrollerPalette.THUMB,
+                                thickness=0, segments=24, show=False)
+                        self._parts[cap_key] = cap_tag
             # End buttons must be drawn after masks/tracks, otherwise the
             # opaque native-chrome mask covers their arrow glyphs.
             for key in ("up", "down", "left", "right"):
@@ -434,7 +488,6 @@ class DpgScrollerArrowOverlay:
 
 
     def _set_cap(self, key, rect, points, show=True, *, hovered=False, rounding=None):
-        dpg = self.dpg
         rect_tag = self._rects.get(key)
         arrow_tag = self._arrows.get(key)
         if not rect_tag or not arrow_tag:
@@ -450,11 +503,11 @@ class DpgScrollerArrowOverlay:
                 color=p.END_CAP_BORDER)
             if rounding is not None:
                 kwargs["rounding"] = float(rounding)
-            dpg.configure_item(rect_tag, **kwargs)
+            self._configure_chrome(rect_tag, **kwargs)
             snapped = {}
             for name, point in zip(("p1", "p2", "p3"), points):
                 snapped[name] = (int(round(point[0]-ox)), int(round(point[1]-oy)))
-            dpg.configure_item(
+            self._configure_chrome(
                 arrow_tag, **snapped,
                 color=p.ARROW, fill=p.ARROW, show=show)
         except Exception:
@@ -468,6 +521,18 @@ class DpgScrollerArrowOverlay:
             x0, y0, x1, y1 = rect
             ox, oy = self._origin
             sx0, sy0, sx1, sy1 = self._snap_rect((x0, y0, x1, y1), (ox, oy))
+            if key in ("v_thumb", "h_thumb"):
+                middle, centers, radius = self._capsule_geometry(
+                    (sx0, sy0, sx1, sy1), vertical=key == "v_thumb")
+                thumb_color = fill if fill is not None else SharedScrollerPalette.THUMB
+                self._configure_chrome(
+                    tag, pmin=middle[:2], pmax=middle[2:], show=show,
+                    fill=thumb_color, color=(0, 0, 0, 0), rounding=0)
+                for end, center in zip(("start", "end"), centers):
+                    self._configure_chrome(
+                        self._parts[key + "_" + end], center=center,
+                        radius=radius, fill=thumb_color, show=show)
+                return
             kwargs = dict(pmin=(sx0, sy0), pmax=(sx1, sy1), show=show)
             if fill is not None:
                 kwargs["fill"] = fill
@@ -475,9 +540,21 @@ class DpgScrollerArrowOverlay:
                 kwargs["color"] = color
             if rounding is not None:
                 kwargs["rounding"] = float(rounding)
-            self.dpg.configure_item(tag, **kwargs)
+            self._configure_chrome(tag, **kwargs)
         except Exception:
             pass
+
+    @staticmethod
+    def _capsule_geometry(rect, *, vertical=True):
+        x0, y0, x1, y1 = map(float, rect)
+        radius = max(0.0, min(x1 - x0, y1 - y0) * 0.5)
+        if vertical:
+            center = (x0 + x1) * 0.5
+            return ((x0, y0 + radius, x1, y1 - radius),
+                    ((center, y0 + radius), (center, y1 - radius)), radius)
+        center = (y0 + y1) * 0.5
+        return ((x0 + radius, y0, x1 - radius, y1),
+                ((x0 + radius, center), (x1 - radius, center)), radius)
 
     def hide(self):
         self._end_gesture()
@@ -488,7 +565,7 @@ class DpgScrollerArrowOverlay:
         for tag in list(self._parts.values()) + list(self._rects.values()) + list(self._arrows.values()) + list(self._hits.values()):
             try:
                 if tag and dpg.does_item_exist(tag):
-                    dpg.configure_item(tag, show=False)
+                    self._configure_chrome(tag, show=False)
             except Exception:
                 pass
 
@@ -527,7 +604,7 @@ class DpgScrollerArrowOverlay:
 
     def _target_rect(self):
         dpg = self.dpg
-        rect = dpg_window_rect(dpg, self.container, clip=True)
+        rect = self._window_rect(self.container, clip=True)
         if rect is not None:
             return rect
         provider = self.rect_provider
@@ -541,10 +618,10 @@ class DpgScrollerArrowOverlay:
             except Exception:
                 pass
 
-        rect = dpg_window_rect(dpg, self.target_item, clip=True)
+        rect = self._window_rect(self.target_item, clip=True)
         if rect is not None:
             return rect
-        if dpg_window_rect(dpg, self.target_item) is not None:
+        if self._window_rect(self.target_item) is not None:
             return None
 
         # Fast path used by drawing items and DPG builds that expose child
@@ -758,6 +835,15 @@ class DpgScrollerArrowOverlay:
         self._last_axes = axes
 
     def update(self):
+        self._geometry_cache = {}
+        self._geometry_nodes = {}
+        try:
+            self._update()
+        finally:
+            self._geometry_cache = None
+            self._geometry_nodes = None
+
+    def _update(self):
         if self._destroyed:
             return
         dpg = self.dpg
@@ -780,7 +866,7 @@ class DpgScrollerArrowOverlay:
             cur_x = float(dpg.get_x_scroll(self.target_item)) if self.horizontal else 0.0
             viewport_size = None
             if self._content_extent is not None:
-                viewport_rect = dpg_window_rect(dpg, self.target_item, clip=True)
+                viewport_rect = self._window_rect(self.target_item, clip=True)
                 if viewport_rect is not None:
                     viewport_size = (viewport_rect[2]-viewport_rect[0], viewport_rect[3]-viewport_rect[1])
                 else:
@@ -793,9 +879,9 @@ class DpgScrollerArrowOverlay:
         except Exception:
             self.hide(); return
 
-        origin = dpg_window_rect(dpg, self.container)
+        origin = self._window_rect(self.container)
         self._origin = (origin[0], origin[1]) if origin is not None else (x0, y0)
-        dpg.configure_item(self.layer, width=max(1, int(width)), height=max(1, int(height)))
+        self._configure_chrome(self.layer, width=max(1, int(width)), height=max(1, int(height)))
 
         m = SharedScrollerMetrics
         p = SharedScrollerPalette
@@ -803,15 +889,6 @@ class DpgScrollerArrowOverlay:
         has_v = self.vertical and max_y > 0.0
         has_h = self.horizontal and max_x > 0.0
         pointer = self._pointer()
-        foreground_blocked = self._foreground_input_blocked()
-        visual_pointer = None if foreground_blocked else pointer
-        if foreground_blocked:
-            # Occlusion is a z-order state, not an animation target.  Clear
-            # hover/active chrome immediately instead of leaving a short fade
-            # visible through the foreground dialog.
-            self._end_gesture()
-            self._expansion["v"] = 0.0
-            self._expansion["h"] = 0.0
 
         # Animate only the chrome inside a fixed native gutter.
         now = time.monotonic()
@@ -821,7 +898,7 @@ class DpgScrollerArrowOverlay:
         # Resolve the *actual* reserved lane from the scrolling child's visible
         # geometry. DPG may add spacing around a width=-THICKNESS child; using
         # x1-THICKNESS blindly is what made the idle thumb appear right-biased.
-        content_rect = dpg_window_rect(dpg, self.target_item, clip=True)
+        content_rect = self._window_rect(self.target_item, clip=True)
         content_right = content_rect[2] if content_rect is not None else None
         content_bottom = content_rect[3] if content_rect is not None else None
         v_lane_x0, v_lane_x1 = self._resolve_lane(x0, x1, content_right, native_t)
@@ -834,6 +911,20 @@ class DpgScrollerArrowOverlay:
         h_bound_x1 = v_lane_x0 if has_v else x1
         v_hover_rect = (v_lane_x0, y0, v_lane_x1, v_bound_y1)
         h_hover_rect = (x0, h_lane_y0, h_bound_x1, h_lane_y1)
+        # A collapsed, uncaptured scrollbar away from the pointer has no hover
+        # or press to arbitrate. Do not scan every foreground surface for each
+        # unrelated scrollbar on every frame. Active/fading chrome must still
+        # check live occlusion so a popup immediately cancels its feedback.
+        needs_gate = (self._gesture is not None or self._captured or
+                      any(value > 0.0 for value in self._expansion.values()) or
+                      (has_v and self._inside(pointer, v_hover_rect, m.HOVER_MARGIN)) or
+                      (has_h and self._inside(pointer, h_hover_rect, m.HOVER_MARGIN)))
+        foreground_blocked = bool(needs_gate and self._foreground_input_blocked())
+        visual_pointer = None if foreground_blocked else pointer
+        if foreground_blocked:
+            self._end_gesture()
+            self._expansion["v"] = 0.0
+            self._expansion["h"] = 0.0
         v_hover = has_v and self._inside(visual_pointer, v_hover_rect, m.HOVER_MARGIN)
         h_hover = has_h and self._inside(visual_pointer, h_hover_rect, m.HOVER_MARGIN)
         for axis, hovered in (("v", v_hover), ("h", h_hover)):
@@ -898,7 +989,7 @@ class DpgScrollerArrowOverlay:
                 travel = max(0.0, available - thumb_len)
                 ratio = 0.0 if max_y <= 0.0 else max(0.0, min(1.0, cur_y / max_y))
                 thumb0 = track0 + travel * ratio
-                inset = 1.5
+                inset = 0.5 + self._expansion["v"]
                 thumb_fill = p.THUMB_HOVER if v_hover else p.THUMB
                 if self._gesture is not None and self._gesture["axis"] == "v":
                     thumb_fill = p.THUMB_ACTIVE
@@ -953,7 +1044,7 @@ class DpgScrollerArrowOverlay:
                 travel = max(0.0, available - thumb_len)
                 ratio = 0.0 if max_x <= 0.0 else max(0.0, min(1.0, cur_x / max_x))
                 thumb0 = track0 + travel * ratio
-                inset = 1.5
+                inset = 0.5 + self._expansion["h"]
                 thumb_fill = p.THUMB_HOVER if h_hover else p.THUMB
                 if self._gesture is not None and self._gesture["axis"] == "h":
                     thumb_fill = p.THUMB_ACTIVE
@@ -1008,6 +1099,7 @@ class DpgScrollerArrowOverlay:
         self._rects.clear()
         self._arrows.clear()
         self._hits.clear()
+        self._chrome_config.clear()
 
 
 class QScroller(DpgScrollerArrowOverlay):

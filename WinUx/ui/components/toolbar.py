@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import os
 
-from ...resources import RESOURCE_DIR, icon_path
+from ...platform.resources import RESOURCE_DIR, icon_path
 from DearUIQt.tooltip import add_styled_tooltip, reset_tooltip_runtime_resources
 from DearUIQt.gui import QtFusionMetrics, QtFusionPalette
 from DearUIQt.widgets import QMenu, QLineEdit, QPushButton, QToolButton, QFrame, QSpacer, QImageView, QRetainedItem
@@ -21,6 +21,7 @@ from DearUIQt.themes import (
 from DearUIQt.input_gate import register_pointer_protected_item
 from DearUIQt.gui import QFontDatabase, QTextureRegistry
 from DearUIQt import QGuiRuntime
+from DearUIQt.core import QDebouncer
 
 _TOOLBAR_ICON_THEME = None
 _PLOT_PANEL_ICON_THEME = None
@@ -63,23 +64,17 @@ def _owned_theme(native, *, owns=False):
     return QTheme(theme_id=native, owns=owns)
 
 def path_button_font():
-    """Return the normal Windows UI font used by Qt-style path fields.
-
-    Earlier builds used a 16 px bold face, which made the path selector read
-    like a toolbar heading.  A QLineEdit/QComboBox path field uses the normal
-    application font, so prefer Segoe UI regular at 14 px and retain bold
-    fonts only as a compatibility fallback on stripped Windows images.
-    """
+    """Return the bold Windows UI font used by the two path buttons."""
     global _PATH_BUTTON_FONT, _PATH_FONT_DB
     if _PATH_BUTTON_FONT is not None and _PATH_BUTTON_FONT.exists():
         return _PATH_BUTTON_FONT
 
     windir = Path(os.environ.get("WINDIR", r"C:\\Windows"))
     candidates = (
+        windir / "Fonts" / "segoeuib.ttf",   # Segoe UI Bold
+        windir / "Fonts" / "seguisb.ttf",    # Segoe UI Semibold fallback
+        windir / "Fonts" / "arialbd.ttf",    # Arial Bold fallback
         windir / "Fonts" / "segoeui.ttf",
-        windir / "Fonts" / "segoeuib.ttf",
-        windir / "Fonts" / "seguisb.ttf",
-        windir / "Fonts" / "arial.ttf",
     )
     try:
         font_path = next((path for path in candidates if path.is_file()), None)
@@ -119,7 +114,7 @@ def search_popup_theme():
             ThemeColor.BORDER: p.BORDER, ThemeColor.BORDER_SHADOW: p.SHADOW,
         },
         styles={
-            ThemeStyle.WINDOW_PADDING: (6, 3), ThemeStyle.WINDOW_ROUNDING: 0,
+            ThemeStyle.WINDOW_PADDING: (2, 4), ThemeStyle.WINDOW_ROUNDING: 0,
             ThemeStyle.CHILD_ROUNDING: 0, ThemeStyle.WINDOW_BORDER_SIZE: 0,
             ThemeStyle.CHILD_BORDER_SIZE: 0, ThemeStyle.ITEM_SPACING: (5, 0),
         },
@@ -159,7 +154,7 @@ def search_shell_theme():
             ThemeTarget.CHILD_WINDOW,
             colors={ThemeColor.CHILD_BACKGROUND: p.BASE, ThemeColor.BORDER: p.BORDER},
             styles={
-                ThemeStyle.WINDOW_PADDING: (4, 1), ThemeStyle.ITEM_SPACING: (0, 0),
+                ThemeStyle.WINDOW_PADDING: (6, 1), ThemeStyle.ITEM_SPACING: (0, 0),
                 ThemeStyle.CHILD_BORDER_SIZE: 1,
                 ThemeStyle.CHILD_ROUNDING: QtFusionMetrics.FRAME_ROUNDING,
             },
@@ -184,7 +179,7 @@ def search_editor_theme():
             ThemeColor.BORDER: (0, 0, 0, 0),
         },
         styles={
-            ThemeStyle.FRAME_PADDING: (3, 3), ThemeStyle.FRAME_BORDER_SIZE: 0,
+            ThemeStyle.FRAME_PADDING: (3, 5), ThemeStyle.FRAME_BORDER_SIZE: 0,
             ThemeStyle.FRAME_ROUNDING: 0,
         },
     )), owns=True)
@@ -199,8 +194,9 @@ def search_close_theme():
     _SEARCH_CLOSE_THEME = _owned_theme(make_theme(theme_component(
         ThemeTarget.PUSH_BUTTON,
         colors={
-            ThemeColor.BUTTON: (0, 0, 0, 0), ThemeColor.BUTTON_HOVERED: p.BUTTON_HOVER,
-            ThemeColor.BUTTON_ACTIVE: p.BUTTON_ACTIVE, ThemeColor.TEXT: p.TEXT,
+            ThemeColor.BUTTON: (0, 0, 0, 0),
+            ThemeColor.BUTTON_HOVERED: (232, 65, 72, 255),
+            ThemeColor.BUTTON_ACTIVE: (196, 43, 48, 255), ThemeColor.TEXT: p.TEXT,
             ThemeColor.BORDER: (0, 0, 0, 0),
         },
         styles={
@@ -211,11 +207,67 @@ def search_close_theme():
     )), owns=True)
     return _SEARCH_CLOSE_THEME
 
+def _raised_toolbar_icon_theme(*, frame_padding=(4, 3), compact=False):
+    """Return a slightly embossed QToolButton-like theme for WinUx toolbars.
+
+    The previous toolbar buttons intentionally blended into the toolbar by
+    using a transparent idle face.  In the file panes this made the actions
+    read as flat icons instead of clickable controls.  Give them a subtle
+    raised block surface with a real border, a hint of shadow, and clearer
+    hover/pressed states while keeping the toolbar compact.
+    """
+    p = QtFusionPalette
+    try:
+        pad_x, pad_y = frame_padding
+    except Exception:
+        pad_x, pad_y = 4, 3
+    pad_x, pad_y = max(0, int(pad_x)), max(0, int(pad_y))
+    rounding = 4 if compact else 4
+    base = tuple(int(v) for v in p.BUTTON[:3]) + ((246 if compact else 252),)
+    hover = tuple(int(v) for v in p.BUTTON_HOVER[:3]) + (255,)
+    active = tuple(int(v) for v in p.BUTTON_ACTIVE[:3]) + (255,)
+    border = tuple(int(v) for v in p.BORDER[:3]) + (255,)
+    shadow = (0, 0, 0, 0)
+    return _owned_theme(make_theme(
+        theme_component(
+            ThemeTarget.PUSH_BUTTON,
+            colors={
+                ThemeColor.BUTTON: base,
+                ThemeColor.BUTTON_HOVERED: hover,
+                ThemeColor.BUTTON_ACTIVE: active,
+                ThemeColor.TEXT: p.TEXT,
+                ThemeColor.BORDER: border,
+                ThemeColor.BORDER_SHADOW: shadow,
+            },
+            styles={
+                ThemeStyle.FRAME_BORDER_SIZE: 1,
+                ThemeStyle.FRAME_ROUNDING: rounding,
+                ThemeStyle.FRAME_PADDING: (pad_x, pad_y),
+            },
+        ),
+        theme_component(
+            ThemeTarget.IMAGE_BUTTON,
+            colors={
+                ThemeColor.BUTTON: base,
+                ThemeColor.BUTTON_HOVERED: hover,
+                ThemeColor.BUTTON_ACTIVE: active,
+                ThemeColor.BORDER: border,
+                ThemeColor.BORDER_SHADOW: shadow,
+            },
+            styles={
+                ThemeStyle.FRAME_BORDER_SIZE: 1,
+                ThemeStyle.FRAME_ROUNDING: rounding,
+                ThemeStyle.FRAME_PADDING: (pad_x, pad_y),
+            },
+        ),
+    ), owns=True)
+
+
 def toolbar_icon_theme():
     global _TOOLBAR_ICON_THEME
     if _theme_alive(_TOOLBAR_ICON_THEME):
         return _TOOLBAR_ICON_THEME
-    _TOOLBAR_ICON_THEME = _owned_theme(imgui_tool_button_theme())
+    _TOOLBAR_ICON_THEME = _raised_toolbar_icon_theme(frame_padding=(4, 3), compact=False)
     return _TOOLBAR_ICON_THEME
 
 
@@ -271,14 +323,31 @@ def toolbar_fitted_icon_theme():
     global _TOOLBAR_FITTED_ICON_THEME
     if _theme_alive(_TOOLBAR_FITTED_ICON_THEME):
         return _TOOLBAR_FITTED_ICON_THEME
-    _TOOLBAR_FITTED_ICON_THEME = _owned_theme(imgui_tool_button_theme(frame_padding=(1, 1)))
+    _TOOLBAR_FITTED_ICON_THEME = _raised_toolbar_icon_theme(frame_padding=(1, 1), compact=True)
     return _TOOLBAR_FITTED_ICON_THEME
 
 def path_button_theme():
+    """Rounded, bold-path QLineEdit-like button used by both file panes."""
     global _PATH_BUTTON_THEME
     if _theme_alive(_PATH_BUTTON_THEME):
         return _PATH_BUTTON_THEME
-    _PATH_BUTTON_THEME = _owned_theme(imgui_path_bar_theme())
+    p = QtFusionPalette
+    _PATH_BUTTON_THEME = _owned_theme(make_theme(theme_component(
+        ThemeTarget.PUSH_BUTTON,
+        colors={
+            ThemeColor.BUTTON: p.BASE,
+            ThemeColor.BUTTON_HOVERED: p.BASE,
+            ThemeColor.BUTTON_ACTIVE: p.HIGHLIGHT_HOVER,
+            ThemeColor.TEXT: p.TEXT,
+            ThemeColor.BORDER: p.BORDER,
+        },
+        styles={
+            ThemeStyle.FRAME_BORDER_SIZE: 1,
+            ThemeStyle.FRAME_ROUNDING: 4,
+            ThemeStyle.FRAME_PADDING: (6, 2),
+            ThemeStyle.BUTTON_TEXT_ALIGN: (0.0, 0.5),
+        },
+    )), owns=True)
     return _PATH_BUTTON_THEME
 
 
@@ -317,6 +386,15 @@ class ResourceTextures:
             if cached.exists():
                 return cached.nativeId()
             cls._textures.pop(key, None)
+
+        from .action_icons import action_icon_pixels
+        generated = action_icon_pixels(name, requested_size or DEFAULT_UI_TEXTURE_SIZE)
+        if generated is not None:
+            width, height, pixels = generated
+            texture = cls._registry().addStaticTexture(
+                width, height, pixels, tag="winux_texture_{}".format(len(cls._textures)))
+            cls._textures[key] = texture
+            return texture.nativeId()
 
         path = icon_path(name)
         if not path.is_file():
@@ -463,7 +541,8 @@ class ResourceMenuBar:
 
 def add_resource_button(parent, icon_name, callback, tooltip, *, user_data=None,
                         width=TOOLBAR_BUTTON_WIDTH,
-                        height=TOOLBAR_BUTTON_HEIGHT):
+                        height=TOOLBAR_BUTTON_HEIGHT,
+                        margin_x=0):
     """Create a QToolButton-sized action with a centered resource icon.
 
     Dear PyGui's image-button ``width``/``height`` describe the image content,
@@ -474,6 +553,8 @@ def add_resource_button(parent, icon_name, callback, tooltip, *, user_data=None,
     """
     width = max(20, int(width))
     height = max(20, int(height))
+    margin_x = max(0, int(margin_x or 0))
+    inner_width = max(20, width - margin_x * 2)
     texture = ResourceTextures.get(
         icon_name, pixel_size=TOOLBAR_TEXTURE_SIZE)
     if texture:
@@ -484,6 +565,7 @@ def add_resource_button(parent, icon_name, callback, tooltip, *, user_data=None,
         )
         button = QToolButton(
             "", parent=parent, icon=texture,
+            width=inner_width, height=height,
             icon_size=(icon_extent, icon_extent), auto_raise=True,
         )
         # Keep WinUx's resource-specific tint while DearUIQt owns the control
@@ -497,12 +579,17 @@ def add_resource_button(parent, icon_name, callback, tooltip, *, user_data=None,
     else:
         button = QToolButton(
             tooltip, parent=parent,
-            width=width, height=height, auto_raise=True,
+            width=inner_width, height=height, auto_raise=True,
         )
     button.clicked.connect(
         lambda: callback(button.tag, None, user_data)
         if callable(callback) else None)
     button.setTheme(toolbar_icon_theme())
+    if margin_x:
+        try:
+            QRetainedItem(button.tag).configure(indent=margin_x)
+        except Exception:
+            pass
     add_styled_tooltip(button.tag, tooltip)
     return button
 
@@ -511,7 +598,8 @@ class FileToolbar:
     """Navigation toolbar shared by Local and Server file views."""
 
     COLLAPSED_HEIGHT = 36
-    SEARCH_ROW_HEIGHT = 32
+    SEARCH_ROW_HEIGHT = 36
+    SEARCH_FIELD_HEIGHT = 28
     # The outer QToolBar surface has 2 px vertical padding on each side and
     # the shared alignment spacer consumes another 2 px.  Keep the toolbar
     # table at the same 30 px it receives while collapsed instead of using
@@ -559,6 +647,7 @@ class FileToolbar:
                 self._toolbar_grid.cell(0, column).tag, icon_name,
                 self._on_navigate, tooltip, user_data=action,
                 width=TOOLBAR_BUTTON_WIDTH, height=TOOLBAR_BUTTON_HEIGHT,
+                margin_x=2 if column < 2 else 0,
             )
 
         self.path_button = QPushButton(
@@ -585,35 +674,45 @@ class FileToolbar:
             height=self.SEARCH_ROW_HEIGHT, frame_shape=QFrame.NoFrame,
             no_scrollbar=True, no_scroll_with_mouse=True)
         self.search_popup = self._search_popup_frame.tag
+        QRetainedItem(self.search_popup).configure(always_use_window_padding=True)
         self._search_popup_frame.setTheme(search_popup_theme())
         # One framed search field, matching a Qt QLineEdit with embedded
         # leading search icon and trailing clear action. The old horizontal
         # group exposed three separate ImGui widgets and looked disconnected.
         self._search_shell_frame = QFrame(
-            parent=self._search_popup_frame, width=-1, height=26,
+            parent=self._search_popup_frame, width=-1, height=self.SEARCH_FIELD_HEIGHT,
             frame_shape=QFrame.StyledPanel, no_scrollbar=True,
             no_scroll_with_mouse=True)
         self.search_shell = self._search_shell_frame.tag
+        QRetainedItem(self.search_shell).configure(always_use_window_padding=True)
         self._search_shell_frame.setTheme(search_shell_theme())
         self._search_grid = QGridLayout(
-            3, column_widths=(22, None, 24), parent=self._search_shell_frame, height=0)
+            3, column_widths=(22, None, 22), parent=self._search_shell_frame, height=0)
         self.search_table = self._search_grid.tag
         search_texture = ResourceTextures.get("Search", pixel_size=32)
         leading = self._search_grid.cell(0, 0)
+        QSpacer(0, 5, parent=leading)
         if search_texture:
-            QImageView(
+            self.search_icon = QImageView(
                 search_texture, parent=leading, width=16, height=16,
                 tint=(90, 90, 90, 255))
         else:
             QSpacer(16, 16, parent=leading)
         self.search_input = QLineEdit(
             "", parent=self._search_grid.cell(0, 1), width=-1,
-            placeholder="Search this folder", on_enter=False, auto_select_all=False,
+            placeholder="Search or mask: *.inp;*.odb|*.bak", on_enter=False, auto_select_all=False,
         )
         self.search_input.textEdited.connect(self._on_search_text)
+        self.search_input.setToolTip(
+            'Search name, type or path. Masks match names: *.inp;*.odb\n'
+            'Use | to exclude: *.inp;*.odb|*.bak. Matching ignores case.')
+        self._search_filter_debouncer = QDebouncer(
+            self.panel.apply_filter, interval=120, parent=self.search_input)
         self.search_input.setTheme(search_editor_theme())
+        trailing = self._search_grid.cell(0, 2)
+        QSpacer(0, 3, parent=trailing)
         self.search_close = QPushButton(
-            "x", parent=self._search_grid.cell(0, 2),
+            "\u00d7", parent=trailing,
             width=20, height=20, role="flat")
         self.search_close.clicked.connect(self._hide_search)
         self.search_close.setTheme(search_close_theme())
@@ -716,15 +815,17 @@ class FileToolbar:
             callback(self.panel, action)
 
     def _on_search(self, sender=None, app_data=None, user_data=None):
+        self._search_filter_debouncer.cancel()
         value = app_data
         if value is None and not self.search_input._deleted:
             value = self.search_input.text()
         self.panel.apply_filter(str(value or ""))
 
     def _on_search_text(self, value):
-        self.panel.apply_filter(str(value or ""))
+        self._search_filter_debouncer.trigger(str(value or ""))
 
     def clear_search(self, apply=False):
+        self._search_filter_debouncer.cancel()
         if not self.search_input._deleted:
             self.search_input.clear()
         if apply:

@@ -7,7 +7,10 @@ import pytest
 
 from WinUx.preferences.update import UpdatePreferences
 from tools.build_github_release import build_release
-from winux_update_manifest import REQUIRED_FILES, source_descriptor
+from winux_update_manifest import REQUIRED_FILES as LEGACY_REQUIRED_FILES, source_descriptor
+from winux_runtime.update.manifest import REQUIRED_FILES as RUNTIME_REQUIRED_FILES
+
+REQUIRED_FILES = tuple(sorted(set(LEGACY_REQUIRED_FILES) | set(RUNTIME_REQUIRED_FILES)))
 from winux_update_providers import (
     DEFAULT_GITHUB_REPOSITORY, GitHubReleaseProvider, safe_extract_zip,
     should_use_github, update_preferences,

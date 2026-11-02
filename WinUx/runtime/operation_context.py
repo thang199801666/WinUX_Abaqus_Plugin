@@ -20,6 +20,15 @@ class OperationContext:
         if self.current():
             self.app.view.after(delay, self._deliver, callback, args)
 
+    def post_after_render(self, callback, *args):
+        """Deliver after native popup/platform-window teardown has completed."""
+        if self.current():
+            schedule = getattr(self.app.view, "after_render", None)
+            if callable(schedule):
+                schedule(self._deliver, callback, args)
+            else:
+                self.post(0, callback, *args)
+
     def _deliver(self, callback, args):
         if self.current() and self.app.view.winfo_exists():
             owner = getattr(callback, "__self__", None)

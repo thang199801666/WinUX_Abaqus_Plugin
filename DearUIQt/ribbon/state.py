@@ -1,9 +1,6 @@
 """Public ribbon state mutation API shared by :class:`RibbonBar`."""
 from __future__ import annotations
 
-from .textures import RibbonTileTextures as _RibbonTileTextures
-
-
 class RibbonStateMixin:
     def button_tag(self, key: str):
         record = self._buttons.get(str(key))
@@ -47,11 +44,7 @@ class RibbonStateMixin:
             return False
         record["label"] = str(label)
         if record.get("large_tile") and record.get("image"):
-            texture = _RibbonTileTextures.get(
-                record["image"], record["label"],
-                int(record.get("width") or self.LARGE_BUTTON_WIDTH),
-                self.LARGE_BUTTON_HEIGHT, self.LARGE_ICON_SIZE,
-                icon_path_resolver=self.icon_path_resolver, backend=self.backend)
+            texture = self._tile_texture(record)
             if texture is not None:
                 try:
                     self.backend.configure_item(record["tag"], texture_tag=texture)
@@ -96,10 +89,7 @@ class RibbonStateMixin:
         if image_tag is None or not image:
             return image_tag is None
         if record.get("large_tile"):
-            texture = _RibbonTileTextures.get(
-                image, record.get("label", ""), int(record.get("width") or self.LARGE_BUTTON_WIDTH),
-                self.LARGE_BUTTON_HEIGHT, self.LARGE_ICON_SIZE,
-                icon_path_resolver=self.icon_path_resolver, backend=self.backend)
+            texture = self._tile_texture(record)
         else:
             pixel_size = 16 if record.get("scope") == "quick" else self.LARGE_ICON_SIZE
             texture = self._load_texture(image, pixel_size)

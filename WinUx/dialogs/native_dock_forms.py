@@ -1,5 +1,5 @@
 """Native dock clients. Application/SSH/ODB work stays in the main process."""
-from .console_form import ConsoleDialog
+from .console.console_form import ConsoleDialog
 from DearUIQt import QtDialog
 from ..ui.components.job_plots import JobPlotsWindow
 
@@ -29,6 +29,7 @@ class ConsoleDockForm(ConsoleDialog):
     def __init__(self, view, payload, emit):
         self._emit = emit
         self._output_state = str(payload.get("output", ""))
+        self._raw_output_state = payload.get("raw_output", "")
         self._completion_waiters = {}
         self._completion_counter = 0
 
@@ -48,7 +49,12 @@ class ConsoleDockForm(ConsoleDialog):
                          lambda command: emit("command", value=command),
                          lambda: emit("interrupt"),
                          completion_callback=request_completion,
-                         completion_list_callback=show_completion_list)
+                         completion_list_callback=show_completion_list,
+                         raw_output_callback=lambda: self._raw_output_state,
+                         raw_input_callback=lambda data: emit("input", value=data),
+                          resize_callback=lambda columns, rows: emit(
+                              "resize", columns=int(columns), rows=int(rows)),
+                          refresh_callback=lambda: emit('refresh'))
         restore_console_editor(self, payload.get("editor", {}))
         self._set_output(self._output_state)
         self._last_editor_state = None
@@ -69,6 +75,9 @@ class ConsoleDockForm(ConsoleDialog):
         elif command == "output":
             self._output_state = str(args[0])
             super().handle_command(command, *args)
+        elif command == "raw_output":
+            self._raw_output_state = args[0]
+            self._update_raw_terminal()
         elif command == "completion_result":
             request_id, result = int(args[0]), args[1]
             callback = self._completion_waiters.pop(request_id, None)
@@ -113,7 +122,9 @@ class PlotDockForm(QtDialog):
             self.content, payload.get("job_id", ""), payload.get("job_name", ""),
             on_selection_change=lambda job, rows: emit("selection", ids=sorted(self.panel.selected_ids)),
             reference_library=self.references,
-            on_reference_manage=lambda: emit("reference_manage"), after=view.after)
+            on_reference_manage=lambda: emit("reference_manage"), after=view.after,
+            palette=payload.get('snapshot', {}).get('palette', 'default'),
+            on_palette_change=lambda palette: emit('palette', palette=palette))
         self.panel.set_dock_mode("floating")
         self._catalog_snapshot = None
         self.apply_snapshot(payload.get("snapshot", {}))
@@ -126,6 +137,7 @@ class PlotDockForm(QtDialog):
         callback, panel.on_selection_change = panel.on_selection_change, None
         try:
             self.references.items = snapshot.get("references", [])
+            panel.set_palette(snapshot.get('palette', 'default'), persist=False, notify=False)
             if rows != self._catalog_snapshot:
                 panel.set_catalog({"historyOutputs": rows})
                 self._catalog_snapshot = rows

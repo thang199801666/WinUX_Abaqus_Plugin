@@ -1,4 +1,3 @@
-"""Public JobManagerDialog API on the shared DearUIQt application event loop."""
-from .inprocess_adapters import JobManagerDialog
-
-__all__ = ["JobManagerDialog"]
+"""Compatibility alias. Canonical implementation: :mod:`WinUx.dialogs.jobs.job_manager_dialog`."""
+from .._compat import alias_module
+alias_module(__name__, "WinUx.dialogs.jobs.job_manager_dialog")

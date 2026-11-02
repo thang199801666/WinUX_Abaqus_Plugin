@@ -21,9 +21,18 @@ ICON_SIZE = 16
 SHGFI_ICON = 0x000000100
 SHGFI_SMALLICON = 0x000000001
 SHGFI_USEFILEATTRIBUTES = 0x000000010
+SHGFI_SYSICONINDEX = 0x000004000
 
 SHGSI_ICON = 0x000000100
 SHGSI_SMALLICON = 0x000000001
+SHGSI_LARGEICON = 0x000000000
+
+SHIL_SMALL = 0
+SHIL_LARGE = 1
+SHIL_EXTRALARGE = 2
+SHIL_SYSSMALL = 3
+SHIL_JUMBO = 4
+ILD_NORMAL = 0x00000000
 
 FILE_ATTRIBUTE_NORMAL = 0x00000080
 FILE_ATTRIBUTE_DIRECTORY = 0x00000010
@@ -34,6 +43,21 @@ SIID_FOLDER = 3
 DI_NORMAL = 0x0003
 DIB_RGB_COLORS = 0
 BI_RGB = 0
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", ctypes.c_ulong),
+        ("Data2", ctypes.c_ushort),
+        ("Data3", ctypes.c_ushort),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+IID_IIMAGELIST = GUID(
+    0x46EB5926, 0x582E, 0x4017,
+    (ctypes.c_ubyte * 8)(0x9F, 0xDF, 0xE8, 0x99, 0x8D, 0xAA, 0x09, 0x50),
+)
 
 
 class SHFILEINFOW(ctypes.Structure):
@@ -129,6 +153,16 @@ class WindowsIconRegistry:
         ]
         shell32.SHGetStockIconInfo.restype = ctypes.c_long
 
+        # SHGetImageList exposes the Explorer system image lists, including
+        # 48 px and 256 px/Jumbo sources.  Some very old Windows builds do not
+        # export it by name, so feature-detect instead of making startup depend
+        # on the symbol.
+        if hasattr(shell32, "SHGetImageList"):
+            shell32.SHGetImageList.argtypes = [
+                ctypes.c_int, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)
+            ]
+            shell32.SHGetImageList.restype = ctypes.c_long
+
         user32.GetDC.argtypes = [wintypes.HWND]
         user32.GetDC.restype = wintypes.HDC
         user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
@@ -177,21 +211,29 @@ class WindowsIconRegistry:
             cls._texture_registry = dpg.add_texture_registry(show=False)
 
     @classmethod
-    def _add_texture(cls, image: Image.Image, tag: str):
-        """Upload one Windows Shell icon at the legacy 16px contract."""
+    def _add_texture(cls, image: Image.Image, tag: str, size: int = ICON_SIZE):
+        """Upload one Shell icon at the requested device-pixel size.
+
+        Historically every shell icon was silently collapsed to 16 px.  That
+        works for Details/List but makes Tiles/Large/Extra-large views stretch
+        the same tiny raster and become visibly blurry.  Keep the 16 px default
+        for existing callers while allowing Explorer view modes to retain a
+        native larger raster.
+        """
         cls._ensure_texture_registry()
+        size = max(1, int(size))
         image = image.convert("RGBA")
-        if image.size != (ICON_SIZE, ICON_SIZE):
+        if image.size != (size, size):
             resampling = getattr(Image, "Resampling", Image).LANCZOS
-            image = image.resize((ICON_SIZE, ICON_SIZE), resampling)
+            image = image.resize((size, size), resampling)
 
         pixels = [channel / 255.0 for channel in image.tobytes()]
         if dpg.does_item_exist(tag):
             dpg.delete_item(tag)
 
         return dpg.add_static_texture(
-            width=ICON_SIZE,
-            height=ICON_SIZE,
+            width=size,
+            height=size,
             default_value=pixels,
             tag=tag,
             parent=cls._texture_registry,
@@ -201,9 +243,8 @@ class WindowsIconRegistry:
     def _add_native_texture(cls, image: Image.Image, tag: str):
         """Upload an RGBA image without silently forcing it to 16x16.
 
-        Shell/list-view icons intentionally keep the historical 16px contract
-        through :meth:`_add_texture`.  Toolbar resources, however, are already
-        rasterized for their final device-pixel size and must be uploaded 1:1;
+        Toolbar resources are already rasterized for their final device-pixel
+        size and must be uploaded 1:1;
         resampling them back to 16px and stretching them again in Dear ImGui
         destroys edge contrast on Windows.
         """
@@ -226,45 +267,44 @@ class WindowsIconRegistry:
         )
 
     @classmethod
-    def _ensure_fallbacks(cls) -> None:
-        fallback_tags = (
-            cls._textures.get("folder:fallback"),
-            cls._textures.get("file:fallback"),
-        )
-        if all(fallback_tags):
+    def _fallback_texture(cls, is_dir: bool, size: int = ICON_SIZE):
+        size = max(1, int(size))
+        key = f"{'folder' if is_dir else 'file'}:fallback:{size}"
+        cached = cls._textures.get(key)
+        if cached is not None:
             try:
-                if all(dpg.does_item_exist(tag) for tag in fallback_tags):
-                    return
+                if dpg.does_item_exist(cached):
+                    return cached
             except Exception:
                 pass
+            cls._textures.pop(key, None)
 
-        # A Dear PyGui tag is valid only in the context that created it. If a
-        # fallback is stale, every cached extension icon belongs to that same
-        # destroyed context and must be discarded together.
-        cls._textures.clear()
-
-        transparent = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-        cls._textures["folder:fallback"] = cls._add_texture(
-            transparent, "native_icon_folder_fallback"
-        )
-        cls._textures["file:fallback"] = cls._add_texture(
-            transparent, "native_icon_file_fallback"
-        )
+        transparent = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        tag = f"native_icon_{'folder' if is_dir else 'file'}_fallback_{size}"
+        texture = cls._add_texture(transparent, tag, size=size)
+        cls._textures[key] = texture
+        return texture
 
     @classmethod
-    def _stock_hicon(cls, stock_id: int):
+    def _ensure_fallbacks(cls) -> None:
+        # Preserve the old helper contract for code/tests that only need the
+        # default small-icon fallback.
+        cls._fallback_texture(True, ICON_SIZE)
+        cls._fallback_texture(False, ICON_SIZE)
+
+    @classmethod
+    def _stock_hicon(cls, stock_id: int, size: int = ICON_SIZE):
         cls._configure_win32_api()
         info = SHSTOCKICONINFO()
         info.cbSize = ctypes.sizeof(SHSTOCKICONINFO)
+        flags = SHGSI_ICON | (SHGSI_SMALLICON if int(size) <= ICON_SIZE else SHGSI_LARGEICON)
         hr = ctypes.windll.shell32.SHGetStockIconInfo(
-            stock_id,
-            SHGSI_ICON | SHGSI_SMALLICON,
-            ctypes.byref(info),
+            stock_id, flags, ctypes.byref(info)
         )
         return info.hIcon if hr == 0 else None
 
     @classmethod
-    def _file_type_hicon(cls, extension: str):
+    def _file_type_hicon(cls, extension: str, size: int = ICON_SIZE):
         cls._configure_win32_api()
         info = SHFILEINFOW()
         extension = (
@@ -275,48 +315,153 @@ class WindowsIconRegistry:
             else ""
         )
         dummy_path = f"dummy{extension}" if extension else "dummy_file"
+        flags = SHGFI_ICON | SHGFI_USEFILEATTRIBUTES
+        if int(size) <= ICON_SIZE:
+            flags |= SHGFI_SMALLICON
         result = ctypes.windll.shell32.SHGetFileInfoW(
             dummy_path,
             FILE_ATTRIBUTE_NORMAL,
             ctypes.byref(info),
             ctypes.sizeof(info),
-            SHGFI_ICON | SHGFI_SMALLICON | SHGFI_USEFILEATTRIBUTES,
+            flags,
         )
         return info.hIcon if result else None
 
     @staticmethod
-    def _center_visible_icon(image: Image.Image) -> Image.Image:
-        """Center the *visible* Shell glyph inside its 16 px texture.
+    def _image_list_kind(size: int) -> tuple[int, int]:
+        """Return (SHIL_*, source_pixels) for the smallest sharp source."""
+        size = max(1, int(size))
+        if size <= 16:
+            return SHIL_SMALL, 16
+        if size <= 32:
+            return SHIL_LARGE, 32
+        if size <= 48:
+            return SHIL_EXTRALARGE, 48
+        # Explorer uses the Jumbo list for 64+ icon modes.  Pull 256 px and
+        # downsample once with PIL rather than repeatedly magnifying 16 px.
+        return SHIL_JUMBO, 256
 
-        Windows small HICONs can contain asymmetric transparent padding.  A
-        correctly centered Dear ImGui image widget can therefore still look
-        vertically/horizontally offset.  Normalize the alpha bounds without
-        scaling the glyph so row alignment is based on visible pixels, not the
-        HICON canvas.
-        """
+    @classmethod
+    def _system_icon_index(cls, extension: str = "", is_dir: bool = False):
+        cls._configure_win32_api()
+        info = SHFILEINFOW()
+        if is_dir:
+            dummy_path = "dummy_folder"
+            attrs = FILE_ATTRIBUTE_DIRECTORY
+        else:
+            extension = extension or ""
+            if extension and not extension.startswith("."):
+                extension = "." + extension
+            dummy_path = f"dummy{extension}" if extension else "dummy_file"
+            attrs = FILE_ATTRIBUTE_NORMAL
+        result = ctypes.windll.shell32.SHGetFileInfoW(
+            dummy_path, attrs, ctypes.byref(info), ctypes.sizeof(info),
+            SHGFI_SYSICONINDEX | SHGFI_USEFILEATTRIBUTES,
+        )
+        return int(info.iIcon) if result else None
+
+    @classmethod
+    def _image_list_hicon(cls, image_index: int, requested_size: int):
+        """Fetch an HICON from the same system image lists Explorer uses."""
+        if image_index is None or os.name != "nt":
+            return None, None
+        cls._configure_win32_api()
+        shell32 = ctypes.windll.shell32
+        sh_get_image_list = getattr(shell32, "SHGetImageList", None)
+        if sh_get_image_list is None:
+            # XP exposed this API by ordinal; keeping the fallback also makes
+            # embedded/stripped Shell32 builds less fragile.
+            try:
+                sh_get_image_list = shell32[727]
+                sh_get_image_list.argtypes = [
+                    ctypes.c_int, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_void_p)
+                ]
+                sh_get_image_list.restype = ctypes.c_long
+            except (AttributeError, OSError, TypeError):
+                return None, None
+
+        image_list_kind, source_size = cls._image_list_kind(requested_size)
+        interface = ctypes.c_void_p()
+        hr = sh_get_image_list(
+            image_list_kind, ctypes.byref(IID_IIMAGELIST), ctypes.byref(interface)
+        )
+        if hr != 0 or not interface.value:
+            return None, None
+
+        # IImageList::GetIcon is vtable slot 10; Release is IUnknown slot 2.
+        vtable = ctypes.cast(
+            interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        ).contents
+        get_icon = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, ctypes.c_int, ctypes.c_uint,
+            ctypes.POINTER(wintypes.HICON),
+        )(vtable[10])
+        release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtable[2])
+        hicon = wintypes.HICON()
+        try:
+            hr = get_icon(interface, int(image_index), ILD_NORMAL, ctypes.byref(hicon))
+            if hr != 0 or not hicon:
+                return None, None
+            return hicon, source_size
+        finally:
+            release(interface)
+
+    @staticmethod
+    def _center_visible_icon(image: Image.Image, canvas_size: int | None = None) -> Image.Image:
+        """Center visible Shell glyph without changing its native scale."""
         image = image.convert("RGBA")
+        canvas_size = max(1, int(canvas_size or image.size[0]))
         alpha = image.getchannel("A")
-        # Ignore tiny anti-aliased fringe pixels when finding visual bounds.
         mask = alpha.point(lambda value: 255 if value > 8 else 0)
         bbox = mask.getbbox()
         if not bbox:
             return image
         glyph = image.crop(bbox)
         width, height = glyph.size
-        if width > ICON_SIZE or height > ICON_SIZE:
+        if width > canvas_size or height > canvas_size:
             return image
-        canvas = Image.new("RGBA", (ICON_SIZE, ICON_SIZE), (0, 0, 0, 0))
-        x = (ICON_SIZE - width) // 2
-        y = (ICON_SIZE - height) // 2
+        canvas = Image.new("RGBA", (canvas_size, canvas_size), (0, 0, 0, 0))
+        x = (canvas_size - width) // 2
+        y = (canvas_size - height) // 2
         canvas.alpha_composite(glyph, (x, y))
         return canvas
 
+    @staticmethod
+    def _pad_icon_image(image: Image.Image, padding: int) -> Image.Image:
+        """Add transparent guard pixels without resampling the Shell glyph."""
+        image = image.convert("RGBA")
+        padding = max(0, int(padding))
+        if padding <= 0:
+            return image
+        width, height = image.size
+        canvas = Image.new(
+            "RGBA", (width + 2 * padding, height + 2 * padding),
+            (0, 0, 0, 0))
+        canvas.alpha_composite(image, (padding, padding))
+        return canvas
+
+    @staticmethod
+    def _normalize_rendered_icon(image: Image.Image, size: int) -> Image.Image:
+        """Keep native small Shell padding; normalize only larger rasters.
+
+        The 16 px system image list is already pixel-designed for Explorer.
+        Re-cropping its alpha bounds can erase faint edge pixels and makes the
+        lower/right contour look clipped.  Larger image-list sources can still
+        be optically centered because they are later resized for grid modes.
+        """
+        image = image.convert("RGBA")
+        size = max(1, int(size))
+        if size <= ICON_SIZE:
+            return image
+        return WindowsIconRegistry._center_visible_icon(image, size)
+
     @classmethod
-    def _hicon_to_image(cls, hicon) -> Optional[Image.Image]:
+    def _hicon_to_image(cls, hicon, size: int = ICON_SIZE) -> Optional[Image.Image]:
         """Render an HICON into a 32-bit top-down DIB and return RGBA pixels."""
         if not hicon:
             return None
 
+        size = max(1, int(size))
         cls._configure_win32_api()
         user32 = ctypes.windll.user32
         gdi32 = ctypes.windll.gdi32
@@ -335,8 +480,8 @@ class WindowsIconRegistry:
 
             bitmap_info = BITMAPINFO()
             bitmap_info.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
-            bitmap_info.bmiHeader.biWidth = ICON_SIZE
-            bitmap_info.bmiHeader.biHeight = -ICON_SIZE
+            bitmap_info.bmiHeader.biWidth = size
+            bitmap_info.bmiHeader.biHeight = -size
             bitmap_info.bmiHeader.biPlanes = 1
             bitmap_info.bmiHeader.biBitCount = 32
             bitmap_info.bmiHeader.biCompression = BI_RGB
@@ -354,25 +499,25 @@ class WindowsIconRegistry:
                 return None
 
             old_bitmap = gdi32.SelectObject(memory_dc, bitmap)
-            ctypes.memset(pixel_ptr.value, 0, ICON_SIZE * ICON_SIZE * 4)
+            ctypes.memset(pixel_ptr.value, 0, size * size * 4)
 
             if not user32.DrawIconEx(
                 memory_dc,
                 0,
                 0,
                 hicon,
-                ICON_SIZE,
-                ICON_SIZE,
+                size,
+                size,
                 0,
                 None,
                 DI_NORMAL,
             ):
                 return None
 
-            raw = ctypes.string_at(pixel_ptr.value, ICON_SIZE * ICON_SIZE * 4)
+            raw = ctypes.string_at(pixel_ptr.value, size * size * 4)
             image = Image.frombytes(
                 "RGBA",
-                (ICON_SIZE, ICON_SIZE),
+                (size, size),
                 raw,
                 "raw",
                 "BGRA",
@@ -391,7 +536,7 @@ class WindowsIconRegistry:
                 )
                 image.putalpha(alpha)
 
-            return cls._center_visible_icon(image)
+            return cls._normalize_rendered_icon(image, size)
         finally:
             if old_bitmap:
                 gdi32.SelectObject(memory_dc, old_bitmap)
@@ -402,14 +547,24 @@ class WindowsIconRegistry:
             user32.ReleaseDC(None, screen_dc)
 
     @classmethod
-    def get_icon(cls, extension: str = "", is_dir: bool = False):
-        """Return a Dear PyGui texture tag for a folder or file extension."""
-        cls._ensure_fallbacks()
+    def get_icon(cls, extension: str = "", is_dir: bool = False, size: int = ICON_SIZE, padding: int = 0):
+        """Return a cached Explorer-quality Shell icon texture.
+
+        ``size`` is the visible Shell raster size. ``padding`` adds transparent
+        guard pixels around that raster without scaling it.  The guard is used
+        by compact Explorer table cells because Dear ImGui can clip the final
+        device-pixel row of an image item at a table boundary on Windows.
+
+        Larger view modes use Windows' 32/48/Jumbo image lists and are cached
+        independently by size.
+        """
+        size = max(1, int(size))
+        padding = max(0, int(padding))
         normalized_extension = (extension or "").lower()
         cache_key = (
-            "folder"
+            f"folder:{size}:pad{padding}"
             if is_dir
-            else f"file:{normalized_extension or '<generic>'}"
+            else f"file:{normalized_extension or '<generic>'}:{size}:pad{padding}"
         )
 
         cached = cls._textures.get(cache_key)
@@ -421,57 +576,83 @@ class WindowsIconRegistry:
                 pass
             cls._textures.pop(cache_key, None)
 
-        fallback_key = "folder:fallback" if is_dir else "file:fallback"
+        fallback = cls._fallback_texture(is_dir, size)
         if os.name != "nt":
-            return cls._textures[fallback_key]
+            return fallback
 
         hicon = None
         try:
-            hicon = (
-                cls._stock_hicon(SIID_FOLDER)
-                if is_dir
-                else cls._file_type_hicon(normalized_extension)
-            )
+            source_size = None
+            # SHIL_SMALL's extracted HICON can lose its bottom scanline on
+            # Windows/DPI combinations, before any UI clipping occurs. The
+            # direct SHGFI_SMALLICON / SHGSI_SMALLICON handles preserve the
+            # complete pixel-designed 16 px raster. Keep image lists for the
+            # larger sizes, where their higher-resolution sources are needed.
+            if size > ICON_SIZE:
+                image_index = cls._system_icon_index(normalized_extension, is_dir=is_dir)
+                hicon, source_size = cls._image_list_hicon(image_index, size)
+            if not hicon:
+                hicon = (
+                    cls._stock_hicon(SIID_FOLDER, size=size)
+                    if is_dir
+                    else cls._file_type_hicon(normalized_extension, size=size)
+                )
+                source_size = 16 if size <= 16 else 32
             if not hicon and not is_dir:
-                hicon = cls._stock_hicon(SIID_DOCNOASSOC)
+                hicon = cls._stock_hicon(SIID_DOCNOASSOC, size=size)
+                source_size = 16 if size <= 16 else 32
 
-            image = cls._hicon_to_image(hicon)
+            image = cls._hicon_to_image(hicon, source_size or size)
             if image is None:
-                return cls._textures[fallback_key]
+                return fallback
+            if image.size != (size, size):
+                resampling = getattr(Image, "Resampling", Image).LANCZOS
+                image = image.resize((size, size), resampling)
 
             safe_suffix = (
-                "folder"
-                if is_dir
-                else (normalized_extension.lstrip(".") or "generic")
+                "folder" if is_dir else (normalized_extension.lstrip(".") or "generic")
             )
-            safe_suffix = "".join(
-                ch if ch.isalnum() else "_" for ch in safe_suffix
-            )
-            texture = cls._add_texture(image, f"native_icon_{safe_suffix}")
+            safe_suffix = "".join(ch if ch.isalnum() else "_" for ch in safe_suffix)
+            if padding:
+                canvas = cls._pad_icon_image(image, padding)
+                texture = cls._add_native_texture(
+                    canvas, f"native_icon_{safe_suffix}_{size}_pad{padding}"
+                )
+            else:
+                texture = cls._add_texture(
+                    image, f"native_icon_{safe_suffix}_{size}", size=size
+                )
             cls._textures[cache_key] = texture
             return texture
-        except (OSError, ValueError, TypeError, ctypes.ArgumentError):
-            return cls._textures[fallback_key]
+        except (OSError, ValueError, TypeError, ctypes.ArgumentError, AttributeError):
+            return fallback
         finally:
             if hicon:
                 ctypes.windll.user32.DestroyIcon(hicon)
 
     @classmethod
-    def get_stock_icon(cls, stock_id: int):
-        """Upload a cached Shell stock icon on the Dear PyGui UI thread."""
-        cls._ensure_fallbacks()
-        key = "stock:{}".format(int(stock_id))
+    def get_stock_icon(cls, stock_id: int, size: int = ICON_SIZE):
+        """Upload a cached Shell stock icon at an explicit pixel size."""
+        size = max(1, int(size))
+        key = "stock:{}:{}".format(int(stock_id), size)
         cached = cls._textures.get(key)
         if cached is not None and dpg.does_item_exist(cached):
             return cached
+        fallback = cls._fallback_texture(True, size)
         if os.name != "nt":
-            return cls._textures["folder:fallback"]
+            return fallback
         hicon = None
         try:
-            hicon = cls._stock_hicon(int(stock_id))
-            image = cls._hicon_to_image(hicon)
+            hicon = cls._stock_hicon(int(stock_id), size=size)
+            source_size = 16 if size <= 16 else 32
+            image = cls._hicon_to_image(hicon, source_size)
             if image is not None:
-                texture = cls._add_texture(image, "native_icon_stock_{}".format(int(stock_id)))
+                if image.size != (size, size):
+                    resampling = getattr(Image, "Resampling", Image).LANCZOS
+                    image = image.resize((size, size), resampling)
+                texture = cls._add_texture(
+                    image, "native_icon_stock_{}_{}".format(int(stock_id), size), size=size
+                )
                 cls._textures[key] = texture
                 return texture
         except (OSError, ValueError, TypeError, ctypes.ArgumentError):
@@ -479,7 +660,7 @@ class WindowsIconRegistry:
         finally:
             if hicon:
                 ctypes.windll.user32.DestroyIcon(hicon)
-        return cls.get_icon(is_dir=True)
+        return fallback
 
     @classmethod
     def read_path_info(cls, path):

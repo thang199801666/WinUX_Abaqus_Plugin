@@ -30,7 +30,7 @@ def run(controller_factory=None):
         if controller_factory is None:
             # Import only after crash hooks are active so import/ABI failures
             # from Dear PyGui are written to the diagnostic logs.
-            from ..controller import WinUXController
+            from ..app.controller import WinUXController
             controller_factory = WinUXController
         log_event("Startup controller import elapsed={:.3f}s".format(time.perf_counter()-started))
         controller = controller_factory()

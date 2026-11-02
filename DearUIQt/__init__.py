@@ -1,4 +1,4 @@
-"""DearUIQt — reusable Qt-style desktop GUI library backed by Dear PyGui.
+"""DearUIQt: reusable Qt-style desktop GUI library backed by Dear PyGui.
 
 New code should prefer the structured namespaces ``core``, ``gui``, ``widgets``,
 ``layouts`` and ``modelview``.  Top-level exports are retained for source
@@ -70,8 +70,25 @@ _LAZY_EXPORTS = {
     # Themes / styling resources
     "QTheme": ".themes",
 
+    # Notifications (inert until explicitly configured by an application)
+    "NotificationKind": ".notifications", "DismissReason": ".notifications",
+    "QNotificationAction": ".notifications", "QNotificationRequest": ".notifications",
+    "QNotificationTheme": ".notifications", "QNotificationCenter": ".notifications",
+    "QNotificationManager": ".notifications", "QNotification": ".notifications",
+
     # Higher-level / utilities
     "StandaloneUiHost": ".runtime", "QGuiRuntime": ".runtime", "RibbonBar": ".ribbon",
+    "RibbonTab": ".ribbon", "RibbonContextGroup": ".ribbon", "RibbonGroup": ".ribbon", "RibbonButton": ".ribbon",
+    "RibbonMenuButton": ".ribbon", "RibbonSplitButton": ".ribbon",
+    "RibbonCommandTemplate": ".ribbon", "RibbonGroupTemplate": ".ribbon",
+    "RibbonTabTemplate": ".ribbon", "RibbonTemplate": ".ribbon",
+    "RibbonTemplateInstance": ".ribbon", "RibbonTemplateFactory": ".ribbon",
+    "RibbonAdaptivePolicy": ".ribbon", "RibbonDisplayTemplate": ".ribbon", "RibbonDisplayTemplateFactory": ".ribbon",
+    "RibbonVisualStyle": ".ribbon", "RibbonVisualStyleFactory": ".ribbon",
+    "RibbonAppearanceTemplate": ".ribbon", "RibbonAppearanceTemplateFactory": ".ribbon",
+    "RibbonGroupLayout": ".ribbon", "RibbonAdaptiveLayout": ".ribbon",
+    "QEventDispatcher": ".core",
+    "QDebouncer": ".core",
     "RibbonResources": ".contracts", "LatestCallQueue": ".dispatch",
     "DpgScrollerArrowOverlay": ".backends.dearpygui", "SharedScrollerMetrics": ".backends.dearpygui",
     "SharedScrollerPalette": ".backends.dearpygui",
@@ -90,7 +107,7 @@ for _name in (
     _LAZY_EXPORTS[_name] = ".qt"
 
 __all__ = list(_LAZY_EXPORTS)
-__version__ = "1.36.3"
+__version__ = "1.45.0"
 
 
 def __getattr__(name):

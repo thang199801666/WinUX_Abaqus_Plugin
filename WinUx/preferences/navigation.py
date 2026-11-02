@@ -8,7 +8,8 @@ from .storage import JsonPreferenceStore
 class NavigationPreferences:
     """Store navigation state without mixing it with encrypted credentials."""
 
-    SORT_COLUMNS = ("#0", "type", "size", "modified")
+    SORT_COLUMNS = ("#0", "type", "size", "modified", "permissions", "owner", "group",
+                    "extension", "created", "accessed", "attributes", "path")
 
     def __init__(self, root=None):
         self._store = JsonPreferenceStore("navigation.json", root=root)
@@ -137,6 +138,23 @@ class NavigationPreferences:
         if column not in self.SORT_COLUMNS:
             return None
         return column, bool(value.get("descending", False))
+
+    def load_columns(self, panel_id):
+        states = self._load().get('columns', {})
+        value = states.get(str(panel_id)) if isinstance(states, dict) else None
+        return value if isinstance(value, dict) else None
+
+    def save_columns(self, panel_id, state):
+        if str(panel_id) not in ('local', 'server') or not isinstance(state, dict):
+            return
+        data = self._load()
+        states = data.get('columns')
+        if not isinstance(states, dict):
+            states = data['columns'] = {}
+        if states.get(str(panel_id)) == state:
+            return
+        states[str(panel_id)] = state
+        self._save(data)
 
     def save_sort(self, panel_id, column, descending):
         """Persist the active sort independently for Local and Server."""

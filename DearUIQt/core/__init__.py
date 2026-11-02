@@ -10,6 +10,8 @@ _EXPORTS = {
     "SignalConnection": ".object", "QSignalBlocker": ".object",
     "QMetaObject": ".object", "QCoreApplication": ".application",
     "QTimer": ".timer", "QThread": ".thread", "QRunnable": ".concurrent",
+    "QEventDispatcher": ".dispatcher",
+    "QDebouncer": ".debounce",
     "QFuture": ".concurrent", "QFutureWatcher": ".concurrent",
     "QThreadPool": ".concurrent", "QtConcurrent": ".concurrent",
     "QProcess": ".process", "QInputTarget": ".input", "QItemInputBinding": ".input", "QGlobalInputBinding": ".input",

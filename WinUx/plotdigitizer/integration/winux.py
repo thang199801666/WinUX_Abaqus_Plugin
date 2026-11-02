@@ -84,5 +84,5 @@ def open_plot_digitizer(view, reference_library=None):
     # Plot Digitizer is a retained QApplication tool.  The legacy floating
     # process controller remains importable for explicit compatibility use, but
     # the application path no longer spawns a dialog process.
-    from ...dialogs.native_reference_tools import PlotDigitizerDialog
+    from ...dialogs.reference.native_reference_tools import PlotDigitizerDialog
     return PlotDigitizerDialog(view, reference_library)

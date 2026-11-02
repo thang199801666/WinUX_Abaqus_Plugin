@@ -18,13 +18,23 @@ _TransferItemRow = TransferItemRow
 
 class BlockingDialog(ResultDialog):
     def __init__(self, view, title, message, kind="message", initial="", on_result=None,
-                 primary_text=None, secondary_text=None, intent="info", owner_hwnd=None):
+                 primary_text=None, secondary_text=None, intent="info", owner_hwnd=None,
+                 option_text=None, option_checked=False, parent=None):
+        if parent is not None and owner_hwnd is None:
+            native = getattr(parent, "_native_window_backend", None)
+            if native is not None:
+                owner_hwnd = native.winId(parent.tag)
+            if not owner_hwnd:
+                resolver = getattr(parent.view, "_find_main_viewport_hwnd", None)
+                owner_hwnd = resolver() if callable(resolver) else None
         self.kind = kind
         self._failure_notice = kind == "message" and intent == "error"
         self._init_result(on_result, False if kind == "confirm" else None)
         super().__init__(view, "blocking", title, {"title": title, "message": message,
             "kind": kind, "initial": initial, "primary_text": primary_text,
-            "secondary_text": secondary_text, "intent": intent}, width=500, height=240,
+            "secondary_text": secondary_text, "intent": intent,
+            "option_text": option_text, "option_checked": bool(option_checked)},
+            width=500, height=270 if option_text else 240,
             modal=True, owner_hwnd=owner_hwnd)
 
     def _close_from_escape(self):
@@ -35,7 +45,7 @@ class JobEditDialog(JobEditScheduleLogic, ResultDialog):
     def __init__(self, view, values, settings=None, on_result=None):
         self._init_result(on_result)
         super().__init__(view, "job_edit", "Edit Job", {"values": list(values or []), "settings": settings or {}},
-                         width=600, height=390, modal=True)
+                         width=420, height=460, modal=True)
 
 
 class ODBExtractDialog(ResultDialog):
@@ -84,7 +94,7 @@ class SettingsDialog(FloatingDialogController):
         if event != "install_update":
             return
         import os
-        from winux_launcher import launch_winux
+        from winux_runtime.launcher import launch_winux
         project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 
         def worker():
@@ -241,11 +251,13 @@ class SyncPreviewDialog(FloatingDialogController):
 class LocalFolderDialog(ResultDialog):
     """Application-facing local folder browser using the shared DPG host."""
 
-    def __init__(self, view, initial, on_selected=None):
+    def __init__(self, view, initial, on_selected=None, *, multiple=False,
+                 show_hidden=False, title=None):
         self._init_result(on_selected, cancel_value=None, notify_cancel=False)
         super().__init__(
-            view, "local_folder", "Open Folder",
-            {"initial": str(initial or "")},
+            view, "local_folder", title or "Open Folder",
+            {"initial": str(initial or ""), "multiple": bool(multiple),
+             "show_hidden": bool(show_hidden), "title": title},
             width=780, height=500, modal=True, resizable=True,
         )
 
@@ -254,12 +266,16 @@ class LocalFileDialog(ResultDialog):
     """File browser in its own owned HWND, unconstrained by the owner viewport."""
 
     def __init__(self, view, initial="", on_selected=None, *, extensions=(),
-                 save=False, default_filename="", width=840, height=540):
+                 save=False, default_filename="", width=840, height=540,
+                 multiple=False, show_hidden=False, title=None):
+        from .path_selection import PathSelectionOptions
+        options = PathSelectionOptions("file", bool(multiple), tuple(extensions or ()), bool(save))
         self._init_result(on_selected, cancel_value=None, notify_cancel=True)
         super().__init__(
-            view, "local_file", "Save File" if save else "Open File",
-            {"initial": str(initial or ""), "extensions": list(extensions),
-             "save": bool(save), "default_filename": str(default_filename or "")},
+            view, "local_file", title or ("Save File" if save else "Open File"),
+            {"initial": str(initial or ""), "extensions": list(options.extensions),
+             "save": bool(save), "default_filename": str(default_filename or ""),
+             "multiple": bool(multiple), "show_hidden": bool(show_hidden), "title": title},
             width=width, height=height, modal=True, resizable=True)
 
 
@@ -413,12 +429,17 @@ class JobManagerDialog(JobManagerLogic, FloatingDialogController):
 
 
 class ConsoleDialog(FloatingDialogController):
-    def __init__(self, view, output_callback, command_callback, interrupt_callback, error_callback=None, completion_callback=None, completion_list_callback=None):
+    def __init__(self, view, output_callback, command_callback, interrupt_callback, error_callback=None, completion_callback=None, completion_list_callback=None, raw_output_callback=None, raw_input_callback=None, resize_callback=None, refresh_callback=None):
         self.output_callback, self.command_callback = output_callback, command_callback
         self.interrupt_callback, self.error_callback = interrupt_callback, error_callback
         self.completion_callback = completion_callback
         self.completion_list_callback = completion_list_callback
+        self.raw_output_callback = raw_output_callback
+        self.raw_input_callback = raw_input_callback
+        self.resize_callback = resize_callback
+        self.refresh_callback = refresh_callback
         self._last_output = None
+        self._last_raw_output = None
         super().__init__(view, "console", "SSH Console", width=680, height=410)
         self.view.after(0, self._poll_output)
 
@@ -430,6 +451,12 @@ class ConsoleDialog(FloatingDialogController):
             if output != self._last_output:
                 self._last_output = output
                 self.post_latest("output", str(output or ""))
+            raw_callback = getattr(self, "raw_output_callback", None)
+            if callable(raw_callback):
+                raw_output = raw_callback()
+                if raw_output != self._last_raw_output:
+                    self._last_raw_output = raw_output
+                    self.post_latest("raw_output", raw_output or "")
         except Exception as exc:
             if callable(self.error_callback):
                 self.error_callback(str(exc))
@@ -448,6 +475,18 @@ class ConsoleDialog(FloatingDialogController):
                 self.post("command_result", command, accepted)
         elif event == "interrupt":
             self.post("interrupt_result", bool(self.interrupt_callback()))
+        elif event == 'refresh':
+            callback = getattr(self, 'refresh_callback', None)
+            if callable(callback):
+                callback()
+        elif event == "input":
+            callback = getattr(self, "raw_input_callback", None)
+            if callable(callback):
+                callback(str(message.get("value", "")))
+        elif event == "resize":
+            callback = getattr(self, "resize_callback", None)
+            if callable(callback):
+                callback(int(message.get("columns", 80)), int(message.get("rows", 24)))
         elif event == "completion_list":
             callback = getattr(self, "completion_list_callback", None)
             if callable(callback):

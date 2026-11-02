@@ -7,7 +7,7 @@ from pathlib import Path
 from DearUIQt.themes import DialogMetrics
 from DearUIQt.gui import QFontDatabase
 from DearUIQt.runtime import QGuiRuntime
-from ..resources import resource_path
+from ..platform.resources import resource_path
 
 
 def configure_ui_context(view):

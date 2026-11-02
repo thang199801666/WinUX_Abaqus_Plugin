@@ -6,7 +6,7 @@ from DearUIQt.backends import dpg
 from DearUIQt.widgets import QWidget, QToolBar
 from DearUIQt.layouts import QGridLayout
 from DearUIQt.themes import body_theme, surface_theme
-from ..dialogs.folder_browser_style import browser_toolbar_theme, browser_layout_theme
+from ..dialogs.selectors.folder_browser_style import browser_toolbar_theme, browser_layout_theme
 from DearUIQt.backends.dearpygui import dpg_window_rect
 from DearUIQt.gui import QtFusionPalette
 

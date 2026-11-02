@@ -27,7 +27,7 @@ class ImGuiQtControlMetrics:
     combo_editor_frame_pad_y: int = 2
     spin_frame_pad_y: int = 5
     border_size: int = 1
-    frame_rounding: int = 0
+    frame_rounding: int = QtFusionMetrics.FRAME_ROUNDING
     button_rounding: int = 5
     arrow_width: int = 22
     spin_arrow_width: int = 17
@@ -102,7 +102,8 @@ def line_edit_theme(backend, *, disabled=False, focused=False):
     return _make_theme(backend, tag, build)
 
 
-def button_theme(backend, *, role="secondary", disabled=False, focused=False, default=False, checked=False):
+def button_theme(backend, *, role="secondary", disabled=False, focused=False, default=False, checked=False, hovered=False,
+                 frame_padding=(8, 3)):
     """Fusion-like QPushButton surface including default/focus semantics."""
     role = str(role or "secondary").lower()
     if role not in ("secondary", "primary", "danger", "flat"):
@@ -112,6 +113,10 @@ def button_theme(backend, *, role="secondary", disabled=False, focused=False, de
         role, state, "default" if default else "plain")
     if checked:
         tag += ".checked"
+    if hovered and not disabled:
+        tag += ".hover"
+    if tuple(frame_padding) != (8, 3):
+        tag += ".padding.{}.{}".format(*frame_padding)
     p = QtFusionPalette
 
     def build():
@@ -124,8 +129,8 @@ def button_theme(backend, *, role="secondary", disabled=False, focused=False, de
             # button geometry or introducing fake drop shadows.
             raised_face = (249, 249, 249, 255)
             raised_border = (154, 154, 154, 255)
-            raised_hover = (252, 252, 252, 255)
-            raised_active = (225, 225, 225, 255)
+            raised_hover = p.BUTTON_HOVER
+            raised_active = p.BUTTON_ACTIVE
             if disabled:
                 face = hover = active = (238, 238, 238, 255)
                 text = p.TEXT_DISABLED
@@ -145,6 +150,9 @@ def button_theme(backend, *, role="secondary", disabled=False, focused=False, de
             if checked and not disabled:
                 face = active
                 border = p.FOCUS
+            if hovered and not disabled:
+                face = hover
+                border = p.FOCUS
             backend.add_theme_color(backend.mvThemeCol_Button, face)
             backend.add_theme_color(backend.mvThemeCol_ButtonHovered, hover)
             backend.add_theme_color(backend.mvThemeCol_ButtonActive, active)
@@ -154,7 +162,7 @@ def button_theme(backend, *, role="secondary", disabled=False, focused=False, de
             backend.add_theme_color(backend.mvThemeCol_NavHighlight, p.FOCUS)
             backend.add_theme_style(backend.mvStyleVar_FrameBorderSize, METRICS.border_size)
             backend.add_theme_style(backend.mvStyleVar_FrameRounding, METRICS.button_rounding)
-            backend.add_theme_style(backend.mvStyleVar_FramePadding, 8, 3)
+            backend.add_theme_style(backend.mvStyleVar_FramePadding, *frame_padding)
             text_align = getattr(backend, "mvStyleVar_ButtonTextAlign", None)
             if text_align is not None:
                 backend.add_theme_style(text_align, 0.5, 0.5)
@@ -296,7 +304,7 @@ def progress_theme(backend, *, state="normal"):
             backend.add_theme_color(backend.mvThemeCol_PlotHistogram, fill)
             backend.add_theme_color(backend.mvThemeCol_PlotHistogramHovered, fill)
             backend.add_theme_style(backend.mvStyleVar_FrameBorderSize, 1)
-            backend.add_theme_style(backend.mvStyleVar_FrameRounding, 1)
+            backend.add_theme_style(backend.mvStyleVar_FrameRounding, METRICS.frame_rounding)
     return _make_theme(backend, tag, build)
 
 
@@ -414,7 +422,9 @@ def spin_editor_theme(backend, *, kind="int", disabled=False):
         if component is None:
             return
         with backend.theme_component(component, enabled_state=not disabled):
-            bg = p.BUTTON_DISABLED if disabled else p.BASE
+            # The shared shell owns the surface and rounded corners. A second
+            # opaque rectangular input background bleeds into its inner arc.
+            bg = (0, 0, 0, 0)
             backend.add_theme_color(backend.mvThemeCol_FrameBg, bg)
             backend.add_theme_color(backend.mvThemeCol_FrameBgHovered, bg)
             backend.add_theme_color(backend.mvThemeCol_FrameBgActive, bg)
@@ -434,6 +444,7 @@ def spin_editor_theme(backend, *, kind="int", disabled=False):
             )
             backend.add_theme_style(backend.mvStyleVar_FrameBorderSize, 0)
             backend.add_theme_style(backend.mvStyleVar_FrameRounding, 0)
+            backend.add_theme_color(backend.mvThemeCol_BorderShadow, (0, 0, 0, 0))
     return _make_theme(backend, tag, build)
 
 
@@ -445,6 +456,7 @@ def spin_shell_theme(backend, *, focused=False, disabled=False):
 
     def build():
         with backend.theme_component(backend.mvChildWindow):
+            backend.add_theme_color(backend.mvThemeCol_BorderShadow, (0, 0, 0, 0))
             backend.add_theme_color(
                 backend.mvThemeCol_ChildBg,
                 p.BUTTON_DISABLED if disabled else p.BASE,
@@ -455,7 +467,7 @@ def spin_shell_theme(backend, *, focused=False, disabled=False):
             )
             backend.add_theme_style(backend.mvStyleVar_WindowPadding, METRICS.border_size, METRICS.border_size)
             backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 0, 0)
-            backend.add_theme_style(backend.mvStyleVar_ChildRounding, METRICS.frame_rounding)
+            backend.add_theme_style(backend.mvStyleVar_ChildRounding, 2)
             backend.add_theme_style(backend.mvStyleVar_ChildBorderSize, METRICS.border_size)
         with backend.theme_component(backend.mvTable):
             backend.add_theme_style(backend.mvStyleVar_CellPadding, 0, 0)
@@ -729,7 +741,7 @@ def path_bar_theme(backend):
             backend.add_theme_color(backend.mvThemeCol_Border, p.BORDER)
             backend.add_theme_color(backend.mvThemeCol_NavHighlight, p.FOCUS)
             backend.add_theme_style(backend.mvStyleVar_FrameBorderSize, 1)
-            backend.add_theme_style(backend.mvStyleVar_FrameRounding, 1)
+            backend.add_theme_style(backend.mvStyleVar_FrameRounding, METRICS.frame_rounding)
             backend.add_theme_style(backend.mvStyleVar_FramePadding, 6, 2)
             align = getattr(backend, "mvStyleVar_ButtonTextAlign", None)
             if align is not None:
@@ -750,10 +762,10 @@ def status_bar_theme(backend):
 
     def build():
         with backend.theme_component(backend.mvChildWindow):
-            backend.add_theme_color(backend.mvThemeCol_ChildBg, p.WINDOW_ALT)
+            backend.add_theme_color(backend.mvThemeCol_ChildBg, p.WINDOW)
             backend.add_theme_color(backend.mvThemeCol_Border, p.BORDER_LIGHT)
-            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 6, 1)
-            backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 5, 0)
+            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 5, 2)
+            backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 4, 0)
             backend.add_theme_style(backend.mvStyleVar_ChildBorderSize, 0)
             backend.add_theme_style(backend.mvStyleVar_ChildRounding, 0)
     return _make_theme(backend, tag, build)
@@ -820,6 +832,9 @@ def application_theme(backend):
         # button geometry identical across both states so a control does not
         # snap back to square corners when an action disables itself.
         for enabled_state in (True, False):
+            for component in (backend.mvInputText, backend.mvCombo):
+                with backend.theme_component(component, enabled_state=enabled_state):
+                    backend.add_theme_style(backend.mvStyleVar_FrameRounding, METRICS.frame_rounding)
             with backend.theme_component(backend.mvButton, enabled_state=enabled_state):
                 backend.add_theme_style(backend.mvStyleVar_FrameRounding, METRICS.button_rounding)
             image_button = getattr(backend, "mvImageButton", None)
@@ -1110,7 +1125,35 @@ def plot_surface_theme(backend):
                               "mvPlotCol_InlayText", "mvPlotCol_AxisText"):
                 color(role_name, (20, 20, 20, 255))
             color("mvPlotCol_AxisGrid", (216, 216, 216, 180))
-            color("mvPlotCol_AxisBg", (250, 250, 250, 255))
+            # ImPlot draws the axis interaction rectangles over the frame.
+            # An opaque AxisBg therefore hides the plot frame along the X/Y
+            # title gutters (most visible along the bottom edge).  Keep all
+            # axis interaction backgrounds transparent so labels/ticks remain
+            # readable without painting a solid panel over the plot border.
+            color("mvPlotCol_AxisBg", (0, 0, 0, 0))
+            color("mvPlotCol_AxisBgHovered", (0, 0, 0, 0))
+            color("mvPlotCol_AxisBgActive", (0, 0, 0, 0))
+
+            # ImPlot's built-in axis menu is rendered while the plot item theme
+            # is active, so core ImGui popup metrics applied here affect only
+            # plot-owned popups instead of loosening the compact application
+            # shell.  WinUx deliberately keeps application WindowPadding at
+            # 2 px; without this override the axis checkboxes sit almost on the
+            # popup border and the Min/Max editors have no breathing room.
+            backend.add_theme_color(backend.mvThemeCol_PopupBg, (250, 250, 250, 255))
+            backend.add_theme_color(backend.mvThemeCol_Border, (176, 176, 176, 255))
+            backend.add_theme_color(backend.mvThemeCol_FrameBg, (255, 255, 255, 255))
+            backend.add_theme_color(backend.mvThemeCol_FrameBgHovered, (248, 250, 252, 255))
+            backend.add_theme_color(backend.mvThemeCol_FrameBgActive, (244, 248, 252, 255))
+            backend.add_theme_color(backend.mvThemeCol_HeaderHovered, p.MENU_HOVER)
+            backend.add_theme_color(backend.mvThemeCol_HeaderActive, p.MENU_ACTIVE)
+            backend.add_theme_color(backend.mvThemeCol_CheckMark, p.HIGHLIGHT)
+            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 8, 6)
+            backend.add_theme_style(backend.mvStyleVar_FramePadding, 5, 3)
+            backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 6, 3)
+            backend.add_theme_style(backend.mvStyleVar_ItemInnerSpacing, 6, 3)
+            backend.add_theme_style(backend.mvStyleVar_PopupRounding, 3)
+            backend.add_theme_style(backend.mvStyleVar_WindowBorderSize, 1)
     return _make_theme(backend, tag, build)
 
 

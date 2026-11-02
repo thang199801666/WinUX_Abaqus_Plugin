@@ -11,10 +11,11 @@ class JobEditScheduleLogic:
     Dialog front ends only depend on this stable scheduling contract.
     """
 
-    DELETE_MODES = ("Delete After", "Delete At")
+    DELETE_MODES = ("Run Time Limit", "Delete After", "Delete At")
     DELETE_AT_FORMAT = "%Y-%m-%d %H:%M:%S"
     LEGACY_DELETE_AT_FORMAT = "%H:%M:%S %m-%d-%Y"
     DEFAULT_DELETE_AFTER = "00:30"
+    DEFAULT_RUNTIME_LIMIT = "00:30"
     JOB_FIELDS = (
         ("Job ID", 0),
         ("Name", 1),
@@ -41,6 +42,41 @@ class JobEditScheduleLogic:
         return timedelta(hours=hours, minutes=minutes, seconds=seconds)
 
     @classmethod
+    def _duration_seconds(cls, value):
+        delta = cls._parse_delete_after(value)
+        return int(delta.total_seconds())
+
+    @classmethod
+    def _format_duration(cls, seconds):
+        seconds = max(0, int(seconds or 0))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return "{:02d}:{:02d}:{:02d}".format(hours, minutes, seconds)
+
+    @classmethod
+    def _elapsed_seconds(cls, value):
+        text = str(value or "").strip()
+        if not text:
+            return 0
+        days = 0
+        if "-" in text:
+            day_text, text = text.split("-", 1)
+            if not day_text.isdigit():
+                return 0
+            days = int(day_text)
+        parts = text.split(":")
+        if len(parts) == 3 and all(part.isdigit() for part in parts):
+            hours, minutes, seconds = map(int, parts)
+        elif len(parts) == 2 and all(part.isdigit() for part in parts):
+            hours = 0
+            minutes, seconds = map(int, parts)
+        else:
+            return 0
+        if minutes > 59 or seconds > 59:
+            return 0
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+    @classmethod
     def _parse_delete_at(cls, value):
         text = str(value or "").strip()
         for fmt in (cls.DELETE_AT_FORMAT, cls.LEGACY_DELETE_AT_FORMAT):
@@ -58,7 +94,9 @@ class JobEditScheduleLogic:
     @classmethod
     def _initial_delete_values(cls, settings):
         settings = dict(settings or {})
-        if settings.get("delete_at_enabled"):
+        if settings.get("delete_runtime_enabled"):
+            mode = "Run Time Limit"
+        elif settings.get("delete_at_enabled"):
             mode = "Delete At"
         elif settings.get("delete_after_enabled"):
             mode = "Delete After"
@@ -73,10 +111,27 @@ class JobEditScheduleLogic:
             or (legacy_value if mode == "Delete After" else "")
             or cls.DEFAULT_DELETE_AFTER
         ).strip()
+        runtime_limit = str(
+            settings.get("delete_runtime")
+            or (legacy_value if mode == "Run Time Limit" else "")
+            or cls.DEFAULT_RUNTIME_LIMIT
+        ).strip()
         delete_at = str(
             settings.get("delete_at")
             or (legacy_value if mode == "Delete At" else "")
         ).strip()
+
+        # Normalize stored durations while retaining the compact HH:MM value
+        # when users entered one deliberately. Validation still accepts both
+        # HH:MM and HH:MM:SS.
+        try:
+            cls._parse_delete_after(delete_after)
+        except ValueError:
+            delete_after = cls.DEFAULT_DELETE_AFTER
+        try:
+            cls._parse_delete_after(runtime_limit)
+        except ValueError:
+            runtime_limit = cls.DEFAULT_RUNTIME_LIMIT
 
         if delete_at:
             try:
@@ -89,4 +144,4 @@ class JobEditScheduleLogic:
             except ValueError:
                 delete_at = (datetime.now() + timedelta(minutes=30)).strftime(
                     cls.DELETE_AT_FORMAT)
-        return mode, delete_after, delete_at
+        return mode, delete_after, delete_at, runtime_limit

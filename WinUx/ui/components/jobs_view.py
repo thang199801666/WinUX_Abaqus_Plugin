@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Optional
 
-from .explorer_list_view import ExplorerListView, ListViewItem
-from .explorer_themes import ListViewTheme
+from .explorer.list_view import ExplorerListView, ListViewItem
+from .explorer.themes import ListViewTheme
 from DearUIQt.widgets import QScrollerMetrics
 from DearUIQt.widgets import QFrame, QRetainedItem
 from DearUIQt.core import Qt, QItemInputBinding
@@ -142,19 +142,20 @@ class JobsView:
         apply_layout()
         self._gui_runtime.invokeNextFrame(apply_layout)
 
-    def _create_listview(self):
+    @classmethod
+    def job_context_menu(cls):
         menu = [
             {"id": action or label, "label": label, "action": action,
              "icon": ResourceTextures.get(icon) if icon else None,
              "enabled": enabled, "separator": action is None}
-            for label, action, icon, enabled in self.MENU
+            for label, action, icon, enabled in cls.MENU
         ]
         # ODB actions in Job Viewer resolve the job's output file from the
         # scheduler/job metadata first. They never depend on the Server file
         # pane selection or its current directory.
         menu.insert(1, {
             "id": "job_check_odb_group",
-            "label": "Check ODB",
+            "label": "Odb Tools",
             "icon": ResourceTextures.get("Check_File"),
             "children": [
                 {
@@ -177,11 +178,15 @@ class JobsView:
             "id": "job_plots",
             "label": "Plots",
             "action": "job_plots",
-            "icon": ResourceTextures.get("JobViewer"),
+            "icon": ResourceTextures.get("ReferenceChart"),
             "enabled": False,
             "checkable": True,
             "checked": False,
         })
+        return menu
+
+    def _create_listview(self):
+        menu = self.job_context_menu()
         listview = ExplorerListView(
             parent=self.body, items=[], columns=self.COLUMNS,
             width=-1, height=-1, show_status_bar=False,

@@ -36,7 +36,8 @@ class ComboField:
                                     pos=(0, 0) if self.editable else (1, 1))
         self._arrow_bg = b.draw_rectangle((0, 0), (METRICS.arrow_width, self.height - 2),
                                           parent=self.arrow, fill=QtFusionPalette.BASE,
-                                          color=(0, 0, 0, 0))
+                                          color=(0, 0, 0, 0),
+                                          rounding=max(0, METRICS.frame_rounding - METRICS.border_size))
         self._separator = b.draw_line((0, 0), (0, self.height - 2), parent=self.arrow,
                                       color=QtFusionPalette.BORDER_LIGHT)
         cx, cy = METRICS.arrow_width / 2, (self.height - 2) / 2
@@ -76,12 +77,12 @@ class ComboField:
                 b.add_theme_color(b.mvThemeCol_BorderShadow, (0, 0, 0, 0))
                 b.add_theme_style(b.mvStyleVar_WindowPadding, 0, 0)
                 b.add_theme_style(b.mvStyleVar_ItemSpacing, 0, 0)
-                b.add_theme_style(b.mvStyleVar_ChildRounding, 0)
+                b.add_theme_style(b.mvStyleVar_ChildRounding, METRICS.frame_rounding)
                 b.add_theme_style(b.mvStyleVar_ChildBorderSize, 1)
             with b.theme_component(b.mvButton, enabled_state=not disabled):
-                b.add_theme_color(b.mvThemeCol_Button, base)
-                b.add_theme_color(b.mvThemeCol_ButtonHovered, base)
-                b.add_theme_color(b.mvThemeCol_ButtonActive, base)
+                b.add_theme_color(b.mvThemeCol_Button, (0, 0, 0, 0))
+                b.add_theme_color(b.mvThemeCol_ButtonHovered, (0, 0, 0, 0))
+                b.add_theme_color(b.mvThemeCol_ButtonActive, (0, 0, 0, 0))
                 b.add_theme_color(b.mvThemeCol_Text, p.TEXT_DISABLED if disabled else p.TEXT)
                 b.add_theme_style(b.mvStyleVar_ButtonTextAlign, 0, 0.5)
                 b.add_theme_style(b.mvStyleVar_FramePadding, 7, 0)
@@ -90,7 +91,7 @@ class ComboField:
             if self.editable:
                 with b.theme_component(b.mvInputText, enabled_state=not disabled):
                     for role in (b.mvThemeCol_FrameBg, b.mvThemeCol_FrameBgHovered, b.mvThemeCol_FrameBgActive):
-                        b.add_theme_color(role, base)
+                        b.add_theme_color(role, (0, 0, 0, 0))
                     b.add_theme_color(b.mvThemeCol_Text, p.TEXT_DISABLED if disabled else p.TEXT)
                     b.add_theme_color(b.mvThemeCol_TextDisabled, p.TEXT_DISABLED)
                     b.add_theme_color(b.mvThemeCol_TextSelectedBg, p.SELECTION_ACTIVE)
@@ -167,9 +168,22 @@ class ComboField:
         self._refresh_signature = signature
         try:
             theme = self._theme(not self._enabled, focused, hovered)
-            for item in (self.tag, self.button, self._arrow_host):
+            for item in (self.tag, self.button):
                 if self._item_exists(item):
                     b.bind_item_theme(item, theme)
+            if self._item_exists(self._arrow_host):
+                # The arrow viewport must not paint a square child background
+                # over the shell's rounded right corners.
+                host_theme = self._themes.get('arrow_host')
+                if host_theme is None:
+                    with b.theme() as host_theme:
+                        with b.theme_component(b.mvChildWindow):
+                            b.add_theme_color(b.mvThemeCol_ChildBg, (0, 0, 0, 0))
+                            b.add_theme_style(b.mvStyleVar_WindowPadding, 0, 0)
+                            b.add_theme_style(b.mvStyleVar_ChildBorderSize, 0)
+                            b.add_theme_style(b.mvStyleVar_ChildRounding, 0)
+                    self._themes['arrow_host'] = host_theme
+                b.bind_item_theme(self._arrow_host, host_theme)
             arrow_fill = (self._surface(not self._enabled, focused, hovered)
                           if not self.editable else
                           (225, 225, 225, 255) if self._popup_visible else

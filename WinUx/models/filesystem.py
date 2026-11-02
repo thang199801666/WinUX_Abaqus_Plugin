@@ -38,6 +38,14 @@ class FileSystemModel:
                     stat.st_mtime,
                     is_hidden=(entry.name.startswith(".") or bool(
                         getattr(stat, "st_file_attributes", 0) & 0x02)),
+                    # Windows st_mode/UID/GID are not NTFS permissions or owners.
+                    mode=stat.st_mode if os.name != "nt" else None,
+                    uid=getattr(stat, "st_uid", None) if os.name != "nt" else None,
+                    gid=getattr(stat, "st_gid", None) if os.name != "nt" else None,
+                    accessed=stat.st_atime,
+                    created=getattr(stat, "st_birthtime", stat.st_ctime if os.name == "nt" else None),
+                    attributes=getattr(stat, "st_file_attributes", None),
+                    is_symlink=entry.is_symlink(),
                 ))
         return sorted(
             result,

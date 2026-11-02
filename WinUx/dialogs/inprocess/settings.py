@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 
 from DearUIQt.core import QThreadPool
-from ..settings_form import SettingsDialog as SettingsForm
+from ..settings.settings_form import SettingsDialog as SettingsForm
 from .common import RetainedTool
 
 
@@ -18,7 +18,7 @@ class SettingsDialog(RetainedTool, SettingsForm):
         self._init_inprocess_lifetime(view)
 
     def _install_update(self):
-        from winux_launcher import launch_winux
+        from winux_runtime.launcher import launch_winux
         project_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
 
         def worker():

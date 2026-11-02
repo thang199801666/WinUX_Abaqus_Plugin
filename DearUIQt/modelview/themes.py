@@ -29,18 +29,19 @@ def qt_item_view_theme(backend):
     p = QtFusionPalette
     with backend.theme() as _ITEM_VIEW_THEME:
         with backend.theme_component(backend.mvTable):
-            backend.add_theme_color(backend.mvThemeCol_TableHeaderBg, p.TOOLBAR)
+            backend.add_theme_color(backend.mvThemeCol_ChildBg, p.TABLE_ROW)
+            backend.add_theme_color(backend.mvThemeCol_TableHeaderBg, p.TABLE_HEADER)
             # ImGui table headers consume the generic Header hover/active roles
             # while TableHeaderBg supplies their normal surface.
-            backend.add_theme_color(backend.mvThemeCol_Header, p.TOOLBAR)
+            backend.add_theme_color(backend.mvThemeCol_Header, p.TABLE_HEADER)
             backend.add_theme_color(backend.mvThemeCol_HeaderHovered, p.HEADER_HOVER)
             backend.add_theme_color(backend.mvThemeCol_HeaderActive, p.HEADER_PRESSED)
             backend.add_theme_color(backend.mvThemeCol_Text, p.TEXT)
-            backend.add_theme_color(backend.mvThemeCol_TableBorderStrong, p.BORDER)
-            backend.add_theme_color(backend.mvThemeCol_TableBorderLight, p.BORDER_LIGHT)
-            backend.add_theme_color(backend.mvThemeCol_TableRowBg, p.BASE)
-            backend.add_theme_color(backend.mvThemeCol_TableRowBgAlt, p.ALTERNATE_BASE)
-            backend.add_theme_style(backend.mvStyleVar_CellPadding, 6, 3)
+            backend.add_theme_color(backend.mvThemeCol_TableBorderStrong, p.TABLE_BORDER)
+            backend.add_theme_color(backend.mvThemeCol_TableBorderLight, p.TABLE_GRID)
+            backend.add_theme_color(backend.mvThemeCol_TableRowBg, p.TABLE_ROW)
+            backend.add_theme_color(backend.mvThemeCol_TableRowBgAlt, p.TABLE_ROW_ALT)
+            backend.add_theme_style(backend.mvStyleVar_CellPadding, *QtFusionMetrics.TABLE_CELL_PADDING)
             add_dpg_scroller_style(backend, track=p.WINDOW_ALT)
         with backend.theme_component(backend.mvSelectable):
             # Qt/Fusion list/table selection remains readable with dark text in
@@ -56,7 +57,7 @@ def qt_item_view_theme(backend):
             backend.add_theme_style(backend.mvStyleVar_FramePadding, 5, 3)
         with backend.theme_component(backend.mvButton):
             # Dear PyGui renders sortable headers as buttons internally.
-            backend.add_theme_color(backend.mvThemeCol_Button, p.TOOLBAR)
+            backend.add_theme_color(backend.mvThemeCol_Button, p.TABLE_HEADER)
             backend.add_theme_color(backend.mvThemeCol_ButtonHovered, p.HEADER_HOVER)
             backend.add_theme_color(backend.mvThemeCol_ButtonActive, p.HEADER_PRESSED)
             backend.add_theme_color(backend.mvThemeCol_Text, p.TEXT)
@@ -68,6 +69,14 @@ def qt_item_view_theme(backend):
                 backend.add_theme_style(backend.mvStyleVar_ButtonTextAlign, 0.0, 0.5)
             except Exception:
                 pass
+        with backend.theme_component(backend.mvButton, enabled_state=False):
+            # Centered, noninteractive presentation headers used by editable
+            # job tables share the same chrome as native sortable headers.
+            backend.add_theme_color(backend.mvThemeCol_Button, (0, 0, 0, 0))
+            backend.add_theme_color(backend.mvThemeCol_Text, p.TABLE_HEADER_TEXT)
+            backend.add_theme_style(backend.mvStyleVar_ButtonTextAlign, .5, .5)
+            backend.add_theme_style(backend.mvStyleVar_FrameBorderSize, 0)
+            backend.add_theme_style(backend.mvStyleVar_FramePadding, 0, 0)
     return _ITEM_VIEW_THEME
 
 
@@ -248,7 +257,10 @@ def qt_list_view_theme(backend):
         with backend.theme_component(backend.mvChildWindow):
             backend.add_theme_color(backend.mvThemeCol_ChildBg, p.BASE)
             backend.add_theme_color(backend.mvThemeCol_Border, p.BORDER)
-            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 6, 0)
+            # Insets here shrink the selectable fill as well as the text,
+            # leaving a white strip along both sides of every selected row.
+            # Keep the viewport flush; QListView owns the label's text inset.
+            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 0, 0)
             backend.add_theme_style(backend.mvStyleVar_ChildRounding, 0)
             backend.add_theme_style(backend.mvStyleVar_ChildBorderSize, 1)
             backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 0, 0)

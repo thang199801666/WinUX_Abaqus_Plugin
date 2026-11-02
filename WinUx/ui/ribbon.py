@@ -1,6 +1,6 @@
 """WinUx resource adapter for the reusable UI-framework ribbon."""
 from .components.toolbar import ResourceTextures
-from ..resources import icon_path
+from ..platform.resources import icon_path
 from DearUIQt.ribbon import RibbonBar as FrameworkRibbonBar
 
 

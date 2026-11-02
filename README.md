@@ -10,6 +10,7 @@ SSH access, and Abaqus job tools into one workspace.
 - Submit, schedule, and monitor Abaqus jobs.
 - Edit remote text files with Server Notepad.
 - Inspect ODB results and plot history output.
+- Digitize plot images with tick recognition, manual calibration and curve extraction.
 - Check for updates from GitHub Releases.
 
 ## Quick start
@@ -29,7 +30,7 @@ SSH access, and Abaqus job tools into one workspace.
    %USERPROFILE%\abaqus_plugins\WinUx
    ```
 
-   `WinUx_plugin.py`, `run_winux.py`, `vendor`, and the `WinUx` package should
+    `WinUx_plugin.py`, `run_winux.py`, `vendor`, `DearUIQt`, `winux_runtime`, and the `WinUx` package should
    sit directly inside that folder.
 3. Restart Abaqus/CAE, then select **Plug-ins > WinUx**.
 4. Connect to your SSH server to browse files, transfer input files, and manage jobs.
@@ -45,6 +46,9 @@ If your Abaqus installation uses a versioned command, set it before launching:
 ```bat
 set WINUX_ABAQUS_COMMAND=abq2026
 ```
+
+Launch Plot Digitizer directly with `abaqus python run_plotdigitizer.py`, or use
+`run_plotdigitizer.bat` from the installation directory.
 
 ### Updates
 

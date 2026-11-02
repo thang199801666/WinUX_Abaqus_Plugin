@@ -64,6 +64,8 @@ class QTreeView(QWidget):
         self._item_by_key = {}
         self._current_key = None
         self._handler_registries = []
+        self._selection_handler_by_key = {}
+        self._toggle_handler_by_key = {}
         self._model = None
         self._model_connections = []
         self._index_by_key = {}
@@ -72,6 +74,8 @@ class QTreeView(QWidget):
         self._selection_model = QItemSelectionModel(parent=self)
         self._updating_from_model = False
         self.setItems(items)
+        from ..backends.shared_scrollers import register_scroll_surface
+        register_scroll_surface(backend, tag)
 
     def setItems(self, items):
         if self._model is not None and not self._updating_from_model:
@@ -114,7 +118,7 @@ class QTreeView(QWidget):
     def keyRole(self):
         return self._key_role
 
-    def _key_for_index(self, index, path):
+    def _key_for_index(self, index, path=None):
         if self._key_role is not None:
             value = index.data(self._key_role)
             if value is not None:
@@ -124,9 +128,63 @@ class QTreeView(QWidget):
                 except TypeError:
                     pass
         pointer = index.internalPointer()
-        return ("model", id(pointer)) if pointer is not None else ("model-path", tuple(path))
+        if pointer is not None:
+            return ("model", id(pointer))
+        if path is None:
+            path = []
+            current = index
+            while current.isValid():
+                path.append(current.row())
+                current = current.parent()
+            path.reverse()
+        return ("model-path", tuple(path))
+
+    def _update_model_data(self, top_left, bottom_right):
+        """Apply one same-parent dataChanged range without rebuilding nodes."""
+        model = self._model
+        if (model is None or not top_left.isValid() or not bottom_right.isValid()
+                or top_left.model() is not model or bottom_right.model() is not model
+                or top_left.parent() != bottom_right.parent()
+                or top_left.row() > bottom_right.row()
+                or top_left.column() > bottom_right.column()):
+            return False
+        if top_left.column() > 0:
+            return True  # This view renders only column zero.
+        parent = top_left.parent()
+        updates = []
+        for row in range(top_left.row(), bottom_right.row() + 1):
+            index = model.index(row, 0, parent)
+            if not index.isValid():
+                return False
+            key = self._key_for_index(index)
+            item = self._item_by_key.get(key)
+            if item is None or self._index_by_key.get(key) != index:
+                return False  # Key/identity changes need structural rendering.
+            value = index.data(Qt.DisplayRole)
+            updates.append((key, item, index, "" if value is None else str(value),
+                            index.data(Qt.UserRole), bool(index.flags() & Qt.ItemIsEnabled)))
+        for key, item, index, text, data, enabled in updates:
+            options = {}
+            if item.text != text:
+                options['label'] = text
+            if not item.children and item.enabled != enabled:
+                options['enabled'] = enabled
+            if options:
+                try:
+                    self.backend.configure_item(self._native_by_key[key], **options)
+                except Exception:
+                    return False  # Rebuild from the authoritative model below.
+            item.text, item.data, item.enabled = text, data, enabled
+            self._index_by_key[key] = index
+        return True
 
     def _model_changed(self, *_args):
+        if self._deleted:
+            return self
+        if (len(_args) >= 2 and isinstance(_args[0], QModelIndex)
+                and isinstance(_args[1], QModelIndex)
+                and self._update_model_data(_args[0], _args[1])):
+            return self
         model = self._model
         self._index_by_key.clear()
         if model is None:
@@ -284,6 +342,8 @@ class QTreeView(QWidget):
             except Exception:
                 pass
         self._handler_registries.clear()
+        self._selection_handler_by_key.clear()
+        self._toggle_handler_by_key.clear()
         self._native_by_key.clear()
         self._item_by_key.clear()
         seen = set()
@@ -298,7 +358,6 @@ class QTreeView(QWidget):
                     label=item.text,
                     parent=parent,
                     default_open=bool(item.expanded),
-                    callback=self._node_toggled,
                     user_data=item.key,
                 )
                 self._native_by_key[item.key] = native
@@ -307,13 +366,18 @@ class QTreeView(QWidget):
                 # nesting a second selectable (which would duplicate the label).
                 try:
                     registry = self.backend.add_item_handler_registry()
-                    self.backend.add_item_clicked_handler(
+                    self._handler_registries.append(registry)
+                    handler = self.backend.add_item_clicked_handler(
                         parent=registry,
                         callback=self._selected,
                         user_data=item.key,
                     )
+                    toggle_handler = self.backend.add_item_toggled_open_handler(
+                        parent=registry, callback=self._node_toggled, user_data=item.key,
+                        two_way=True)
                     self.backend.bind_item_handler_registry(native, registry)
-                    self._handler_registries.append(registry)
+                    self._selection_handler_by_key[item.key] = handler
+                    self._toggle_handler_by_key[item.key] = toggle_handler
                 except Exception:
                     pass
                 for child in item.children:
@@ -335,6 +399,9 @@ class QTreeView(QWidget):
 
     def _selected(self, sender, app_data=None, user_data=None):
         key = user_data
+        if (self._deleted or sender not in (self._native_by_key.get(key),
+                                            self._selection_handler_by_key.get(key))):
+            return
         item = self._item_by_key.get(key)
         if item is None or not item.enabled:
             return
@@ -356,11 +423,14 @@ class QTreeView(QWidget):
 
     def _node_toggled(self, sender, app_data=None, user_data=None):
         key = user_data
+        native = self._native_by_key.get(key)
+        if self._deleted or sender not in (native, self._toggle_handler_by_key.get(key)):
+            return
         item = self._item_by_key.get(key)
         if item is None:
             return
         try:
-            opened = bool(self.backend.get_value(sender))
+            opened = bool(self.backend.get_value(native))
         except Exception:
             opened = bool(app_data) if isinstance(app_data, bool) else not item.expanded
         if opened == item.expanded:
@@ -382,6 +452,8 @@ class QTreeView(QWidget):
             except Exception:
                 pass
         self._handler_registries.clear()
+        self._selection_handler_by_key.clear()
+        self._toggle_handler_by_key.clear()
         super().delete()
 
 

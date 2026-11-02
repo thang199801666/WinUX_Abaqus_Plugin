@@ -92,6 +92,21 @@ class BackgroundTaskManager:
         self._workers = []
         self._sentinel = object()
         self._worker_start_error = None
+        # Creating the controller constructs three task lanes.  Starting all
+        # nine daemon threads here used to happen before the viewport existed.
+        # Workers now start on the first real submission for each lane, keeping
+        # thread allocation/scheduling out of the cold-start critical path.
+        self._workers_started = False
+
+    def _ensure_workers_locked(self):
+        """Start this lane exactly once, on its first submitted task.
+
+        Caller must hold ``self._lock``.  Partial thread-start failure keeps any
+        workers that already started and records the error for diagnostics.
+        """
+        if self._workers_started or self._closed:
+            return
+        self._workers_started = True
         for index in range(self.max_workers):
             worker = threading.Thread(
                 target=self._worker_loop,
@@ -101,8 +116,6 @@ class BackgroundTaskManager:
             try:
                 worker.start()
             except Exception as exc:
-                # A thread quota/resource failure should degrade background
-                # features, not crash WinUx before the main window appears.
                 self._worker_start_error = exc
                 log_exception(
                     "Background worker could not start: {}-{}".format(
@@ -125,15 +138,19 @@ class BackgroundTaskManager:
         if not callable(callback):
             raise TypeError("background callback must be callable")
 
-        if not self._workers:
-            handle = BackgroundTaskHandle(name, key, cancel_event)
-            error = self._worker_start_error or RuntimeError(
-                "no background worker threads are available")
-            self._reject(handle, RuntimeError(
-                "background worker pool unavailable: {}".format(error)))
-            return handle
-
         with self._lock:
+            if self._closed:
+                handle = BackgroundTaskHandle(name, key, cancel_event)
+                self._reject(handle, RuntimeError("background task manager is closed"))
+                return handle
+            self._ensure_workers_locked()
+            if not self._workers:
+                handle = BackgroundTaskHandle(name, key, cancel_event)
+                error = self._worker_start_error or RuntimeError(
+                    "no background worker threads are available")
+                self._reject(handle, RuntimeError(
+                    "background worker pool unavailable: {}".format(error)))
+                return handle
             if self._closed:
                 handle = BackgroundTaskHandle(name, key, cancel_event)
                 self._reject(handle, RuntimeError("background task manager is closed"))

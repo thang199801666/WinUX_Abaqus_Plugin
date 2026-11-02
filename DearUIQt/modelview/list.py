@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import Any, Iterable
 
 from ..core.object import Signal, Qt, QPoint, QRect
+from ..core.item_model import QModelIndex
 from ..core.input import QGlobalInputBinding
 from ..gui.system import QCursor
 from ..gui.palette import QtFusionMetrics
@@ -14,6 +15,13 @@ from .base import _QtAbstractItemView
 
 class QtListView(_QtAbstractItemView):
     """QListView-like single-column item view with stable keys."""
+
+    @staticmethod
+    def _display_label(text):
+        # ImGui Selectable has no independent horizontal text padding. Keep
+        # its hit/highlight rectangle full-width and inset only its caption.
+        # This is presentation-only: DisplayRole/currentText/copy stay exact.
+        return "  " + str(text)
 
     def __init__(self, parent=None, items=(), *, width=-1, height=-1,
                   visible_rows=None, multiple=False, after=None, backend=None,
@@ -33,6 +41,11 @@ class QtListView(_QtAbstractItemView):
         # Last renderer state per row: avoid native set_value/theme crossings
         # when selection updates leave most rows visually unchanged.
         self._row_visual_state: dict[Any, tuple[bool, bool, bool, bool]] = {}
+        self._row_visual_full_sync = True
+        self._row_visual_selected = set()
+        self._row_visual_current = None
+        self._row_visual_focus = False
+        self._row_visual_retry = set()
         self.currentTextChanged = Signal(self)
         self.itemCheckChanged = Signal(self)
         self.contextMenuRequested = Signal(self)
@@ -45,6 +58,8 @@ class QtListView(_QtAbstractItemView):
         if callable(on_activate):
             self.activated.connect(on_activate)
         self.setItems(items)
+        from ..backends.shared_scrollers import register_scroll_surface
+        register_scroll_surface(backend, tag)
         if auto_height and self.checkboxes:
             self.setFixedHeight(int(visible_rows) * self.rowHeight() + 2)
         if context_menu_requests:
@@ -63,23 +78,77 @@ class QtListView(_QtAbstractItemView):
         except (TypeError, ValueError):
             return super()._model_index_for_key(key)
 
+    @staticmethod
+    def _item_from_model_index(row, index):
+        checked = index.data(Qt.CheckStateRole)
+        text = index.data(Qt.DisplayRole)
+        return QtListItem(
+            row, "" if text is None else str(text), index.data(Qt.UserRole),
+            bool(index.flags() & Qt.ItemIsEnabled),
+            None if checked is None else int(checked) == Qt.Checked)
+
+    def _update_model_data(self, top_left, bottom_right):
+        model = self.model()
+        if (model is None or not top_left.isValid() or not bottom_right.isValid()
+                or top_left.model() is not model or bottom_right.model() is not model
+                or top_left.parent().isValid() or bottom_right.parent().isValid()
+                or top_left.row() > bottom_right.row()
+                or top_left.column() > bottom_right.column()):
+            return False
+        if top_left.column() > 0:
+            return True  # QListView renders only the first model column.
+        updates = []
+        for row in range(top_left.row(), bottom_right.row() + 1):
+            index = model.index(row, 0)
+            old = self._value_for_key(row)
+            if not index.isValid() or old is None or row not in self.items:
+                return False
+            new = self._item_from_model_index(row, index)
+            if (old.checked is None) != (new.checked is None):
+                return False  # Checkbox presence changes native row structure.
+            if new.checked is not None and row not in self.checkboxes:
+                return False
+            updates.append((old, new))
+        try:
+            for old, new in updates:
+                options = {}
+                if new.text != old.text:
+                    options['label'] = self._display_label(new.text)
+                if new.enabled != old.enabled:
+                    options['enabled'] = new.enabled
+                if options:
+                    self.backend.configure_item(self.items[new.key], **options)
+                if new.key in self.checkboxes:
+                    if new.enabled != old.enabled:
+                        self.backend.configure_item(self.checkboxes[new.key], enabled=new.enabled)
+                    if new.checked != old.checked:
+                        self.backend.set_value(self.checkboxes[new.key], new.checked)
+                self._values[self._state._key_index[new.key]] = new
+                if new.enabled != old.enabled:
+                    self._row_visual_retry.add(new.key)
+        except Exception:
+            return False  # Reconcile partial writes from the authoritative model.
+        self._sync_selection_visuals()
+        return True
+
     def _model_changed(self, *_args):
+        if self._deleted:
+            return self
+        if (type(self).setItems is QtListView.setItems
+                and len(_args) >= 2 and isinstance(_args[0], QModelIndex)
+                and isinstance(_args[1], QModelIndex)
+                and self._update_model_data(_args[0], _args[1])):
+            return self
         model = self.model()
         if model is None:
-            return None
+            self.setItems(())
+            return self
         values = []
         for row in range(int(model.rowCount())):
             index = model.index(row, 0)
             if not index.isValid():
                 continue
-            checked = index.data(Qt.CheckStateRole)
-            values.append(QtListItem(
-                row,
-                "" if index.data(Qt.DisplayRole) is None else str(index.data(Qt.DisplayRole)),
-                index.data(Qt.UserRole),
-                bool(index.flags() & Qt.ItemIsEnabled),
-                None if checked is None else int(checked) == Qt.Checked,
-            ))
+            values.append(self._item_from_model_index(row, index))
         self.setItems(values)
         return self
 
@@ -110,11 +179,14 @@ class QtListView(_QtAbstractItemView):
             self.backend.bind_item_theme(parent, qt_check_list_row_theme(self.backend))
             self.checkboxes[item.key] = self.backend.add_checkbox(
                 parent=parent, label="", default_value=bool(item.checked),
-                enabled=bool(item.enabled), pos=(0, 2), user_data=item.key,
+                enabled=bool(item.enabled), pos=(4, 2), user_data=item.key,
                 callback=self._check_clicked)
-            position = (24, 0)
+            # Reserve a full indicator-sized lane plus a gap. A checkbox at
+            # x=4 can reach x=24 (font height + frame padding); starting the
+            # selectable there lets its selection/focus fill cover that border.
+            position = (QtFusionMetrics.ROW_HEIGHT + 8, 0)
         self.items[item.key] = self.backend.add_selectable(
-            parent=parent, label=item.text, width=0,
+            parent=parent, label=self._display_label(item.text), width=0,
             height=QtFusionMetrics.ROW_HEIGHT, pos=position,
             default_value=item.key in self.selected,
             enabled=bool(item.enabled), user_data=item.key,
@@ -134,6 +206,7 @@ class QtListView(_QtAbstractItemView):
                     for new, old in zip(incoming, self._values))):
             self._values = incoming
             return self
+        self._row_visual_full_sync = True
         # Text, enabled and checkbox-value refreshes can all be applied in
         # place when row keys and checkbox *presence* have not changed.
         # Checked -> unchecked does not change the native row structure. In
@@ -149,7 +222,7 @@ class QtListView(_QtAbstractItemView):
                 for new, old in zip(incoming, self._values):
                     changed = {}
                     if new.text != old.text:
-                        changed["label"] = new.text
+                        changed["label"] = self._display_label(new.text)
                     if new.enabled != old.enabled:
                         changed["enabled"] = bool(new.enabled)
                     if changed:
@@ -293,21 +366,26 @@ class QtListView(_QtAbstractItemView):
             return False
 
     def _clicked(self, sender, value, key):
+        if self._deleted or self.items.get(key) != sender:
+            return  # A queued callback may refer to a replaced native row.
+        item = self._value_for_key(key)
+        if item is None or not item.enabled:
+            return
         old_current = self.current
         self._row_clicked(sender, value, key)
         if old_current != self.current:
             self.currentTextChanged.emit(self.currentText())
 
     def _check_clicked(self, sender, checked, key):
-        if self.checkboxes.get(key) != sender:
+        if self._deleted or self.checkboxes.get(key) != sender:
             return  # Ignore callbacks queued by a row that has been rebuilt.
-        item = next((item for item in self._values if item.key == key), None)
+        item = self._value_for_key(key)
         if item is None or item.checked is None or not item.enabled:
             return
         checked = bool(checked)
         if checked == item.checked:
             return
-        self._values = [replace(value, checked=checked) if value.key == key else value for value in self._values]
+        self._values[self._state._key_index[key]] = replace(item, checked=checked)
         self.itemCheckChanged.emit(key, checked)
 
     def itemGeometry(self, key, *, include_check_indicator=True):
@@ -380,16 +458,32 @@ class QtListView(_QtAbstractItemView):
         return self
 
     def currentText(self):
-        key = self.current
-        item = next((item for item in self._values if item.key == key), None)
+        item = self._value_for_key(self.current)
         return item.text if item is not None else ""
 
     def currentData(self):
         return self.itemData(self.current)
 
     def itemData(self, key):
-        item = next((item for item in self._values if item.key == key), None)
+        item = self._value_for_key(key)
         return item.data if item is not None else None
+
+    def itemForKey(self, key):
+        """Return the retained row payload in O(1), or None for an absent key.
+
+        Reuse the selection state's first-occurrence index rather than retaining
+        another per-row dictionary. Same-key payload refreshes remain visible.
+        """
+        return self._value_for_key(key)
+
+    def _value_for_key(self, key):
+        # QListWidget overrides itemForKey to return a QListWidgetItem, not
+        # the QtListItem payload consumed by this base renderer.
+        index = self._state._key_index.get(key)
+        if index is None or index >= len(self._values):
+            return None
+        item = self._values[index]
+        return item if item.key == key else None
 
     def setCurrentText(self, text):
         text = str(text)
@@ -402,11 +496,30 @@ class QtListView(_QtAbstractItemView):
         return changed
 
     def _sync_selection_visuals(self):
-        enabled_by_key = {value.key: bool(value.enabled) for value in self._values}
+        selected_keys = set(self.selected)
+        current_key = self.current
+        active_focus = self._has_focus
+        if self._row_visual_full_sync:
+            dirty = set(self.items)
+        else:
+            dirty = selected_keys ^ self._row_visual_selected
+            if current_key != self._row_visual_current:
+                dirty.update((current_key, self._row_visual_current))
+            if active_focus != self._row_visual_focus:
+                # Active/inactive themes also change unselected hover colors.
+                dirty.update(self.items)
+        dirty.update(self._row_visual_retry)
+        self._row_visual_retry.clear()
         visual_state = self._row_visual_state
-        for key, item in tuple(self.items.items()):
-            state = (key in self.selected, not enabled_by_key.get(key, True),
-                     key == self.current, self._has_focus)
+        for key in dirty:
+            item = self.items.get(key)
+            if item is None:
+                continue
+            value = self._value_for_key(key)
+            chosen = key in selected_keys
+            current = key == current_key
+            state = (chosen, value is not None and not value.enabled,
+                     current, active_focus)
             if visual_state.get(key) == state:
                 continue
             selected, disabled, current, active = state
@@ -424,8 +537,13 @@ class QtListView(_QtAbstractItemView):
                 # Do not cache an incomplete update: try again on the next
                 # selection/focus reconciliation if the backend was transient.
                 visual_state.pop(key, None)
+                self._row_visual_retry.add(key)
             else:
                 visual_state[key] = state
+        self._row_visual_selected = selected_keys
+        self._row_visual_current = current_key
+        self._row_visual_focus = active_focus
+        self._row_visual_full_sync = False
 
     def _focus_current(self):
         item = self.items.get(self.current)

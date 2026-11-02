@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..job_schedule_form import JobScheduleDialog as JobScheduleForm
+from ..jobs.job_schedule_form import JobScheduleDialog as JobScheduleForm
 from .common import RetainedTool
 
 

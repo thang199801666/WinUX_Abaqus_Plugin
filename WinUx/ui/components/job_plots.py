@@ -6,14 +6,19 @@ import time
 import re
 from typing import Any, Dict, Iterable, Optional
 
-from ...services.odb_history_live import default_history_ids, merge_series_delta
+from ...services.odb.history_live import default_history_ids, merge_series_delta
+from ...services.plot_palettes import (
+    PALETTES, EXCEL_THEME_KEYS, PLOT_THEME_KEYS,
+    normalize_plot_theme, palette_colors,
+)
+from ...preferences.plot_appearance import PlotAppearancePreferences
 from ...services.reference_charts import (ReferenceChartLibrary, evaluate_reference_formula, resolve_reference_formula_ids)
 from .. import QDockWidget as DockWidget
 from DearUIQt.widgets import (
     QCheckBox, QLineEdit, QToolButton, QFrame, QLabel, QSpacer, QSeparator,
     QCanvas, QPlotWidget, QPlotAxis, QLineSeries, QRetainedItem, QMenu, QToolTip,
 )
-from DearUIQt.layouts import QHBoxLayout, QVBoxLayout
+from DearUIQt.layouts import QHBoxLayout
 from DearUIQt.input_gate import (
     acquire_pointer_input, release_pointer_input,
     register_pointer_protected_item, unregister_pointer_protected_item,
@@ -46,11 +51,13 @@ class JobPlotsWindow:
     ICON_SIZE = 20
     ICON_BUTTON_WIDTH = 30
     ICON_GAP = 6
+    THEME_BUTTON_WIDTH = 76
+    PALETTE_BUTTON_WIDTH = THEME_BUTTON_WIDTH  # compatibility alias
     HEADER_HEIGHT = 18
     OUTER_MARGIN = 6
     TOOLBAR_BODY_GAP = 6
     PANEL_GAP = 8
-    HISTORY_ROW_GAP = 3
+    HISTORY_ROW_GAP = 2
     INNER_PAD = 7
     BUTTON_ROW_GAP = 4
     CONTROL_SECTION_GAP = 10
@@ -58,22 +65,14 @@ class JobPlotsWindow:
     BUTTON_HEIGHT = METRICS.button_height
     EDIT_HEIGHT = METRICS.control_height
     TOP_SECTION_PAD = 8
-    SERIES_COLORS = (
-        (0, 191, 255, 255),
-        (255, 179, 0, 255),
-        (76, 217, 100, 255),
-        (255, 99, 132, 255),
-        (178, 102, 255, 255),
-        (0, 220, 190, 255),
-        (255, 140, 66, 255),
-        (120, 170, 255, 255),
-    )
+    SERIES_COLORS = palette_colors('default')
 
     def __init__(
             self, parent, job_id: str, job_name: str,
             on_selection_change=None, on_close=None, on_dock_change=None,
-            on_dock_area_change=None, dock_area="right", reference_library=None,
-            on_reference_manage=None, after=None):
+             on_dock_area_change=None, dock_area="right", reference_library=None,
+             on_reference_manage=None, after=None, dock_features=None,
+             palette=None, on_palette_change=None):
         self.parent = parent
         self.job_id = str(job_id)
         self.job_name = str(job_name or "")
@@ -101,6 +100,7 @@ class JobPlotsWindow:
         self._after = after or (lambda delay, callback, *args: callback(*args))
         self._reference_series_tags = {}
         self._reference_series_objects = {}
+        self._reference_color_indices = {}
         self._reference_themes = {}  # compatibility: styles are now series-owned
         self._reference_menu_items = {}
         self._client_layout_signature = None
@@ -108,6 +108,11 @@ class JobPlotsWindow:
         self._font_probe_checked_at = 0.0
         self._native_revision = 0
         self._plot_tooltips = []
+        self._icon_button_layouts = {}
+        self._palette_preferences = PlotAppearancePreferences() if palette is None else None
+        self._palette_id = normalize_plot_theme(
+            self._palette_preferences.load_palette() if palette is None else palette)
+        self.on_palette_change = on_palette_change
 
         safe_job = "".join(ch if ch.isalnum() else "_" for ch in self.job_id)
         self.tag = "job_plots_window_{}".format(safe_job)
@@ -119,10 +124,14 @@ class JobPlotsWindow:
             stale.deleteNative()
 
         self._build_themes()
-        label = "Plots - {}{}".format(
-            self.job_name or "Job",
-            " ({})".format(self.job_id) if self.job_id else "",
-        )
+        if self.job_name or self.job_id:
+            label = "Plots"
+            if self.job_name:
+                label += " - {}".format(self.job_name)
+            if self.job_id:
+                label += " ({})".format(self.job_id)
+        else:
+            label = "Plots"
         self.label = label
         self.dock = DockWidget(
             self.parent,
@@ -130,6 +139,7 @@ class JobPlotsWindow:
             tag=self.tag,
             on_float_change=self._dock_float_requested,
             on_close=self._handle_close,
+            features=dock_features,
             dock_area=self.dock_area,
             on_dock_area_change=self._dock_area_requested,
         )
@@ -159,6 +169,24 @@ class JobPlotsWindow:
         self._reference_menu.triggered.connect(self._reference_menu_triggered)
         self.reference_popup = self._reference_menu.tag
         register_pointer_protected_item(self.reference_popup)
+        palette_layout = QHBoxLayout(parent=self._toolbar_frame, spacing=0)
+        self.palette_button = QToolButton(
+            'Theme', parent=palette_layout, width=self.THEME_BUTTON_WIDTH,
+            height=self.BUTTON_HEIGHT, auto_raise=False)
+        # Text tool buttons do not inherit the raised icon-button styling by
+        # default.  Bind the same plot-panel chrome explicitly so Theme reads
+        # as a clickable control instead of sinking into the toolbar surface.
+        self.palette_button.setTheme(plot_panel_icon_theme())
+        self._icon_button_layouts[self.palette_button.tag] = palette_layout
+        self.palette_button.clicked.connect(lambda: self._after(1, self._open_palette_menu))
+        self._palette_menu = QMenu((), min_width=230, max_width=340)
+        self._palette_menu.triggered.connect(self._palette_menu_triggered)
+        register_pointer_protected_item(self._palette_menu.tag)
+        self._update_palette_menu()
+        tip = QToolTip(self.palette_button)
+        tip.setTheme(tooltip_theme())
+        QLabel('Series color theme: Excel-style Theme Colors', parent=tip, wrap=320)
+        self._plot_tooltips.append(tip)
 
         # r71: DockManager owns default QDockWidget title-bar gestures so a
         # single Plot dock can use the same live left/right/top/bottom/center
@@ -206,6 +234,7 @@ class JobPlotsWindow:
             no_scrollbar=False, no_scroll_with_mouse=False,
             horizontal_scrollbar=False)
         self.history_container = self._history_frame.tag
+        self._history_frame.setTheme(self._history_theme)
 
         self._body_gap_widget = QSpacer(self.PANEL_GAP, 0, parent=self._body_layout)
         self.body_gap = self._body_gap_widget.tag
@@ -235,6 +264,8 @@ class JobPlotsWindow:
         self._plot_widget.setTheme(self._plot_theme)
         self._list_frame.setTheme(self._panel_theme)
         self._history_rows: Dict[str, Any] = {}
+        self._history_row_widgets = {}
+        self._history_tooltips = {}
         self._history_labels: Dict[str, Any] = {}
         self.reference_library.subscribe(self._refresh_references)
         self._refresh_references()
@@ -247,17 +278,25 @@ class JobPlotsWindow:
         # Source deployments without optional icons stay operable; the shipped
         # archive contains all four PNGs so users normally see only the icon.
         fallback_glyph = {"fit": "F", "reference": "R", "select_all": "+", "select_none": "–"}
+        layout = QHBoxLayout(parent=parent, spacing=0)
         button = QToolButton(
             "" if texture else fallback_glyph.get(name, "?"),
-            parent=parent, icon=texture, icon_size=(self.ICON_SIZE, self.ICON_SIZE),
+            parent=layout, icon=texture, icon_size=(self.ICON_SIZE, self.ICON_SIZE),
             auto_raise=True)
         button.setTheme(plot_panel_icon_theme())
         button.clicked.connect(callback)
-        tip = QToolTip(button, delay=0.55, hide_on_activity=True)
+        tip = QToolTip(button)
         tip.setTheme(tooltip_theme())
         QLabel(tooltip, parent=tip, wrap=280)
         self._plot_tooltips.append(tip)
+        self._icon_button_layouts[button.tag] = layout
         return button
+
+    def _position_icon_button(self, button, position):
+        # Position the wrapper, not the image button itself. Native DPG restores
+        # the cursor after explicitly positioned items; that can replace the
+        # last-item hover data consumed by the following native tooltip.
+        return self._safe_configure(self._icon_button_layouts[button.tag], pos=position)
 
     def _build_themes(self):
         # Plot-specific renderer roles are centralized in DearUIQt; WinUx only
@@ -267,17 +306,21 @@ class JobPlotsWindow:
         self._body_theme = compact_layout_surface_theme(
             padding=(0, 0), spacing=(0, 0), child_border=0,
             tag="winux.jobplots.body", cache=True)
+        self._history_theme = compact_layout_surface_theme(
+            padding=(0, 0), spacing=(0, self.HISTORY_ROW_GAP),
+            tag="winux.jobplots.history.rows", cache=True)
         self._panel_theme = panel_surface_theme(bordered=True, compact=True)
         self._history_label_theme = text_theme(
             color=(25, 25, 25, 255), tag="winux.jobplots.history.text", cache=True)
 
-    def set_dock_mode(self, mode):
+    def set_dock_mode(self, mode, *, sync=True):
         mode = "floating" if str(mode).lower() == "floating" else "docked"
         self.dock_mode = mode
         self._drag_undock_requested = False
         if hasattr(self, "dock"):
-            self.dock.set_floating(mode == "floating")
-        self._sync_client_layout(force=True)
+            self.dock.set_floating(mode == "floating", sync=sync)
+        if sync:
+            self._sync_client_layout(force=True)
 
     def set_dock_area(self, area):
         area = str(area or "right").lower()
@@ -382,6 +425,7 @@ class JobPlotsWindow:
         toolbar_w = max(1, content_w)
         fit_x = max(inner_pad, toolbar_w - inner_pad - icon_w)
         reference_x = max(inner_pad, fit_x - self.ICON_GAP - icon_w)
+        palette_x = max(inner_pad, reference_x - self.ICON_GAP - self.THEME_BUTTON_WIDTH)
         fit_y = max(0, (toolbar_h - self.BUTTON_HEIGHT) // 2)
         status_y = max(0, (toolbar_h - int(status_size[1])) // 2)
 
@@ -402,11 +446,12 @@ class JobPlotsWindow:
             self.toolbar, pos=(0, 0), width=toolbar_w,
             height=toolbar_h)
         self._safe_configure(self.status_text, pos=(inner_pad, status_y),
-                             wrap=max(40, reference_x - inner_pad - 8))
+                             wrap=max(40, palette_x - inner_pad - 8))
         # Image-button width/height describe glyph pixels, not outer frames.
         # Configure positions only; QToolButton and the icon theme own sizing.
-        self._safe_configure(self.fit_button, pos=(fit_x, fit_y))
-        self._safe_configure(self.reference_button, pos=(reference_x, fit_y))
+        self._position_icon_button(self.fit_button, (fit_x, fit_y))
+        self._position_icon_button(self.reference_button, (reference_x, fit_y))
+        self._position_icon_button(self.palette_button, (palette_x, fit_y))
 
         self._safe_configure(
             self.body_panel, pos=(margin, body_y),
@@ -423,9 +468,9 @@ class JobPlotsWindow:
         self._safe_configure(
             self.filter_input, pos=(inner_pad, filter_y),
             width=filter_w, height=self.EDIT_HEIGHT)
-        self._safe_configure(self.all_button, pos=(inner_pad, button_row_y))
-        self._safe_configure(self.none_button,
-                             pos=(inner_pad + icon_w + self.ICON_GAP, button_row_y))
+        self._position_icon_button(self.all_button, (inner_pad, button_row_y))
+        self._position_icon_button(self.none_button,
+                                   (inner_pad + icon_w + self.ICON_GAP, button_row_y))
         self._safe_configure(self.count_text, pos=(count_x, count_y))
         self._safe_configure(
             self.header_separator, pos=(inner_pad, history_y - 7),
@@ -479,10 +524,13 @@ class JobPlotsWindow:
         if pointer is not None:
             try:
                 handle_pos = self._drag_handle_widget.globalPos()
+                handle_size = self._drag_handle_widget.size()
                 hx, hy = float(handle_pos.x()), float(handle_pos.y())
                 drag_anchor = (
                     max(0.0, pointer[0] - hx),
                     max(0.0, pointer[1] - hy),
+                    max(1.0, float(handle_size.width())),
+                    max(1.0, float(handle_size.height())),
                 )
             except Exception:
                 drag_anchor = None
@@ -521,12 +569,18 @@ class JobPlotsWindow:
         self._closed = True
         self.reference_library.unsubscribe(self._refresh_references)
         unregister_pointer_protected_item(self.reference_popup)
+        unregister_pointer_protected_item(self._palette_menu.tag)
+        self._palette_menu.delete()
         try:
             self._reference_menu.delete()
         except Exception:
             pass
         self._clear_reference_series()
         self._cleanup_series_themes()
+        self._clear_history_rows()
+        for tip in self._plot_tooltips:
+            tip.delete()
+        self._plot_tooltips.clear()
         if self._drag_registry:
             try:
                 if hasattr(self._drag_registry, "delete"):
@@ -554,14 +608,78 @@ class JobPlotsWindow:
     def _handle_close(self, sender=None, app_data=None, user_data=None):
         self.close(notify=True)
 
+    def _update_palette_menu(self):
+        def rows(keys):
+            return [
+                {'id': key, 'action': key, 'label': PALETTES[key][0],
+                 'checkable': True, 'checked': key == self._palette_id}
+                for key in keys
+            ]
+
+        # Mirror Excel's Theme Colors gallery: one curated colour family per
+        # row.  Series consume the six accent swatches in order, then the
+        # darker accent pass for charts with more than six curves.
+        self._palette_menu.setActions(rows(EXCEL_THEME_KEYS))
+
+    def _open_palette_menu(self):
+        if not self.exists():
+            return
+        from DearUIQt.gui.placement import item_screen_rect, visible_item_screen_rect
+        from DearUIQt.backends.native_windows import NativeWindowBackend
+        button = self.palette_button
+        self._palette_menu.popupBelow(
+            item_screen_rect(button.backend, button.tag),
+            global_position=NativeWindowBackend(button.backend).isEnabled(),
+            anchor_provider=lambda: (visible_item_screen_rect(button.backend, button.tag)
+                                     if button.exists() and button.isVisible() else None))
+
+    def _palette_menu_triggered(self, action, _context=None):
+        if action in PLOT_THEME_KEYS:
+            self.set_palette(action)
+
+    def set_palette(self, palette, *, persist=True, notify=True):
+        palette = normalize_plot_theme(palette)
+        if palette == self._palette_id or not self.exists():
+            return False
+        self._palette_id = palette
+        for item_id, series in self._series_objects.items():
+            if series.exists():
+                series.setStyle(color=self._series_color(item_id))
+        for plot_id, series in self._reference_series_objects.items():
+            if series.exists():
+                series.setStyle(color=self._reference_color(self._reference_color_indices.get(plot_id, 0)))
+        self._update_palette_menu()
+        self._native_revision += 1
+        if persist and self._palette_preferences is not None:
+            try:
+                self._palette_preferences.save_palette(palette)
+            except (OSError, ValueError) as exc:
+                self.set_error('Could not save plot theme: {}'.format(exc))
+        if notify and callable(self.on_palette_change):
+            self.on_palette_change(palette)
+        return True
+
+    def _reference_color(self, index):
+        # Continue the selected theme after the history-output colors.  Excel
+        # treats every plotted series as part of one chart color sequence;
+        # reference overlays should therefore not jump to a separate palette.
+        colors = palette_colors(self._palette_id)
+        return colors[(len(self.catalog) + index) % len(colors)]
+
     def _open_reference_menu(self):
         if not self.exists():
             return
         if not self.reference_library.snapshot():
             self._manage_references()
             return
-        geometry = self.reference_button.globalGeometry()
-        self._reference_menu.popup((geometry.left(), geometry.bottom()))
+        from DearUIQt.gui.placement import item_screen_rect, visible_item_screen_rect
+        from DearUIQt.backends.native_windows import NativeWindowBackend
+        self._reference_menu.popupBelow(
+            item_screen_rect(self.reference_button.backend, self.reference_button.tag),
+            global_position=NativeWindowBackend(self.reference_button.backend).isEnabled(),
+            anchor_provider=lambda: (
+                visible_item_screen_rect(self.reference_button.backend, self.reference_button.tag)
+                if self.reference_button.exists() and self.reference_button.isVisible() else None))
 
     def _reference_menu_triggered(self, action, _context=None):
         action = str(action or "")
@@ -600,6 +718,7 @@ class JobPlotsWindow:
             except Exception:
                 pass
         self._reference_series_objects.clear()
+        self._reference_color_indices.clear()
         self._reference_series_tags.clear()
         self._reference_themes.clear()
 
@@ -626,8 +745,6 @@ class JobPlotsWindow:
             self._reference_menu_items[series_id] = action
         self._reference_menu.setActions(menu_actions)
         self._clear_reference_series()
-        colors = ((163, 56, 157, 255), (128, 91, 12, 255), (38, 112, 143, 255),
-                  (181, 55, 42, 255), (76, 104, 45, 255), (82, 73, 151, 255))
         rendered = 0
         for index, item in enumerate(references):
             series_id = item["id"]
@@ -652,9 +769,10 @@ class JobPlotsWindow:
                 series = self._plot_widget.addLineSeries(
                     list(xs), list(ys), axis=self._y_axis_widget,
                     label="Reference: {}".format(plot_item.get("name") or item["name"]),
-                    color=colors[index % len(colors)], width=2.0,
+                    color=self._reference_color(index), width=2.0,
                     marker=(QLineSeries.CircleMarker if len(points) == 1 else QLineSeries.NoMarker))
                 self._reference_series_objects[plot_id] = series
+                self._reference_color_indices[plot_id] = index
                 self._reference_series_tags[plot_id] = series.tag
                 rendered += 1
         if rendered:
@@ -732,10 +850,32 @@ class JobPlotsWindow:
         self._sync_formula_dependencies(notify=False)
         self._notify_selection_changed()
 
+    @staticmethod
+    def _history_tooltip_text(row, item_id):
+        output = str(row.get("output") or item_id)
+        display = str(row.get("displayName") or output)
+        lines = [display, "Output: {}".format(output)]
+        description = str(row.get("description") or "")
+        if description and description not in display:
+            lines.append("Description: {}".format(description))
+        for key, title in (("step", "Step"), ("historyRegion", "Region"),
+                           ("regionDescription", "Region description")):
+            if row.get(key):
+                lines.append("{}: {}".format(title, row[key]))
+        lines.append("Points: {:,}".format(int(row.get("points") or 0)))
+        return "\n".join(lines)
+
+    def _clear_history_rows(self):
+        for row in self._history_row_widgets.values():
+            row.delete()
+        self._history_row_widgets.clear()
+        self._history_tooltips.clear()
+
     def _rebuild_history_list(self):
         history = QRetainedItem(self.history_container)
         if not history.exists():
             return
+        self._clear_history_rows()
         history.clear()
         self._checkboxes.clear()
         self._history_rows.clear()
@@ -743,36 +883,33 @@ class JobPlotsWindow:
         for item_id, row in self.catalog.items():
             output = str(row.get("output") or "")
             display = str(row.get("displayName") or output or item_id)
-            step = str(row.get("step") or "")
-            region = str(row.get("historyRegion") or "")
             points = int(row.get("points") or 0)
             label = "{}  ·  {:,} pts".format(display, points)
-            row_layout = QVBoxLayout(parent=self.history_container, spacing=0)
+            # One inline row, with a single 2px vertical gap owned by the list
+            # theme. Nested groups/spacers previously added several native
+            # ItemSpacing gaps, making each small checkbox row about 32px tall.
+            row_layout = QHBoxLayout(parent=self._history_frame, spacing=7)
             row_group = row_layout.tag
-            inline_layout = QHBoxLayout(parent=row_layout, spacing=0)
-            inline_group = inline_layout.tag
             checkbox = QCheckBox(
                 "", checked=item_id in self.selected_ids,
-                parent=inline_group)
+                parent=row_layout)
             checkbox.clicked.connect(
                 lambda checked, item_id=item_id, checkbox=checkbox:
                 self._checkbox_changed(checkbox.tag, checked, item_id))
-            QSpacer(7, 0, parent=inline_layout)
-            label_widget = QLabel(label, parent=inline_layout)
+            label_widget = QLabel(label, parent=row_layout)
             label_widget.setTheme(self._history_label_theme)
             label_text = label_widget.tag
-            QSpacer(0, self.HISTORY_ROW_GAP, parent=row_layout)
             self._checkboxes[item_id] = checkbox
             self._history_rows[item_id] = row_group
+            self._history_row_widgets[item_id] = row_layout
             self._history_labels[item_id] = label_text
+            tips = []
             for tip_target in (checkbox, label_widget):
-                tip = QToolTip(tip_target, delay=0.45, hide_on_activity=True)
+                tip = QToolTip(tip_target)
                 tip.setTheme(tooltip_theme())
-                QLabel("Output: {}".format(output), wrap=420, parent=tip)
-                if step:
-                    QLabel("Step: {}".format(step), wrap=420, parent=tip)
-                if region:
-                    QLabel("Region: {}".format(region), wrap=420, parent=tip)
+                QLabel(self._history_tooltip_text(row, item_id), wrap=420, parent=tip)
+                tips.append(tip)
+            self._history_tooltips[item_id] = tips
         self._apply_filter()
 
     def _update_history_count(self):
@@ -835,6 +972,7 @@ class JobPlotsWindow:
                 "series": [{"id": key, "points": [list(p) for p in points], "reset": True}
                            for key, points in self._series_points.items()],
                 "references": self.reference_library.snapshot(),
+                "palette": self._palette_id,
                 "status": self._status_label.text()}
 
     def _filter_changed(self, sender=None, app_data=None, user_data=None):
@@ -856,14 +994,15 @@ class JobPlotsWindow:
             QRetainedItem(target).setVisible(not needle or needle in haystack)
 
     def _series_color(self, item_id):
+        colors = palette_colors(getattr(self, '_palette_id', 'default'))
         row = self.catalog.get(item_id, {})
         output = str(row.get("output") or "").strip().upper()
         if output == "ALLKE":
-            return (0, 191, 255, 255)
+            return colors[0]
         if output == "ALLIE":
-            return (255, 179, 0, 255)
+            return colors[1]
         index = list(self.catalog).index(item_id) if item_id in self.catalog else 0
-        return self.SERIES_COLORS[index % len(self.SERIES_COLORS)]
+        return colors[index % len(colors)]
 
     def _delete_series(self, item_id):
         self._series_tags.pop(item_id, None)
@@ -927,14 +1066,15 @@ class JobPlotsWindow:
                 "Live | {} selected | {} points | updated {}".format(
                     len(self.selected_ids), total_points, stamp))
 
-    def reference_formula_sources(self):
+    def reference_formula_sources(self, *, include_points=True):
         """Return a serializable snapshot of the current Plot history catalog/data."""
         rows = []
         for item_id, catalog in self.catalog.items():
             row = dict(catalog or {})
             row["id"] = str(item_id)
-            row["points"] = [list(point[:2]) for point in self._series_points.get(item_id, ())
-                             if isinstance(point, (list, tuple)) and len(point) >= 2]
+            row["points"] = ([list(point[:2]) for point in self._series_points.get(item_id, ())
+                              if isinstance(point, (list, tuple)) and len(point) >= 2]
+                             if include_points else [])
             rows.append(row)
         return rows
 

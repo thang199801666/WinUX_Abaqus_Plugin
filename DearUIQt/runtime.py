@@ -1,13 +1,8 @@
 """Small host/runtime abstractions for standalone Dear PyGui UI surfaces."""
 from __future__ import annotations
 
-import heapq
-import time
-import itertools
-import threading
-from queue import Queue, Empty
-
 from .core.object import QSize
+from .core.dispatcher import QEventDispatcher
 
 
 class StandaloneUiHost:
@@ -24,15 +19,7 @@ class StandaloneUiHost:
             backend = get_backend()
         self.backend = backend
         self.is_standalone_ui_host = True
-        self._queue = []
-        self._incoming = Queue()
-        self._sequence = itertools.count(1)
-        # Heap entries carry only lightweight schedule tokens; callback/args
-        # live in a separately cancellable map. ``after_cancel`` can therefore
-        # release an obsolete bound-method closure immediately even when its
-        # due timestamp is far in the future.
-        self._scheduled_callbacks = {}
-        self._scheduled_lock = threading.Lock()
+        self.dispatcher = QEventDispatcher()
         self._floating_focus_suppressed = True
         self._native_hwnd = 0
         self.use_native_file_selectors = False
@@ -46,74 +33,33 @@ class StandaloneUiHost:
             callback("{}: {}".format(title, message))
 
     def after(self, delay_ms, callback, *args):
-        sequence = next(self._sequence)
-        due = time.monotonic() + max(0, int(delay_ms or 0)) / 1000.0
-        with self._scheduled_lock:
-            self._scheduled_callbacks[sequence] = (callback, args)
-        self._incoming.put((due, sequence))
-        return sequence
+        return self.dispatcher.after(delay_ms, callback, *args)
 
     def after_cancel(self, sequence):
-        """Cancel a callback immediately, reclaiming stale timer heap nodes.
+        return self.dispatcher.after_cancel(sequence)
 
-        QTimer restarts and closing dialogs can cancel many long-running timers.
-        Opportunistic compaction avoids retaining those deadline tokens until
-        their original due time. The incoming MPSC queue is filtered on pump.
-        """
-        if sequence is None:
-            return False
-        with self._scheduled_lock:
-            removed = self._scheduled_callbacks.pop(sequence, None) is not None
-            if removed and len(self._queue) > max(64, len(self._scheduled_callbacks) * 2 + 32):
-                self._queue[:] = [
-                    item for item in self._queue
-                    if item[1] in self._scheduled_callbacks
-                ]
-                heapq.heapify(self._queue)
-            return removed
+    def next_deadline_ms(self):
+        return self.dispatcher.nextDeadlineMs()
+
+    def set_wake_callback(self, callback):
+        return self.dispatcher.setWakeCallback(callback)
+
+    def close(self):
+        self.dispatcher.close()
+
+    def _callback_error(self, callback, error):
+        handler = getattr(self, 'on_callback_error', None)
+        if callable(handler):
+            handler(callback, error)
 
     def pump(self, max_callbacks=256, time_budget_ms=8.0):
-        """Process one bounded standalone UI turn without starving rendering.
-
-        The old unbounded intake loop could starve rendering when another
-        thread flooded the callback queue, and due timer bursts executed in a
-        single turn. Keep deadline order, retain the unprocessed tail, and
-        continue on the next rendered frame without dropping input events.
-        """
-        for _ in range(2048):
-            try:
-                due, sequence = self._incoming.get_nowait()
-            except Empty:
-                break
-            with self._scheduled_lock:
-                live = sequence in self._scheduled_callbacks
-            if live:
-                heapq.heappush(self._queue, (due, sequence))
-        start = time.monotonic()
-        processed = 0
-        limit = max(0, int(max_callbacks)) if max_callbacks is not None else None
-        budget = (None if time_budget_ms is None else
-                  max(0.0, float(time_budget_ms)) / 1000.0)
-        while self._queue and self._queue[0][0] <= time.monotonic():
-            if limit is not None and processed >= limit:
-                break
-            if budget is not None and processed and time.monotonic() - start >= budget:
-                break
-            _due, sequence = heapq.heappop(self._queue)
-            with self._scheduled_lock:
-                payload = self._scheduled_callbacks.pop(sequence, None)
-            if payload is None:
-                continue
-            callback, args = payload
-            try:
-                callback(*args)
-            except Exception:
-                # One UI callback must not terminate a standalone feature loop.
-                pass
-            processed += 1
-        return processed
+        """Deliver one bounded UI turn; report errors through an optional hook."""
+        return self.dispatcher.processEvents(max_callbacks, time_budget_ms,
+                                             on_error=self._callback_error)
 
     def winfo_exists(self):
+        if self.dispatcher.isClosed():
+            return False
         try:
             return bool(self.backend.is_dearpygui_running())
         except Exception:
@@ -130,6 +76,8 @@ class QGuiRuntime:
     calls through their main-window implementation.
     """
 
+    _before_render_callbacks = {}
+
     def __init__(self, backend=None):
         if backend is None:
             from .backends import get_backend
@@ -139,6 +87,59 @@ class QGuiRuntime:
         self._setup = False
         self._viewport_created = False
         self._visible = False
+
+    def addBeforeRenderCallback(self, callback, *, late=False):
+        """Register short UI-thread work immediately before renderer submission.
+
+        Registrations are shared by wrappers for the same backend/context.
+        Bound methods are weak and callbacks are removed at context teardown.
+        This is for late cursor/overlay sampling, never I/O or full layouts.
+        ``late`` samples pointer overlays after ordinary pre-render updates,
+        regardless of registration order.
+        """
+        import weakref
+        if not callable(callback):
+            raise TypeError('before-render callback must be callable')
+        token = object()
+        weak = getattr(callback, '__self__', None) is not None
+        try:
+            entry = (weakref.WeakMethod(callback), True) if weak else (callback, False)
+        except TypeError:
+            entry = (callback, False)
+        self._before_render_callbacks.setdefault(id(self.backend), {})[token] = (*entry, bool(late))
+        return token
+
+    def removeBeforeRenderCallback(self, token):
+        callbacks = self._before_render_callbacks.get(id(self.backend))
+        if callbacks is None:
+            return False
+        removed = callbacks.pop(token, None) is not None
+        if not callbacks:
+            self._before_render_callbacks.pop(id(self.backend), None)
+        return removed
+
+    def _run_before_render_callbacks(self):
+        callbacks = self._before_render_callbacks.get(id(self.backend))
+        if not callbacks:
+            return
+        # Snapshot both phases together: registrations made by a callback must
+        # wait for the next frame, including late registrations.
+        tokens = sorted(tuple(callbacks), key=lambda token: callbacks[token][2])
+        for token in tokens:
+            entry = callbacks.get(token)
+            if entry is None:
+                continue
+            callback, weak, _late = entry
+            callback = callback() if weak else callback
+            if callback is None or getattr(getattr(callback, '__self__', None), '_deleted', False):
+                self.removeBeforeRenderCallback(token)
+                continue
+            try:
+                callback()
+            except Exception:
+                self.removeBeforeRenderCallback(token)
+                import logging
+                logging.getLogger(__name__).exception('Before-render callback removed after failure')
 
     def createContext(self, *, manual_callbacks=True):
         if self._context_created:
@@ -197,6 +198,17 @@ class QGuiRuntime:
         configure(0, **options)
         return True
 
+    def setViewportTitle(self, title):
+        """Update the active viewport caption, including externally owned hosts."""
+        setter = getattr(self.backend, "set_viewport_title", None)
+        if not callable(setter):
+            return False
+        try:
+            setter(str(title))
+            return True
+        except Exception:
+            return False
+
     def viewportSize(self, *, client=False):
         """Return the current viewport size as ``QSize``."""
         prefix = "get_viewport_client_" if client else "get_viewport_"
@@ -244,6 +256,8 @@ class QGuiRuntime:
 
     def setPrimaryWindow(self, item, primary=True):
         self.backend.set_primary_window(getattr(item, "tag", item), bool(primary))
+        from .backends.native_windows import NativeWindowBackend
+        NativeWindowBackend(self.backend).registerPrimary(item, primary)
 
     def setApplicationTheme(self, theme):
         """Bind one application-wide renderer theme through the runtime boundary."""
@@ -298,10 +312,31 @@ class QGuiRuntime:
         except Exception:
             return False
 
+    def hasPendingPresentation(self):
+        """Whether a native window transition needs the next render promptly."""
+        from .backends.native_presentation import presentation_for
+        presentation = presentation_for(self.backend)
+        return bool(presentation is not None and presentation.needs_frame())
+
     def renderFrame(self):
         if not self.isRunning():
             return False
-        self.backend.render_dearpygui_frame()
+        from .gui.popup_tracking import update_popup_positions
+        update_popup_positions(self.backend)
+        from .backends.shared_scrollers import update_shared_scrollers
+        update_shared_scrollers(self.backend)
+        from .backends.native_presentation import presentation_for
+        presentation = presentation_for(self.backend)
+        if presentation is not None:
+            presentation.before_frame()
+        try:
+            self._run_before_render_callbacks()
+            self.backend.render_dearpygui_frame()
+        finally:
+            if presentation is not None:
+                presentation.after_frame()
+        # Stretching controls publish their new geometry during this render.
+        update_popup_positions(self.backend)
         return True
 
     def stop(self):
@@ -438,8 +473,17 @@ class QGuiRuntime:
         try:
             if self.isRunning():
                 self.stop()
+            from .backends.shared_scrollers import clear_shared_scrollers
+            clear_shared_scrollers(self.backend)
             self.backend.destroy_context()
         finally:
+            self._before_render_callbacks.pop(id(self.backend), None)
+            from .backends.native_windows import NativeWindowBackend
+            NativeWindowBackend(self.backend).registerPrimary(None, False)
+            from .gui.popup_tracking import clear_popup_tracking
+            clear_popup_tracking(self.backend)
+            from .backends.native_presentation import release_presentation
+            release_presentation(self.backend)
             self._context_created = False
             self._setup = False
             self._viewport_created = False

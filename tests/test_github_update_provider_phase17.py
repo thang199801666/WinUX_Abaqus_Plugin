@@ -321,7 +321,7 @@ def test_application_update_preferences_keep_legacy_source_and_normalize_repo(tm
 def test_settings_form_exposes_github_and_legacy_s_provider_controls():
     from pathlib import Path
 
-    source = (Path(__file__).parents[1] / "WinUx" / "dialogs" / "settings_form.py").read_text()
+    source = (Path(__file__).parents[1] / "WinUx" / "dialogs" / "settings" / "settings_form.py").read_text(encoding="utf-8")
     for token in (
         '"Updates"',
         '"GitHub repository"',

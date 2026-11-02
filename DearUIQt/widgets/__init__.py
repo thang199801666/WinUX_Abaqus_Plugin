@@ -4,7 +4,7 @@ Implementation lives in this package. ``DearUIQt.qt`` is a legacy facade only.
 """
 from .._lazy import resolve, namespace_dir
 _EXPORTS = {
-    "QApplication": "..core.application", "QWidget": ".widget", "QRetainedItem": ".retained", "QCanvas": ".canvas", "QViewportCanvas": ".canvas", "QToolTip": ".tooltip",
+    "QApplication": "..core.application", "QWidget": ".widget", "QRetainedItem": ".retained", "QCanvas": ".canvas", "QViewportCanvas": ".canvas", "QPaintGroup": ".canvas", "QToolTip": ".tooltip",
     "QPlotWidget": ".plot", "QPlotAxis": ".plot", "QLineSeries": ".plot",
     "QFrame": ".containers", "QMainWindow": ".windows", "QNativeWindow": ".native_window", "QInlineEditPanel": ".inline_edit",
     "QLabel": ".buttons", "QPushButton": ".buttons", "QToolButton": ".buttons", "QImageView": ".image",

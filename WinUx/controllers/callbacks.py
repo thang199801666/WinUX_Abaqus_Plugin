@@ -17,6 +17,7 @@ REQUIRED_CALLBACK_KEYS = (
     "run_job",
     "check_inp",
     "check_odb",
+    "upgrade_odb",
     "edit_server_file",
     "extract_odb",
     "quick_transfer",
@@ -54,6 +55,7 @@ def build_controller_callbacks(controller):
         "run_job": controller.run_job,
         "check_inp": controller.check_inp,
         "check_odb": controller.check_odb,
+        "upgrade_odb": controller.upgrade_odb,
         "edit_server_file": controller.edit_server_file,
         "extract_odb": controller.extract_odb,
         "quick_transfer": controller.quick_transfer,
@@ -61,11 +63,15 @@ def build_controller_callbacks(controller):
         "job_schedule": controller.job_schedules,
         "job_schedule_command": controller.job_schedule_command,
         "console_output": controller.server.shell_output,
+        "console_raw_output": controller.server.shell_terminal_output,
         "console_connected": lambda: controller.server.connected,
         "console_command": controller.console_command,
+        "console_input": controller.console_input,
+        "console_resize": controller.console_resize,
         "console_complete": controller.console_complete,
         "console_completion_list": controller.console_completion_list,
         "console_interrupt": controller.console_interrupt,
+        "console_refresh": controller.console_refresh,
         "job_user": lambda: controller.server.username or "",
         "bookmark_command": controller.bookmark_command,
         "site_manager": controller.site_manager,
@@ -74,6 +80,12 @@ def build_controller_callbacks(controller):
         # part of REQUIRED_CALLBACK_KEYS so injected/minimal views stay source
         # compatible, while the production view can wake adaptive pollers.
         "user_activity": controller.user_activity,
+        # Optional view-state queries used to keep Explorer context-menu
+        # commands Qt-like: visible at all times, but enabled only when the
+        # current selection/clipboard/server state makes the command valid.
+        "file_clipboard_available": (
+            lambda: controller._file_clipboard_controller().has_files()),
+        "server_connected": lambda: bool(controller.server.connected),
     }
     return validate_callbacks(callbacks)
 

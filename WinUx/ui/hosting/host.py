@@ -66,6 +66,7 @@ class QDialogHost:
         self.lease = None
         self.reuse_count = 0
         self.idle_ack = False
+        self.idle_since = None
         self.last_kind = None
         self.source_epoch = None
         self._reap_started = False
@@ -130,6 +131,7 @@ class QDialogHost:
                 self.close()
             else:
                 self.idle_ack = True
+                self.idle_since = time.monotonic()
                 self.ready.set()
         except (OSError, ValueError, RuntimeError, StopIteration):
             self.close()
@@ -331,6 +333,7 @@ class QDialogHostPool:
                 self._workers.remove(worker)
                 worker.ready.clear()
                 worker.idle_ack = False
+                worker.idle_since = None
                 worker.lease = secrets.token_hex(16)
                 if self.reusable:
                     self._leased.add(worker)
@@ -391,6 +394,7 @@ class QDialogHostPool:
             keep = (reusable or waiting) and len(self._workers) < idle_limit
             if keep:
                 worker.idle_ack = True
+                worker.idle_since = time.monotonic()
                 worker.reuse_count += 1
                 if reusable:
                     worker.ready.set()
@@ -409,6 +413,29 @@ class QDialogHostPool:
                 self._workers.remove(worker)
         worker.close()
         self.refill()
+
+    def trim_idle(self, max_idle_seconds=120.0, *, now=None):
+        """Retire unused clean hosts, never leased tools or hosts still loading.
+
+        Do not immediately refill: the next tool request can launch normally,
+        and a recently closed tool will again be reusable for the grace period.
+        The GUI maintenance turn must never wait for the preparation lock.
+        """
+        now = time.monotonic() if now is None else float(now)
+        if not self._lock.acquire(False):
+            return 0
+        try:
+            if self._closed:
+                return 0
+            expired = [worker for worker in self._workers
+                       if worker.idle_ack and worker.idle_since is not None
+                       and now - worker.idle_since >= max(0.0, max_idle_seconds)]
+            self._workers = [worker for worker in self._workers if worker not in expired]
+        finally:
+            self._lock.release()
+        for worker in expired:
+            worker.close()
+        return len(expired)
 
     def close(self):
         with self._lock:
@@ -435,6 +462,7 @@ def start_dialog_prewarm(view):
         pool = QDialogHostPool(capacity=1, reusable=True, resident_headroom=0)
     view._dialog_host_pool = pool
     view._dialog_prewarm_pool = pool
+    dialog_host_manager(view).schedule_idle_trim()
 
 
 class QDialogLease:
@@ -592,6 +620,20 @@ class QDialogHostManager:
         # older hidden hosts back into the normal warm pool.
         self._resident_hidden = OrderedDict()
         self._resident_limit = max(0, int(getattr(view, "_dialog_resident_limit", 6)))
+        self._idle_trim_token = None
+
+    def schedule_idle_trim(self):
+        after = getattr(self.view, 'after', None)
+        if not self._closed and self._idle_trim_token is None and callable(after):
+            self._idle_trim_token = after(30000, self._trim_idle_hosts)
+
+    def _trim_idle_hosts(self):
+        self._idle_trim_token = None
+        if self._closed:
+            return
+        if self._pool is not None:
+            self._pool.trim_idle(120.0)
+        self.schedule_idle_trim()
 
     @property
     def pool(self):
@@ -707,6 +749,10 @@ class QDialogHostManager:
         if self._closed:
             return
         self._closed = True
+        token, self._idle_trim_token = self._idle_trim_token, None
+        cancel = getattr(self.view, 'after_cancel', None)
+        if token is not None and callable(cancel):
+            cancel(token)
         with self._lease_lock:
             leases = tuple(self._leases)
             self._leases.clear()

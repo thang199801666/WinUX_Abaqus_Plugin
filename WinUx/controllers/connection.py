@@ -119,6 +119,7 @@ class ConnectionController:
 
     def login_failed(self, dialog, error, automatic=False):
         self.app._connection_online.clear()
+        self._update_connection_indicator()
         if dialog is not None:
             try:
                 if dialog.winfo_exists():
@@ -182,6 +183,7 @@ class ConnectionController:
         """
         if self.app._closing:
             return
+        self.view.after(0, self._update_connection_indicator)
         if not hasattr(self.app, "_connection_online"):
             self.app._connection_online = threading.Event()
         if self.server.connected:
@@ -303,9 +305,18 @@ class ConnectionController:
                 not self.server.connected):
             return
         self.app._connection_online.set()
+        self._update_connection_indicator()
         self.app._schedule_wakeup.set()
         self.app._flush_schedule_manifest_async()
         folder = self.app._server_current_path or self.server.home
         # Never perform wire I/O from Dear PyGui's render thread. A reconnect
         # can complete while a transfer owns the serialized SSH lock.
         self.app.open_path(self.view.right, folder, False)
+
+    def _update_connection_indicator(self):
+        """UI-thread delivery reads current state, never an old worker snapshot."""
+        if self.app._closing:
+            return
+        setter = getattr(self.view, 'set_server_connection_state', None)
+        if callable(setter):
+            setter(bool(self.server.connected))

@@ -116,8 +116,7 @@ def _control_frame(theme_component, *, focused=False, disabled=False):
     # visually equal to the 26 px retained spin-box shell.
     dpg.add_theme_style(dpg.mvStyleVar_FramePadding, METRICS.frame_pad_x, METRICS.editor_frame_pad_y)
     dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
-    # Match the crisp square outline of the shared combo/editor shells.
-    dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+    dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, METRICS.frame_rounding)
 
 
 def line_edit_shell_theme(*, focused=False, disabled=False):
@@ -149,7 +148,7 @@ def line_edit_shell_theme(*, focused=False, disabled=False):
             dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
             dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 1)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 0)
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, METRICS.frame_rounding)
     if slot == 'normal':
         _LINE_EDIT_SHELL_THEME = theme
     elif slot == 'focus':
@@ -166,10 +165,10 @@ def line_edit_editor_theme(*, disabled=False):
     if _is_theme(current):
         return current
     p = QtFusionPalette
-    background = p.BUTTON_DISABLED if disabled else p.BASE
+    background = (0, 0, 0, 0)  # Let the rounded outer shell paint the surface.
     text = p.TEXT_DISABLED if disabled else p.TEXT
     with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvInputText):
+        with dpg.theme_component(dpg.mvInputText, enabled_state=not disabled):
             dpg.add_theme_color(dpg.mvThemeCol_FrameBg, background)
             dpg.add_theme_color(dpg.mvThemeCol_FrameBgHovered, background)
             dpg.add_theme_color(dpg.mvThemeCol_FrameBgActive, background)
@@ -201,7 +200,7 @@ def line_edit_theme(*, focused=False, disabled=False):
     if _is_theme(current):
         return current
     with dpg.theme() as theme:
-        with dpg.theme_component(dpg.mvInputText) as component:
+        with dpg.theme_component(dpg.mvInputText, enabled_state=not disabled) as component:
             _control_frame(component, focused=focused, disabled=disabled)
     if slot == 'normal':
         _LINE_EDIT_THEME = theme
@@ -280,7 +279,7 @@ def plain_text_edit_theme():
             dpg.add_theme_color(dpg.mvThemeCol_TextSelectedBg, (0, 120, 215, 115))
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 5)
             dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, METRICS.frame_rounding)
         with dpg.theme_component(dpg.mvAll):
             add_dpg_scroller_style(dpg, track=p.WINDOW_ALT)
     _PLAIN_TEXT_EDIT_THEME = theme
@@ -395,11 +394,11 @@ def dialog_theme():
             dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, p.TITLE_ACTIVE)
             dpg.add_theme_color(dpg.mvThemeCol_TitleBgCollapsed, p.TITLE)
             dpg.add_theme_color(dpg.mvThemeCol_MenuBarBg, p.TOOLBAR)
-            dpg.add_theme_color(dpg.mvThemeCol_TableHeaderBg, p.TOOLBAR)
-            dpg.add_theme_color(dpg.mvThemeCol_TableBorderStrong, p.BORDER)
-            dpg.add_theme_color(dpg.mvThemeCol_TableBorderLight, p.BORDER_LIGHT)
-            dpg.add_theme_color(dpg.mvThemeCol_TableRowBg, p.BASE)
-            dpg.add_theme_color(dpg.mvThemeCol_TableRowBgAlt, p.ALTERNATE_BASE)
+            dpg.add_theme_color(dpg.mvThemeCol_TableHeaderBg, p.TABLE_HEADER)
+            dpg.add_theme_color(dpg.mvThemeCol_TableBorderStrong, p.TABLE_BORDER)
+            dpg.add_theme_color(dpg.mvThemeCol_TableBorderLight, p.TABLE_GRID)
+            dpg.add_theme_color(dpg.mvThemeCol_TableRowBg, p.TABLE_ROW)
+            dpg.add_theme_color(dpg.mvThemeCol_TableRowBgAlt, p.TABLE_ROW_ALT)
             dpg.add_theme_color(dpg.mvThemeCol_Tab, p.BUTTON)
             dpg.add_theme_color(dpg.mvThemeCol_TabHovered, p.BUTTON_HOVER)
             dpg.add_theme_color(dpg.mvThemeCol_TabActive, p.BASE)
@@ -477,7 +476,8 @@ def dialog_theme():
                 dpg.add_theme_color(dpg.mvThemeCol_TextSelectedBg, (0, 120, 215, 115))
                 dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 3)
                 dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
-                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding,
+                                    0 if component == dpg.mvListbox else METRICS.frame_rounding)
 
         # QComboBox preview and arrow share one outer frame; the arrow subcontrol
         # uses Qt button roles while the preview remains a white editor surface.
@@ -496,8 +496,12 @@ def dialog_theme():
             dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, p.MENU_ACTIVE)
             dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 3)
             dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 1)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 1)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, METRICS.frame_rounding)
             dpg.add_theme_style(dpg.mvStyleVar_PopupRounding, 1)
+
+        for component in (dpg.mvInputText, dpg.mvInputInt, dpg.mvInputFloat, dpg.mvCombo):
+            with dpg.theme_component(component, enabled_state=False):
+                dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, METRICS.frame_rounding)
 
         with dpg.theme_component(dpg.mvRadioButton):
             dpg.add_theme_color(dpg.mvThemeCol_CheckMark, p.HIGHLIGHT)
@@ -520,12 +524,12 @@ def dialog_theme():
             dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 1)
 
         with dpg.theme_component(dpg.mvTable):
-            dpg.add_theme_color(dpg.mvThemeCol_TableHeaderBg, p.TOOLBAR)
-            dpg.add_theme_color(dpg.mvThemeCol_TableBorderStrong, p.BORDER)
-            dpg.add_theme_color(dpg.mvThemeCol_TableBorderLight, p.BORDER_LIGHT)
-            dpg.add_theme_color(dpg.mvThemeCol_TableRowBg, p.BASE)
-            dpg.add_theme_color(dpg.mvThemeCol_TableRowBgAlt, p.ALTERNATE_BASE)
-            dpg.add_theme_style(dpg.mvStyleVar_CellPadding, 5, 3)
+            dpg.add_theme_color(dpg.mvThemeCol_TableHeaderBg, p.TABLE_HEADER)
+            dpg.add_theme_color(dpg.mvThemeCol_TableBorderStrong, p.TABLE_BORDER)
+            dpg.add_theme_color(dpg.mvThemeCol_TableBorderLight, p.TABLE_GRID)
+            dpg.add_theme_color(dpg.mvThemeCol_TableRowBg, p.TABLE_ROW)
+            dpg.add_theme_color(dpg.mvThemeCol_TableRowBgAlt, p.TABLE_ROW_ALT)
+            dpg.add_theme_style(dpg.mvStyleVar_CellPadding, *QtFusionMetrics.TABLE_CELL_PADDING)
     return _DIALOG_THEME
 
 

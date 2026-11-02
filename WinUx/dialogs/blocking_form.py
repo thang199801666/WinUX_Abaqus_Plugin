@@ -11,7 +11,8 @@ class BlockingDialog(QtDialog):
     ASYNC_RESULT_DELAY_MS = 20
 
     def __init__(self, view, title, message, kind="message", initial="", on_result=None,
-                 primary_text=None, secondary_text=None, intent="info"):
+                 primary_text=None, secondary_text=None, intent="info",
+                 option_text=None, option_checked=False, parent=None):
         self.kind = str(kind)
         self.on_result = on_result
         self.result = {"done": False, "value": None}
@@ -24,15 +25,28 @@ class BlockingDialog(QtDialog):
         # presented frame is already compact (no oversized/visible resize).
         _, content_height = compact_message_size(
             message, heading=heading, kind=kind, width=480)
-        super().__init__(view, title, width=480, height=content_height, compact=True)
+        if option_text:
+            content_height += 30
+        # Use the normal native QtDialog path, exactly like SSH Login.  An
+        # embedded ImGui modal is not a substitute for a proper owned window:
+        # it changes backdrop, input capture, and the message-box chrome.
+        super().__init__(
+            view, title, width=480, height=content_height, compact=True,
+            resizable=False, parent=parent,
+        )
         self.preferred_size = (480, content_height)
         role = str(intent or ("question" if kind == "confirm" else "info"))
         self.message_box_body(heading, str(message), intent=role)
         self.entry = None
+        self.option_checkbox = None
         if kind == "input":
             QSpacer(parent=self.content, height=2, backend=dpg)
             self.entry = self.line_edit(str(initial or ""), parent=self.content)
             dpg.focus_item(self.entry)
+        if option_text:
+            QSpacer(parent=self.content, height=3, backend=dpg)
+            self.option_checkbox = self.checkbox(
+                str(option_text), checked=bool(option_checked), parent=self.content)
         actions = [(primary_text or "OK", self.accept,
                     "danger" if intent in ("error", "danger", "delete") else "primary", True)]
         if kind != "message":
@@ -40,7 +54,16 @@ class BlockingDialog(QtDialog):
         self.button_box(actions)
 
     def accept(self):
-        self.finish(dpg.get_value(self.entry) if self.entry is not None else True)
+        if self.entry is not None:
+            value = dpg.get_value(self.entry)
+        elif self.option_checkbox is not None:
+            value = {
+                "accepted": True,
+                "checked": bool(dpg.get_value(self.option_checkbox)),
+            }
+        else:
+            value = True
+        self.finish(value)
 
     def finish(self, value):
         if self.result["done"]:

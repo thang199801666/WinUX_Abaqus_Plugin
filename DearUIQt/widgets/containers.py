@@ -54,6 +54,9 @@ class QFrame(QWidget):
         native_options.update(options)
         native = backend.add_child_window(**native_options)
         super().__init__(native, parent=parent, after=after, backend=backend)
+        if not no_scrollbar or horizontal_scrollbar:
+            from ..backends.shared_scrollers import register_scroll_surface
+            register_scroll_surface(backend, native)
         if not show:
             self._explicit_visible = False
             self._effective_visible = False

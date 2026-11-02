@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from ..services.file_types import file_type_name
 
 
 @dataclass(frozen=True)
@@ -15,13 +16,19 @@ class FileItem:
     size: int
     modified: float
     is_hidden: bool = False
+    mode: int | None = None
+    uid: int | None = None
+    gid: int | None = None
+    accessed: float | None = None
+    created: float | None = None
+    attributes: int | None = None
+    owner_name: str = ""
+    group_name: str = ""
+    is_symlink: bool = False
 
     @property
     def type_text(self) -> str:
-        if self.is_dir:
-            return "File folder"
-        suffix = self.path.suffix.lstrip(".").upper()
-        return (suffix + " file") if suffix else "File"
+        return file_type_name(self.name, self.is_dir)
 
     @property
     def size_text(self) -> str:

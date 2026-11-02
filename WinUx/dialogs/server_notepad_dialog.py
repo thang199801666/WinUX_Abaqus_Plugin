@@ -136,7 +136,7 @@ class ServerNotepadDialog:
     # Process lifecycle / IPC
     # ------------------------------------------------------------------
     def _start_process(self):
-        script = Path(__file__).resolve().parents[1] / "services" / "server_notepad_process.py"
+        script = Path(__file__).resolve().parents[1] / "services" / "server_notepad" / "process.py"
         log_dir = Path(tempfile.gettempdir()) / "WinUx" / "logs"
         try:
             log_dir.mkdir(parents=True, exist_ok=True)

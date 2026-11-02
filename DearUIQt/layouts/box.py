@@ -64,6 +64,8 @@ def _invalidate_owner(layout):
         owner._layout_dirty = True
         owner._cached_size_hint = None
         owner._cached_minimum_size = None
+        if hasattr(owner, '_cached_entries'):
+            owner._cached_entries = None
         owner = owner.parent
     update = getattr(owner, "updateGeometry", None)
     if callable(update):
@@ -118,22 +120,34 @@ class QBoxLayout(QWidget):
         self._contents_margins = QMargins(0, 0, 0, 0)
         self._cached_size_hint = None
         self._cached_minimum_size = None
+        self._cached_items = None
+
+    def childEvent(self, event):
+        super().childEvent(event)
+        if (not self._deleted and hasattr(self, '_layout_dirty')
+                and isinstance(event.child(), QWidget)):
+            self.invalidate()
 
     def invalidate(self):
         self._layout_dirty = True
         self._cached_size_hint = None
         self._cached_minimum_size = None
+        self._cached_items = None
         _invalidate_owner(self)
         return True
 
     def activate(self):
         if not self._layout_enabled or not self._layout_dirty:
             return False
-        for child in self._items():
-            child.ensurePolished()
-            if getattr(child, "_is_layout", False):
-                child.activate()
         self._layout_dirty = False
+        try:
+            for child in self._items():
+                child.ensurePolished()
+                if getattr(child, "_is_layout", False):
+                    child.activate()
+        except Exception:
+            self._layout_dirty = True
+            raise
         return True
 
     def setEnabled(self, enabled):
@@ -246,32 +260,34 @@ class QBoxLayout(QWidget):
         return value if isinstance(value, QSize) and value.isValid() else QSize(0, 0)
 
     def _aggregate_hint(self, minimum=False):
-        hints = []
+        width = height = count = 0
         for child in self._items():
             hint = _layout_hint(child, minimum)
             if hint is not None:
-                hints.append(self._valid_hint(hint))
+                hint = self._valid_hint(hint)
+                count += 1
+                if self._horizontal:
+                    width += hint.width()
+                    height = max(height, hint.height())
+                else:
+                    width = max(width, hint.width())
+                    height += hint.height()
         margins = self._contents_margins
         horizontal_margin = margins.left() + margins.right()
         vertical_margin = margins.top() + margins.bottom()
-        if not hints:
-            return QSize(horizontal_margin, vertical_margin)
-        gap = self._spacing * max(0, len(hints) - 1)
-        if self._horizontal:
-            return QSize(sum(item.width() for item in hints) + gap + horizontal_margin,
-                         max(item.height() for item in hints) + vertical_margin)
-        return QSize(max(item.width() for item in hints) + horizontal_margin,
-                     sum(item.height() for item in hints) + gap + vertical_margin)
+        gap = self._spacing * max(0, count - 1)
+        return QSize(width + horizontal_margin + (gap if self._horizontal else 0),
+                     height + vertical_margin + (0 if self._horizontal else gap))
 
     def sizeHint(self):
         if self._cached_size_hint is None:
             self._cached_size_hint = self._aggregate_hint(False)
-        return self._cached_size_hint
+        return QSize(self._cached_size_hint.width(), self._cached_size_hint.height())
 
     def minimumSize(self):
         if self._cached_minimum_size is None:
             self._cached_minimum_size = self._aggregate_hint(True)
-        return self._cached_minimum_size
+        return QSize(self._cached_minimum_size.width(), self._cached_minimum_size.height())
 
     minimumSizeHint = minimumSize
 
@@ -280,7 +296,9 @@ class QBoxLayout(QWidget):
 
     def _items(self):
         self._require_ui()
-        return [child for child in self._children if isinstance(child, QWidget)]
+        if self._cached_items is None:
+            self._cached_items = tuple(child for child in self._children if isinstance(child, QWidget))
+        return self._cached_items
 
     def itemAt(self, index):
         items = self._items()
@@ -288,7 +306,10 @@ class QBoxLayout(QWidget):
 
     def indexOf(self, widget):
         items = self._items()
-        return items.index(widget) if widget in items else -1
+        try:
+            return items.index(widget)
+        except ValueError:
+            return -1
 
     def _insert(self, index, widget):
         _validate_placement(self, widget)
@@ -339,15 +360,27 @@ class QBoxLayout(QWidget):
         taking Qt layout items and calling ``deleteLater`` on their widgets.
         It also keeps renderer child deletion out of application code.
         """
-        items = list(self._items())
+        items = tuple(self._items())
         if delete:
             for child in reversed(items):
                 child.delete()
             self.invalidate()
             return len(items)
-        for index in range(len(items) - 1, -1, -1):
-            self.takeAt(index)
+        for child in reversed(items):
+            if not child._deleted and child.parent is self:
+                _detach(self, child)
+        if items:
+            self.invalidate()
         return len(items)
+
+    def delete(self):
+        try:
+            super().delete()
+        finally:
+            if self._deleted:
+                self._cached_items = None
+                self._cached_size_hint = None
+                self._cached_minimum_size = None
 
 
 class QHBoxLayout(QBoxLayout):
@@ -410,7 +443,8 @@ class QGridLayout(QWidget):
     _is_layout = True
 
     def __init__(self, columns=2, *, column_widths=None, parent=None, after=None, backend=None,
-                 width=-1, height=-1, vertical_dividers=False, horizontal_dividers=False):
+                 width=-1, height=-1, vertical_dividers=False, horizontal_dividers=False,
+                 resizable=False):
         if not isinstance(columns, int) or isinstance(columns, bool) or columns < 1:
             raise ValueError("grid columns must be a positive integer")
         widths = (None,) * columns if column_widths is None else tuple(column_widths)
@@ -428,6 +462,7 @@ class QGridLayout(QWidget):
             native_height = 0
         tag = backend.add_table(header_row=False, width=int(width), height=native_height,
             policy=backend.mvTable_SizingStretchProp, pad_outerX=False,
+            resizable=bool(resizable),
             borders_innerH=bool(horizontal_dividers), borders_outerH=False,
             borders_innerV=bool(vertical_dividers), borders_outerV=False, **options)
         super().__init__(tag, parent=parent, after=after, backend=backend)
@@ -440,31 +475,46 @@ class QGridLayout(QWidget):
         self._vertical_spacing = 0
         self._cached_size_hint = None
         self._cached_minimum_size = None
+        self._cached_entries = None
         try:
             for width in widths:
                 if width is None:
-                    backend.add_table_column(parent=tag, width_stretch=True)
+                    # Explicit equal weights avoid ImGui deriving column
+                    # proportions from early/disabled button captions.
+                    backend.add_table_column(parent=tag, width_stretch=True,
+                                             init_width_or_weight=1.0)
                 else:
                     backend.add_table_column(parent=tag, width_fixed=True, init_width_or_weight=width)
         except Exception:
             self.delete()
             raise
 
+    def childEvent(self, event):
+        super().childEvent(event)
+        if (not self._deleted and hasattr(self, '_layout_dirty')
+                and isinstance(event.child(), QWidget)):
+            self.invalidate()
+
     def invalidate(self):
         self._layout_dirty = True
         self._cached_size_hint = None
         self._cached_minimum_size = None
+        self._cached_entries = None
         _invalidate_owner(self)
         return True
 
     def activate(self):
         if not self._layout_enabled or not self._layout_dirty:
             return False
-        for _row, _column, child in self._entries():
-            child.ensurePolished()
-            if getattr(child, "_is_layout", False):
-                child.activate()
         self._layout_dirty = False
+        try:
+            for _row, _column, child in self._entries():
+                child.ensurePolished()
+                if getattr(child, "_is_layout", False):
+                    child.activate()
+        except Exception:
+            self._layout_dirty = True
+            raise
         return True
 
     def setEnabled(self, enabled):
@@ -538,12 +588,12 @@ class QGridLayout(QWidget):
     def sizeHint(self):
         if self._cached_size_hint is None:
             self._cached_size_hint = self._aggregate_hint(False)
-        return self._cached_size_hint
+        return QSize(self._cached_size_hint.width(), self._cached_size_hint.height())
 
     def minimumSize(self):
         if self._cached_minimum_size is None:
             self._cached_minimum_size = self._aggregate_hint(True)
-        return self._cached_minimum_size
+        return QSize(self._cached_minimum_size.width(), self._cached_minimum_size.height())
 
     minimumSizeHint = minimumSize
 
@@ -572,6 +622,7 @@ class QGridLayout(QWidget):
                 raise
             self._rows.append(native_row)
             self._cells.update(((index, col), cell) for col, cell in enumerate(cells))
+            self.invalidate()
         return self._cells[row, column]
 
     def addWidget(self, widget, row, column):
@@ -597,8 +648,11 @@ class QGridLayout(QWidget):
 
     def _entries(self):
         self._require_ui()
-        return [(row, col, child) for (row, col), cell in sorted(self._cells.items())
-                for child in cell._children if isinstance(child, QWidget)]
+        if self._cached_entries is None:
+            self._cached_entries = tuple(
+                (row, col, child) for (row, col), cell in sorted(self._cells.items())
+                for child in cell._children if isinstance(child, QWidget))
+        return self._cached_entries
 
     def count(self):
         return len(self._entries())
@@ -635,14 +689,18 @@ class QGridLayout(QWidget):
         return self.takeAt(self.indexOf(widget))
 
     def clear(self, *, delete=True):
-        entries = list(self._entries())
+        entries = tuple(self._entries())
         if delete:
             for _row, _column, child in reversed(entries):
                 child.delete()
             self.invalidate()
             return len(entries)
-        for index in range(len(entries) - 1, -1, -1):
-            self.takeAt(index)
+        for row, column, child in reversed(entries):
+            cell = self._cells.get((row, column))
+            if not child._deleted and child.parent is cell:
+                _detach(self, child)
+        if entries:
+            self.invalidate()
         return len(entries)
 
     def delete(self):
@@ -653,6 +711,9 @@ class QGridLayout(QWidget):
             if self._deleted:
                 self._rows.clear()
                 self._cells.clear()
+                self._cached_entries = None
+                self._cached_size_hint = None
+                self._cached_minimum_size = None
 
 
 class QFormLayout(QGridLayout):

@@ -2292,8 +2292,33 @@ class Transport(threading.Thread, ClosingContextManager):
                         emsg = str(e) or repr(e)
                 else:
                     emsg = e.args
-                self._log(ERROR, "Socket exception: " + emsg)
-                self.saved_exception = e
+
+                # Windows can report WSAESHUTDOWN/WSAENOTSOCK/WSAECONNRESET
+                # from the receiver thread after another WinUx thread has
+                # intentionally begun closing the transport.  Those errors are
+                # an expected EOF equivalent once ``active`` is already false;
+                # logging them as ERROR made a clean close/reconnect look like
+                # an application fault (notably WinError 10058).  Never hide
+                # the same codes while the transport is still active: in that
+                # state they remain genuine network failures and keep the
+                # original ERROR diagnostic.
+                error_code = getattr(e, "winerror", None)
+                if error_code is None:
+                    error_code = getattr(e, "errno", None)
+                if error_code is None and getattr(e, "args", None):
+                    try:
+                        error_code = int(e.args[0])
+                    except (TypeError, ValueError):
+                        error_code = None
+                expected_shutdown = (
+                    not self.active
+                    and error_code in (10038, 10053, 10054, 10058)
+                )
+                if expected_shutdown:
+                    self._log(DEBUG, "Socket closed during transport shutdown: " + emsg)
+                else:
+                    self._log(ERROR, "Socket exception: " + emsg)
+                    self.saved_exception = e
             except Exception as e:
                 self._log(ERROR, "Unknown exception: " + str(e))
                 self._log(ERROR, util.tb_strings())

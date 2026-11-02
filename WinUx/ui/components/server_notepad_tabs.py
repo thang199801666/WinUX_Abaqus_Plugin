@@ -1,24 +1,27 @@
 """Retained tab-strip widgets for the standalone Tk server editor."""
 import tkinter as tk
 from pathlib import PurePosixPath
+from DearUIQt.tooltip import TOOLTIP_DELAY
 
 
 class _ToolTip:
     """Tiny dependency-free tooltip for compact icon-only toolbar buttons."""
 
-    def __init__(self, widget, text, delay=450):
+    def __init__(self, widget, text, delay=None):
         self.widget = widget
         self.text = str(text or "")
-        self.delay = int(delay)
+        self.delay = round(TOOLTIP_DELAY * 1000) if delay is None else int(delay)
         self._after = None
         self._window = None
         widget.bind("<Enter>", self._enter, add="+")
+        widget.bind("<Motion>", self._enter, add="+")
         widget.bind("<Leave>", self._leave, add="+")
         widget.bind("<ButtonPress>", self._leave, add="+")
         widget.bind("<Destroy>", self._leave, add="+")
 
     def _enter(self, _event=None):
         self._cancel()
+        self._hide()
         try:
             self._after = self.widget.after(self.delay, self._show)
         except Exception:
@@ -281,4 +284,3 @@ class _EditorTabStrip:
                 self.canvas.xview_moveto(min(1.0, target / float(total)))
         except Exception:
             pass
-

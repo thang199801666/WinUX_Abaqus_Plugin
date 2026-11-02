@@ -15,9 +15,19 @@ class PlotDigitizerPreferences:
         "show_manual_points": True,
         "show_crosshair": True,
         "show_magnifier": True,
+        "preview_zoom": 5,
+        "preview_size": 140,
+        "preview_crosshair": True,
         "mouse_wheel_zoom": True,
+        "wheel_zoom_percent": 12,
         "fit_images_on_open": True,
         "marker_size_percent": 100,
+    }
+    INT_RANGES = {
+        "marker_size_percent": (50, 250),
+        "preview_zoom": (1, 20),
+        "preview_size": (80, 320),
+        "wheel_zoom_percent": (5, 50),
     }
 
     def __init__(self, root=None):
@@ -34,7 +44,7 @@ class PlotDigitizerPreferences:
             if isinstance(default, bool):
                 if type(value) is bool:
                     normalized[key] = value
-            elif type(value) is int and 50 <= value <= 250:
+            elif type(value) is int and cls.INT_RANGES[key][0] <= value <= cls.INT_RANGES[key][1]:
                 normalized[key] = value
         return normalized
 

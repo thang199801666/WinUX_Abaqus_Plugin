@@ -39,6 +39,31 @@ class UiDispatcher:
         self._sequence = 0
         self._closed = False
         self._owner_thread = threading.get_ident()
+        self._wake_callback = None
+        self._wake_pending = False
+
+    def set_wake_callback(self, callback):
+        with self._lock:
+            self._wake_callback = callback
+            self._wake_pending = False
+
+    def has_immediate_work(self):
+        return not self.queue.empty()
+
+    def _wake_owner(self):
+        # Periodic UI-owned paint/blink timers must not keep the active render
+        # rate alive. Only cross-thread producers need a native wake-up.
+        callback = self._wake_callback
+        if (callable(callback) and threading.get_ident() != self._owner_thread
+                and not self._wake_pending):
+            # after() holds the scheduler lock. A burst of SSH/transfer chunks
+            # needs one native message, not one PostMessage per result.
+            self._wake_pending = True
+            try:
+                callback()
+            except Exception:
+                self._wake_pending = False
+                raise
 
     def after(self, delay_ms, callback, *args):
         """Post ``callback`` to the GUI event loop now or after ``delay_ms``.
@@ -54,6 +79,7 @@ class UiDispatcher:
                 return None
             if delay_ms <= 0:
                 self.queue.put((callback, args))
+                self._wake_owner()
                 return None
             self._sequence += 1
             token = self._sequence
@@ -62,6 +88,7 @@ class UiDispatcher:
                 self._scheduled,
                 (time.monotonic() + delay_ms / 1000.0, token),
             )
+            self._wake_owner()
             return token
 
     def after_cancel(self, token):
@@ -113,6 +140,8 @@ class UiDispatcher:
 
     def drain(self, on_error=None, max_callbacks=None, time_budget_ms=None):
         """Execute one bounded GUI-event turn on the caller/UI thread."""
+        with self._lock:
+            self._wake_pending = False
         # With a bounded GUI turn, admit at most as many expired timers as
         # callbacks we can execute. An explicitly unbounded drain preserves its
         # original drain-all semantics for non-render-loop consumers.
@@ -162,6 +191,8 @@ class UiDispatcher:
             if self._closed:
                 return
             self._closed = True
+            self._wake_callback = None
+            self._wake_pending = False
             self._scheduled[:] = []
             self._scheduled_callbacks.clear()
 

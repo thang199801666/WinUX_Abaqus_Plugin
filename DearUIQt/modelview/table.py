@@ -174,6 +174,11 @@ class QtDataGridView(_QtAbstractItemView):
         self._row_tags: dict[Any, Any] = {}
         self._row_index: dict[Any, int] = {}
         self._row_visual_state: dict[Any, tuple[bool, bool, bool, bool]] = {}
+        self._row_visual_full_sync = True
+        self._row_visual_selected = set()
+        self._row_visual_current = None
+        self._row_visual_focus = False
+        self._row_visual_retry = set()
         self._sort_key = None
         self._sort_ascending = True
         self._row_key_role = None
@@ -246,6 +251,16 @@ class QtDataGridView(_QtAbstractItemView):
         from ..core.item_model import QItemSelectionModel
         return QItemSelectionModel.Select | QItemSelectionModel.Rows
 
+    def enableSpreadsheet(self, **options):
+        """Opt in to cell ranges; data-grid mutation requires an atomic writer."""
+        behavior = getattr(self, '_spreadsheet_behavior', None)
+        if behavior is None:
+            from .spreadsheet_behavior import SpreadsheetBehavior
+            behavior = self._spreadsheet_behavior = SpreadsheetBehavior(self, **options)
+            for item in self.items.values():
+                self.backend.configure_item(item, span_columns=False)
+        return behavior
+
     def _add_native_column(self, column):
         kwargs = dict(parent=self.tag, label=column.label, user_data=column.key,
                       no_sort=not column.sortable)
@@ -276,7 +291,8 @@ class QtDataGridView(_QtAbstractItemView):
     def _model_changed(self, *_args):
         model = self.model()
         if model is None:
-            return None
+            self.set_rows(())
+            return self
         # dataChanged(topLeft, bottomRight, roles) can update retained native
         # cell values in place.  Rebuilding every table row would destroy an
         # active persistent editor and unnecessarily reset native row identity.
@@ -485,9 +501,10 @@ class QtDataGridView(_QtAbstractItemView):
                 for column, native in enumerate(cells):
                     # Renderer-owned display strings, never opaque UserRole
                     # objects (e.g. NumPy arrays), determine visual equality.
-                    new_text = str(values[column]) if column < len(values) else ""
+                    new_text = (str(values[column])
+                                if column < len(values) and values[column] is not None else "")
                     old_text = (str(old_values[column])
-                                if column < len(old_values) else "")
+                                if column < len(old_values) and old_values[column] is not None else "")
                     if old_text == new_text:
                         continue
                     if column == 0:
@@ -531,15 +548,15 @@ class QtDataGridView(_QtAbstractItemView):
             self._row_tags[key] = row_tag
             self._row_index[key] = row_index
             selectable = self.backend.add_selectable(
-                label=str(values[0]) if values else "",
-                span_columns=True, height=QtFusionMetrics.ROW_HEIGHT,
+                label=str(values[0]) if values and values[0] is not None else "",
+                span_columns=getattr(self, '_spreadsheet_behavior', None) is None, height=QtFusionMetrics.ROW_HEIGHT,
                 default_value=key in self.selected, user_data=key,
                 enabled=bool(self.row_enabled.get(key, True)),
                 callback=self._row_clicked, parent=row_tag,
             )
             self.items[key] = selectable
             text_items = [
-                self.backend.add_text(str(value), parent=row_tag)
+                self.backend.add_text("" if value is None else str(value), parent=row_tag)
                 for value in values[1:len(self.columns)]
             ]
             self._cell_text_items[key] = text_items
@@ -572,6 +589,12 @@ class QtDataGridView(_QtAbstractItemView):
                 values = tuple(values)
                 row_enabled[key] = True
             normalized.append((key, values))
+        # Metadata changes (enabled flags, new cells or rebuilt native IDs)
+        # require a full reconciliation even if selected/current did not move.
+        self._row_visual_full_sync = True
+        behavior = getattr(self, '_spreadsheet_behavior', None)
+        if behavior is not None and tuple(key for key, _ in normalized) != tuple(previous):
+            behavior.reset_selection()
         self.rows = normalized
         self.row_data = row_data
         self.row_backgrounds = row_backgrounds
@@ -678,6 +701,7 @@ class QtDataGridView(_QtAbstractItemView):
     setRows = set_rows
 
     def _delete_rows(self):
+        self._row_visual_full_sync = True
         for row in list(self.backend.get_item_children(self.tag, 1) or []):
             try:
                 self.backend.delete_item(row)
@@ -885,7 +909,7 @@ class QtDataGridView(_QtAbstractItemView):
             self._context_open_callback(key)
         self.contextMenuRequested.emit(key)
         if self._context_menu is not None:
-            self._context_menu.popup(point, context=key)
+            self._context_menu.popupGlobal(context=key, owner=self.tag)
 
     def _point_in_item(self, item, point):
         try:
@@ -932,11 +956,35 @@ class QtDataGridView(_QtAbstractItemView):
         self._context_popup = None
         self._context_items.clear()
 
+    def _row_clicked(self, sender, value, key):
+        if (self._deleted or self.items.get(key) != sender
+                or not self.row_enabled.get(key, True)):
+            return
+        super()._row_clicked(sender, value, key)
+
     def _sync_selection_visuals(self):
+        full_sync = self._row_visual_full_sync
+        selected_keys = set(self.selected)
+        current_key = self.current
+        active_focus = self._has_focus
+        if self._row_visual_full_sync:
+            dirty = set(self.items)
+        else:
+            dirty = selected_keys ^ self._row_visual_selected
+            if current_key != self._row_visual_current:
+                dirty.update((current_key, self._row_visual_current))
+            if active_focus != self._row_visual_focus:
+                # Unselected hover colors also depend on focus.
+                dirty.update(self.items)
+        dirty.update(self._row_visual_retry)
+        self._row_visual_retry.clear()
         visual_state = self._row_visual_state
-        for key, item in tuple(self.items.items()):
-            state = (key in self.selected, not bool(self.row_enabled.get(key, True)),
-                     key == self.current, self._has_focus)
+        for key in dirty:
+            item = self.items.get(key)
+            if item is None:
+                continue
+            state = (key in selected_keys, not bool(self.row_enabled.get(key, True)),
+                     key == current_key, active_focus)
             if visual_state.get(key) == state:
                 continue
             selected, disabled, current, active = state
@@ -957,8 +1005,16 @@ class QtDataGridView(_QtAbstractItemView):
                     self.backend.bind_item_theme(text_item, cell_theme)
             except Exception:
                 visual_state.pop(key, None)
+                self._row_visual_retry.add(key)
             else:
                 visual_state[key] = state
+        self._row_visual_selected = selected_keys
+        self._row_visual_current = current_key
+        self._row_visual_focus = active_focus
+        self._row_visual_full_sync = False
+        behavior = getattr(self, '_spreadsheet_behavior', None)
+        if behavior is not None:
+            behavior._paint_selection(force=full_sync)
 
     def _focus_current(self):
         item = self.items.get(self.current)

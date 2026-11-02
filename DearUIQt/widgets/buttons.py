@@ -108,25 +108,20 @@ class ImGuiPushButton(QWidget):
         self._refresh_style()
 
     def _clicked(self, *_args):
-        # Dialogs deliver pointer gestures through QApplication. Native ImGui
-        # activation is still a fallback for keyboard/non-dialog controls, but
-        # must not emit a second clicked() for that same physical mouse release.
+        # Dialogs deliver pointer/keyboard activation through QApplication.
+        # Keep native ImGui activation for non-dialog/standalone controls, but
+        # never emit clicked() twice for the same routed physical gesture.
         if _args and self._dialog_pointer_routing and self._after is not None:
             from ..core.application import QApplication
             application = QApplication.instance()
             if application is not None and application._pointer_bridge_installed:
-                if self._native_pointer_suppressed:
-                    return
-                # A fast click can enqueue the widget callback before the
-                # global press/release handlers. Let that input batch finish
-                # before deciding whether native delivery is still needed.
-                self._after(0, self._deliver_native_click)
+                # QApplication is the sole activation path for dialog buttons.
+                # Native callbacks can arrive in a later input batch, after a
+                # routed release's suppression flag was cleared. Replaying
+                # them then can delete the next selected item with one click.
+                # QDialog handles Return/Space and lost-first-click recovery.
                 return
         self._activate_click()
-
-    def _deliver_native_click(self):
-        if not self._native_pointer_suppressed and not self._deleted and self.isVisible():
-            self._activate_click()
 
     def _begin_pointer_click(self):
         if self._deleted or not self.isEnabled():
@@ -419,12 +414,18 @@ class QToolButton(ImGuiPushButton):
         if menu is None:
             return False
         try:
-            x, y = self.backend.get_item_rect_min(self.tag)
-            _width, height = self.backend.get_item_rect_size(self.tag)
-            menu.popup((x, y + height))
+            from ..gui.placement import item_screen_rect, visible_item_screen_rect
+            from ..backends.native_windows import NativeWindowBackend
+            def anchor():
+                if self._deleted or not self.isVisible():
+                    return None
+                return visible_item_screen_rect(self.backend, self.tag)
+            return menu.popupBelow(
+                item_screen_rect(self.backend, self.tag),
+                global_position=NativeWindowBackend(self.backend).isEnabled(),
+                anchor_provider=anchor)
         except Exception:
-            menu.popup()
-        return True
+            return bool(menu.popup())
 
     def _clicked(self, *_args):
         if self._popup_mode == self.InstantPopup and self._menu is not None:

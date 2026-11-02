@@ -810,19 +810,33 @@ class QChildEvent(QEvent):
         return self.type() == QEvent.ChildRemoved
 
 
+# Shared only by short connection-publication steps, never by slot invocation
+# or user-defined callable equality. No per-signal mutex allocation is needed.
+_SIGNAL_CONNECTION_LOCK = threading.Lock()
+
+
 class SignalConnection:
     def __init__(self, signal, slot, receiver, queued):
         self.signal, self.slot, self.receiver, self.queued = signal, slot, receiver, queued
         self.active = True
 
     def disconnect(self):
-        if not self.active:
-            return
-        self.active = False
-        self.signal._slots.remove(self)
-        if self.receiver is not None:
-            self.receiver._connections.discard(self)
-        self.slot = self.receiver = None
+        with _SIGNAL_CONNECTION_LOCK:
+            if not self.active:
+                return
+            self.active = False
+            slots = self.signal._slots
+            if len(slots) == 1:
+                if slots[0] is self:
+                    self.signal._slots = ()
+            elif slots:
+                self.signal._slots = tuple(connection for connection in slots if connection is not self)
+            # Keep strong locals until after unlocking: releasing the last slot
+            # reference may run a finalizer that connects/disconnects a signal.
+            slot, receiver = self.slot, self.receiver
+            if receiver is not None:
+                receiver._connections.discard(self)
+            self.slot = self.receiver = None
 
     def deliver(self, args):
         if self.active and (self.receiver is None or not self.receiver._deleted):
@@ -834,7 +848,10 @@ class SignalConnection:
 
 class Signal:
     def __init__(self, owner=None):
-        self._slots = []
+        # Most widget signals are never connected. Share the empty tuple and
+        # publish immutable snapshots only when connections actually change.
+        # Emission can iterate its original snapshot without allocating a copy.
+        self._slots = ()
         self.owner = owner
 
     def connect(self, slot, connection_type=None, *, receiver=None, queued=None):
@@ -857,18 +874,26 @@ class Signal:
             raise RuntimeError("cannot connect a deleted receiver")
         if queued and (receiver is None or getattr(receiver, "_after", None) is None):
             raise ValueError("queued connections require a receiver with a UI scheduler")
-        for connection in self._slots:
-            if connection.slot == slot and connection.receiver is receiver and connection.queued == queued:
+        while True:
+            snapshot = self._slots
+            for connection in snapshot:
+                if connection.slot == slot and connection.receiver is receiver and connection.queued == queued:
+                    return connection
+            connection = SignalConnection(self, slot, receiver, queued)
+            with _SIGNAL_CONNECTION_LOCK:
+                if self._slots is not snapshot:
+                    continue
+                self._slots = snapshot + (connection,)
+                if receiver is not None:
+                    receiver._connections.add(connection)
                 return connection
-        connection = SignalConnection(self, slot, receiver, queued)
-        self._slots.append(connection)
-        if receiver is not None:
-            receiver._connections.add(connection)
-        return connection
 
     def disconnect(self, slot=None):
         if slot is None:
-            for connection in tuple(self._slots):
+            with _SIGNAL_CONNECTION_LOCK:
+                connections = self._slots
+                self._slots = ()
+            for connection in connections:
                 connection.disconnect()
         else:
             for connection in tuple(self._slots):
@@ -878,7 +903,7 @@ class Signal:
     def emit(self, *args):
         if self.owner is not None and (self.owner._signals_blocked or self.owner._deleted):
             return
-        for connection in tuple(self._slots):
+        for connection in self._slots:
             if not connection.active:
                 continue
             auto_queue = (connection.queued is None and connection.receiver is not None and
@@ -889,6 +914,15 @@ class Signal:
                 connection.receiver._after(0, connection.deliver, args)
             else:
                 connection.deliver(args)
+
+
+def _remove_owned_child(parent, child):
+    """Fast tail unlink for reverse teardown; preserve sibling order."""
+    children = parent._children
+    if children and children[-1] is child:
+        children.pop()
+    else:
+        children.remove(child)
 
 
 class QObject:
@@ -1019,7 +1053,7 @@ class QObject:
             return
         previous = self.parent
         if previous is not None:
-            previous._children.remove(self)
+            _remove_owned_child(previous, self)
         # ChildRemoved observers should see the new ownership state rather than
         # a stale pointer to the previous parent. This also makes re-entrant
         # ownership inspection match Qt's already-applied object tree.
@@ -1181,7 +1215,7 @@ class QObject:
             if self.parent is not None:
                 previous = self.parent
                 try:
-                    previous._children.remove(self)
+                    _remove_owned_child(previous, self)
                 except ValueError:
                     pass
                 self.parent = None
@@ -1225,12 +1259,28 @@ class QMetaObject:
         if scheduler is None:
             raise RuntimeError("queued invocation requires a receiver scheduler")
         guard = QPointer(receiver)
+        method_name = method if isinstance(method, str) else None
+        weak_callback = None
+        if method_name is not None:
+            # Validation above must not leave the bound method in the queued
+            # closure: that would defeat QPointer and retain a deleted target.
+            callback = None
+        elif getattr(callback, '__self__', None) is receiver:
+            try:
+                weak_callback = weakref.WeakMethod(callback)
+            except TypeError:
+                pass
+            else:
+                callback = None
 
         def deliver():
             target = guard.data()
             if target is None:
                 return
-            current = getattr(target, method, None) if isinstance(method, str) else callback
+            if method_name is not None:
+                current = getattr(target, method_name, None)
+            else:
+                current = weak_callback() if weak_callback is not None else callback
             if callable(current):
                 current(*args, **kwargs)
 

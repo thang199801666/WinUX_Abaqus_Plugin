@@ -11,7 +11,6 @@ from __future__ import annotations
 from ..core.object import QObject
 from .menu import QMenu
 from ..gui.palette import QtFusionMetrics, QtFusionPalette
-from ..gui.system import QCursor
 
 
 _MENU_BAR_THEME_TAG = "dearuiqt.qt.menubar.buttons.rev1"
@@ -174,37 +173,15 @@ class QMenuBar(QObject):
             return None
 
     def _button_anchor_screen_rect(self, rect):
-        """Convert a renderer-local menu-bar rect to desktop screen space.
-
-        Top-level DPG popup windows are positioned in desktop coordinates on
-        the Windows multi-viewport runtime, while menu-bar button geometry is
-        reported in viewport/client coordinates.  Calibrate with the physical
-        cursor and the renderer-local cursor at interaction time; their delta
-        is the exact client origin even with title bars, DPI scaling, move or
-        maximize.  If a backend already reports screen-space item rectangles,
-        detect that from the cursor hit before applying the offset.
-        """
+        """Map the anchor through its owner, including programmatic opens."""
         x, y, width, height = map(float, rect)
         try:
-            screen = QCursor.screenPos(backend=self.backend)
-            local = QCursor.localPos(backend=self.backend)
-            sx, sy = float(screen.x()), float(screen.y())
-            lx, ly = float(local.x()), float(local.y())
-            screen_hit = x <= sx <= x + width and y <= sy <= y + height
-            local_hit = x <= lx <= x + width and y <= ly <= y + height
-            if screen_hit and not local_hit:
-                return x, y, width, height
-            dx, dy = sx - lx, sy - ly
-            if local_hit or abs(dx) > 1.0 or abs(dy) > 1.0:
-                return x + dx, y + dy, width, height
-        except Exception:
-            pass
-        try:
-            getter = getattr(self.backend, "get_viewport_pos", None)
-            viewport = getter() if callable(getter) else None
-            if viewport is not None:
-                vx, vy = float(viewport[0]), float(viewport[1])
-                return x + vx, y + vy, width, height
+            from ..gui.placement import item_screen_rect
+            first = next(self._buttons[menu] for menu in self._menus
+                         if self._buttons.get(menu) is not None)
+            sx, sy, _right, _bottom = item_screen_rect(self.backend, first)
+            rx, ry = self.backend.get_item_rect_min(first)
+            return x + sx - rx, y + sy - ry, width, height
         except Exception:
             pass
         return x, y, width, height
@@ -222,6 +199,18 @@ class QMenuBar(QObject):
         menu = user_data
         if self._active_menu is None or menu is self._active_menu:
             return
+        # Item-hover callbacks are queued. A native popup/focus change can
+        # leave stale callbacks for a previously hovered sibling in the queue;
+        # only switch to the button physically under the cursor now.
+        button = self._buttons.get(menu)
+        rect = self._button_anchor_rect(button) if button is not None else None
+        if rect is None:
+            return
+        from ..gui.system import QCursor
+        x, y, width, height = self._button_anchor_screen_rect(rect)
+        point = QCursor.screenPos(backend=self.backend)
+        if not (x <= point.x() < x + width and y <= point.y() < y + height):
+            return
         if self._menu_is_shown(self._active_menu):
             self._open_menu(menu)
 
@@ -229,6 +218,8 @@ class QMenuBar(QObject):
         button = self._buttons.get(menu)
         if button is None:
             return False
+        if menu is self._active_menu and self._menu_is_shown(menu):
+            return True
         old_menu = self._active_menu
         old_button = self._active_button
         if old_menu is not None and old_menu is not menu:
@@ -245,8 +236,21 @@ class QMenuBar(QObject):
             # anchor once and keep the whole popup tree in global space.
             gx, gy, _gwidth, gheight = self._button_anchor_screen_rect(rect)
             global_popup_y = float(gy) + float(gheight)
+            popup_below = getattr(menu, "popupBelow", None)
             popup_global = getattr(menu, "popupGlobal", None)
-            if callable(popup_global):
+            if callable(popup_below):
+                def anchor():
+                    from ..gui.placement import visible_item_screen_rect
+                    if visible_item_screen_rect(self.backend, button) is None:
+                        return None
+                    current = self._button_anchor_rect(button)
+                    if current is None:
+                        return None
+                    ax, ay, aw, ah = self._button_anchor_screen_rect(current)
+                    return ax, ay, ax + aw, ay + ah
+                shown = bool(popup_below(
+                    (gx, gy, gx + _gwidth, global_popup_y), anchor_provider=anchor))
+            elif callable(popup_global):
                 shown = bool(popup_global((gx, global_popup_y)))
             else:
                 # Compatibility for lightweight/test menus without popupGlobal.

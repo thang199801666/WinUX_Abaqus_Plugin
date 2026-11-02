@@ -1,9 +1,14 @@
 """Run the bundled WinUx application inside ``abaqus python``.
 
-The process is already separate from Abaqus/CAE because ``winux_launcher``
+The process is already separate from Abaqus/CAE because ``winux_runtime.launcher``
 starts this script through the Abaqus command.  Do not start SMApy's
 ``python.exe`` a second time: the ``abaqus python`` command is what prepares
 the native Abaqus Python runtime correctly.
+
+Normal launch: ``abaqus python run_winux.py``. The adjacent deployment's
+manifest revision includes the shared file/folder selector and scrollbar
+changes; startup compares that revision with the installed runtime cache.
+Use ``--runtime-info`` to check which deployment will actually be loaded.
 """
 
 from __future__ import print_function
@@ -31,11 +36,19 @@ def _project_dir():
     # with GitHub.  Explicit dev/health-check launches remain pinned to the
     # requested directory.
     if (os.environ.get("WINUX_SKIP_UPDATE", "").strip() != "1" and
+            os.environ.get("WINUX_PREFER_BUNDLED_RUNTIME", "").strip().lower()
+            not in ("1", "true", "yes", "on", "bundled") and
             os.environ.get("WINUX_HEALTH_CHECK", "").strip() != "1" and
             "--update-health-check" not in sys.argv):
         try:
-            from winux_installation_state import resolve_active_installation
-            active = resolve_active_installation(configured, environ=os.environ)
+            from winux_runtime.installation_state import resolve_active_installation, deployment_is_newer
+            from winux_runtime.update.manifest import required_files_present
+            bundled = os.path.dirname(os.path.abspath(__file__))
+            if (required_files_present(bundled) and
+                    deployment_is_newer(bundled, configured)):
+                configured = bundled
+            active = resolve_active_installation(
+                configured, environ=os.environ, recover='--runtime-info' not in sys.argv)
         except Exception:
             active = None
         if active and os.path.isfile(os.path.join(active, "WinUx", "__main__.py")):
@@ -138,7 +151,6 @@ def _terminate_existing_winux(pid):
 
 
 def _vendor_candidates(project_dir):
-    from winux_native_runtime import native_runtime_path
     plugin_dir = os.path.dirname(os.path.abspath(__file__))
     project_dir = os.path.abspath(project_dir)
     # During the first transition from a flat deployment to an immutable
@@ -158,8 +170,7 @@ def _vendor_candidates(project_dir):
         os.path.join(plugin_dir, "site-packages"),
         os.path.join(plugin_dir, "winux_vendor.zip"),
     )
-    native = native_runtime_path(project_dir)
-    candidates = ((native,) if native else ()) + project_candidates + plugin_candidates
+    candidates = project_candidates + plugin_candidates
     result = []
     seen = set()
     for path in candidates:
@@ -239,7 +250,7 @@ def _show_error(message):
 def _check_for_update(project_dir, update_callable=None, before_sync=None):
     """Run the complete updater in this independent child process.
 
-    ``winux_launcher`` starts this script through ``abaqus python`` and then
+    ``winux_runtime.launcher`` starts this script through ``abaqus python`` and then
     immediately returns control to Abaqus/CAE.  Keeping the update UI here
     prevents native update dialogs from nesting a message loop inside FOX.
 
@@ -252,7 +263,7 @@ def _check_for_update(project_dir, update_callable=None, before_sync=None):
         return None
 
     if update_callable is None:
-        from winux_updater import update_local_if_newer
+        from winux_runtime.update.updater import update_local_if_newer
         update_callable = update_local_if_newer
 
     previous_cwd = _safe_getcwd(os.path.dirname(project_dir))
@@ -315,10 +326,16 @@ def _switch_to_active_project(project_dir, update_status):
     if not active_dir:
         return project_dir
     active_dir = os.path.abspath(active_dir)
-    if not os.path.isfile(os.path.join(active_dir, "WinUx", "__main__.py")):
+    from winux_runtime.installation_state import valid_deployment, deployment_is_newer
+    if not valid_deployment(active_dir):
         return project_dir
     old_dir = os.path.abspath(project_dir)
     if active_dir == old_dir:
+        return project_dir
+    if deployment_is_newer(old_dir, active_dir):
+        # A no-update response from an older bootstrap/updater may still name
+        # the old immutable cache. Do not discard a newer bundled hotfix. A
+        # genuinely newer accepted release continues through this switch.
         return project_dir
     while old_dir in sys.path:
         try:
@@ -345,7 +362,7 @@ def _run_update_health_check(project_dir):
     _configure_bundled_dependencies(project_dir)
     os.chdir(project_dir)
 
-    from winux_update_manifest import read_version, required_files_present
+    from winux_runtime.update.manifest import read_version, required_files_present
     version = read_version(project_dir)
     if not version or not required_files_present(project_dir):
         raise RuntimeError("Candidate deployment is incomplete.")
@@ -356,8 +373,21 @@ def _run_update_health_check(project_dir):
     import WinUx.controller  # noqa: F401
     import WinUx.server_model  # noqa: F401
     import WinUx.view  # noqa: F401
-    import winux_updater  # noqa: F401
-    import winux_launcher  # noqa: F401
+    # These are shared by both in-process dialogs and floating selector hosts.
+    # Verify the new policy/parent/scroller graph in the chosen deployment,
+    # rather than validating only the top-level application imports.
+    from WinUx.dialogs.local_folder_form import LocalPathDialog, LocalFolderDialog
+    from WinUx.dialogs.local_file_form import LocalFileDialog
+    from WinUx.dialogs.path_selection import PathSelectionOptions
+    import DearUIQt.backends.shared_scrollers  # noqa: F401
+    import WinUx.plotdigitizer.ui.settings  # noqa: F401
+    if not (issubclass(LocalFolderDialog, LocalPathDialog) and
+            issubclass(LocalFileDialog, LocalPathDialog)):
+        raise RuntimeError("File/folder selectors must use the shared LocalPathDialog.")
+    PathSelectionOptions("file", multiple=True)
+    PathSelectionOptions("folder", multiple=True)
+    import winux_runtime.update.updater  # noqa: F401
+    import winux_runtime.launcher  # noqa: F401
     print("WINUX_HEALTH_CHECK_OK {}".format(version))
     return True
 
@@ -370,6 +400,16 @@ def main(run_callable=None):
     project_dir = _project_dir()
     if project_dir not in sys.path:
         sys.path.insert(0, project_dir)
+
+    if '--runtime-info' in sys.argv:
+        import json
+        from winux_runtime.installation_state import package_revision
+        from winux_runtime.update.manifest import read_version
+        info = {'directory': project_dir, 'version': read_version(project_dir),
+                'package_revision': package_revision(project_dir),
+                'update_checks_enabled': os.environ.get('WINUX_SKIP_UPDATE', '').strip() != '1'}
+        print(json.dumps(info, indent=2, sort_keys=True))
+        return info
 
     if "--update-health-check" in sys.argv or os.environ.get("WINUX_HEALTH_CHECK", "").strip() == "1":
         return _run_update_health_check(project_dir)

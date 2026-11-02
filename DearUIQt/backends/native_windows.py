@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import threading
 from ctypes import wintypes
 from dataclasses import dataclass
 
@@ -10,6 +11,15 @@ from . import get_backend
 from .api import BackendCapabilityError
 
 
+
+
+@dataclass(frozen=True)
+class _OwnerOpenLease:
+    """Foreground permission captured before allocating a cold modal HWND."""
+
+    owner_hwnd: int
+    last_input_tick: int | None
+    process_id: int
 
 
 @dataclass(frozen=True)
@@ -109,8 +119,14 @@ def _windows_user32():
 class NativeWindowBackend:
     """Bridge to DearUIQt's custom renderer, never emulate native windows."""
 
+    _primary_items = {}
+    _primary_handles = {}
+    _primary_classes = {}
+    _owner_threads = {}
+
     def __init__(self, backend=None):
-        self.backend = get_backend() if backend is None else backend
+        from . import _BackendProxy
+        self.backend = get_backend() if backend is None or isinstance(backend, _BackendProxy) else backend
         self.extension = getattr(self.backend, "internal_dpg", self.backend)
         # Native ownership is a structural property, not per-frame state.  The
         # original C++ bridge rewrote GWLP_HWNDPARENT on every rendered frame;
@@ -130,7 +146,95 @@ class NativeWindowBackend:
         # cannot consume the first client click merely to activate a modal.
         self._mouse_activate_hooks = {}
         self._first_client_click_callbacks = {}
+        self._close_request_callbacks = {}
         self._first_client_click_armed = set()
+        self._interaction_open_lease = None
+        self._interaction_hwnd = 0
+
+    def registerPrimary(self, item, primary=True):
+        key = id(self.backend)
+        if primary:
+            self._primary_items[key] = getattr(item, 'tag', item)
+            getter = getattr(self.backend, 'get_viewport_configuration', None)
+            if callable(getter):
+                self._primary_classes[key] = (getter(0) or {}).get('title')
+        else:
+            self._primary_items.pop(key, None)
+            self._primary_handles.pop(key, None)
+            self._primary_classes.pop(key, None)
+
+    def isPrimaryItem(self, item):
+        primary = self._primary_items.get(id(self.backend))
+        def native_id(tag):
+            getter = getattr(self.backend, 'get_alias_id', None)
+            return getter(tag) if isinstance(tag, str) and callable(getter) else tag
+        return primary is not None and native_id(primary) == native_id(item)
+
+    def cursorClientPosition(self):
+        """Live desktop cursor mapped unambiguously into the primary client."""
+        user32 = _windows_user32()
+        if user32 is None:
+            return None
+        hwnd = self.primaryWinId()
+        if not hwnd:
+            return None
+        point = wintypes.POINT()
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        user32.GetCursorPos.restype = wintypes.BOOL
+        user32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+        user32.ScreenToClient.restype = wintypes.BOOL
+        if (user32.GetCursorPos(ctypes.byref(point)) and
+                user32.ScreenToClient(wintypes.HWND(hwnd), ctypes.byref(point))):
+            return int(point.x), int(point.y)
+        return None
+
+    def cursorPaintPosition(self):
+        """Live pointer in the coordinate space used by viewport paint layers.
+
+        ImGui native/multi-viewport drawing uses desktop coordinates; ordinary
+        single-viewport backends draw in primary-client coordinates instead.
+        """
+        if not self.isEnabled():
+            return self.cursorClientPosition()
+        user32 = _windows_user32()
+        if user32 is None:
+            return None
+        point = wintypes.POINT()
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+        user32.GetCursorPos.restype = wintypes.BOOL
+        if user32.GetCursorPos(ctypes.byref(point)):
+            return int(point.x), int(point.y)
+        return None
+
+    def primaryWinId(self):
+        """Resolve the process's GLFW host, which is not a secondary native item."""
+        user32 = _windows_user32()
+        if user32 is None:
+            return 0
+        key = id(self.backend)
+        cached = self._primary_handles.get(key, 0)
+        if cached and user32.IsWindow(wintypes.HWND(cached)):
+            return cached
+        found = []
+        enum_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+        @enum_type
+        def visit(hwnd, _data):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value == os.getpid():
+                name = ctypes.create_unicode_buffer(80)
+                user32.GetClassNameW(hwnd, name, len(name))
+                if name.value in ('GLFW30', self._primary_classes.get(key)):
+                    found.append(int(hwnd))
+            return True
+        user32.EnumWindows.argtypes = [enum_type, wintypes.LPARAM]
+        user32.EnumWindows(visit, 0)
+        if len(found) == 1:
+            self._primary_handles[key] = found[0]
+            return found[0]
+        return 0
 
     def available(self):
         return all(callable(getattr(self.extension, name, None)) for name in (
@@ -145,16 +249,62 @@ class NativeWindowBackend:
 
     def enable(self):
         self.require()
-        return bool(self.extension.dearuiqt_enable_native_windows())
+        enabled = bool(self.extension.dearuiqt_enable_native_windows())
+        if enabled or self.isEnabled():
+            self._owner_threads[id(self.backend)] = threading.get_ident()
+        return enabled
+
+    def ownerThreadId(self):
+        """Thread that enabled native windows for this renderer, if known."""
+        return self._owner_threads.get(id(self.backend))
+
+    def isOwnerThread(self):
+        owner = self.ownerThreadId()
+        return owner is None or owner == threading.get_ident()
 
     def isEnabled(self):
         return bool(self.available() and self.extension.dearuiqt_native_windows_enabled())
 
+    def _rendererTag(self, item):
+        """Resolve DearPyGui aliases to the numeric ids required by the native ABI.
+
+        Public DearUIQt widgets are allowed to use normal DearPyGui string aliases
+        (the WinUx primary window is ``"winux_primary"``).  The compiled
+        multi-viewport extension, however, accepts only the underlying integer
+        item id.  Converting an alias with ``int(alias)`` raises before a dock or
+        dialog can be presented, so normalize every native-window entry point in
+        one place.
+        """
+        value = getattr(item, "tag", item)
+        if value is None:
+            return 0
+        if isinstance(value, str):
+            getter = getattr(self.backend, "get_alias_id", None)
+            if callable(getter):
+                try:
+                    resolved = getter(value)
+                except Exception:
+                    resolved = 0
+                if resolved:
+                    return int(resolved)
+            # Numeric strings are still accepted for compatibility with callers
+            # that persisted raw renderer ids.  A non-numeric unresolved alias is
+            # a real programming/configuration error, but report it explicitly
+            # rather than leaking Python's ``invalid literal for int()`` message.
+            try:
+                return int(value)
+            except (TypeError, ValueError, OverflowError):
+                raise ValueError(
+                    "Native window alias is not registered: {!r}".format(value))
+        return int(value)
+
     def configure(self, item, *, owner=None, modal=False, owner_hwnd=0):
         self.require()
-        tag = int(getattr(item, "tag", item))
-        owner_tag = 0 if owner is None else int(getattr(owner, "tag", owner))
+        tag = self._rendererTag(item)
+        owner_tag = 0 if owner is None else self._rendererTag(owner)
         self._configured_item_tag = tag
+        self._interaction_open_lease = None
+        self._interaction_hwnd = 0
         self._configured_owner_tag = owner_tag
         try:
             self._configured_owner_hwnd = int(owner_hwnd or 0)
@@ -162,22 +312,77 @@ class NativeWindowBackend:
             self._configured_owner_hwnd = 0
         return self.extension.dearuiqt_configure_native_window(tag, owner_tag, bool(modal))
 
+    def setModal(self, item, modal):
+        """Change native modality without re-resolving the launch-time owner."""
+        self.require()
+        tag = self._rendererTag(item)
+        if tag != self._configured_item_tag:
+            raise ValueError("Native modality requires a configured window")
+        return self.extension.dearuiqt_configure_native_window(
+            tag, self._configured_owner_tag, bool(modal))
+
     def _rawWinId(self, item):
         return int(self.extension.dearuiqt_native_window_handle(
-            int(getattr(item, "tag", item))) or 0)
+            self._rendererTag(item)) or 0)
 
     def _desiredOwnerHwnd(self, item_tag):
         if int(item_tag) != int(self._configured_item_tag or 0):
             return 0
         if self._configured_owner_tag:
-            try:
-                owner = int(self.extension.dearuiqt_native_window_handle(
-                    int(self._configured_owner_tag)) or 0)
-            except Exception:
-                owner = 0
+            # A direct-run tool can use a retained item as the primary DPG
+            # window while native multi-window support is enabled for its child
+            # dialogs.  Resolve that owner through the primary GLFW viewport,
+            # not the secondary-window ABI. Registration may happen after a
+            # hidden child is constructed, so decide this lazily at show time.
+            if self.isPrimaryItem(self._configured_owner_tag):
+                owner = int(self.primaryWinId() or 0)
+            else:
+                try:
+                    owner = int(self.extension.dearuiqt_native_window_handle(
+                        int(self._configured_owner_tag)) or 0)
+                except Exception:
+                    owner = 0
             if owner:
                 return owner
         return int(self._configured_owner_hwnd or 0)
+
+    def isOwnerVisible(self, owner_hwnd):
+        """Snapshot owner visibility before opening a native secondary viewport."""
+        user32 = _windows_user32()
+        if user32 is None or not owner_hwnd:
+            return False
+        try:
+            _live, visible = self._window_valid_visible(user32, int(owner_hwnd))
+            return bool(visible)
+        except Exception:
+            return False
+
+    def revealHiddenOwner(self, owner_hwnd):
+        """Repair an involuntary GLFW owner hide without activating the owner.
+
+        An owned modal dialog must remain over its visible parent. Never
+        restore an iconic window or reveal an owner that was already hidden
+        before the dialog was opened (the caller guards that state).
+        """
+        user32 = _windows_user32()
+        if user32 is None or not owner_hwnd:
+            return False
+        try:
+            owner_hwnd = int(owner_hwnd)
+            live, visible = self._window_valid_visible(user32, owner_hwnd)
+            if not live or visible:
+                return False
+            user32.IsIconic.argtypes = [wintypes.HWND]
+            user32.IsIconic.restype = wintypes.BOOL
+            owner = wintypes.HWND(owner_hwnd)
+            if user32.IsIconic(owner):
+                return False
+            user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.ShowWindow.restype = wintypes.BOOL
+            user32.ShowWindow(owner, 4)  # SW_SHOWNOACTIVATE
+            return True
+        except Exception:
+            return False
 
     def synchronizeOwner(self, item):
         """Commit the Win32 owner only when the relationship actually changes.
@@ -187,7 +392,7 @@ class NativeWindowBackend:
         this method for a few frames without generating any non-client traffic.
         """
         self.require()
-        tag = int(getattr(item, "tag", item))
+        tag = self._rendererTag(item)
         hwnd = self._rawWinId(tag)
         owner_hwnd = self._desiredOwnerHwnd(tag)
         if not hwnd or not owner_hwnd or hwnd == owner_hwnd:
@@ -210,13 +415,114 @@ class NativeWindowBackend:
         except Exception:
             return False
 
+    def preserveOwnerPresentation(self, owner_hwnd, dialog_hwnd, *, was_visible=True,
+                                  asynchronous=False):
+        """Keep an owned dialog's existing owner visible without taking focus.
+
+        Shared by in-process and process-hosted dialogs. Never restore an
+        intentionally minimized/hidden owner or raise WinUx after an Alt-Tab.
+        """
+        user32 = _windows_user32()
+        if user32 is None or not was_visible or not owner_hwnd or not dialog_hwnd:
+            return False
+        try:
+            owner_hwnd, dialog_hwnd = int(owner_hwnd), int(dialog_hwnd)
+            if owner_hwnd == dialog_hwnd:
+                return False
+            owner, dialog = wintypes.HWND(owner_hwnd), wintypes.HWND(dialog_hwnd)
+            if (not user32.IsWindow(owner) or not user32.IsWindow(dialog)
+                    or user32.IsIconic(owner)):
+                return False
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            if int(user32.GetForegroundWindow() or 0) not in (owner_hwnd, dialog_hwnd):
+                return False
+            try:
+                dwm = ctypes.windll.dwmapi
+                cloak = wintypes.DWORD()
+                if (dwm.DwmGetWindowAttribute(owner, 14, ctypes.byref(cloak),
+                                             ctypes.sizeof(cloak)) == 0 and cloak.value):
+                    state = wintypes.BOOL(False)
+                    dwm.DwmSetWindowAttribute(owner, 13, ctypes.byref(state), ctypes.sizeof(state))
+            except (AttributeError, OSError):
+                pass
+            if not user32.IsWindowVisible(owner):
+                user32.ShowWindow(owner, 4)  # SW_SHOWNOACTIVATE
+            user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetWindow.restype = wintypes.HWND
+            candidate = int(user32.GetWindow(dialog, 2) or 0)
+            visible_between = []
+            while candidate and candidate != owner_hwnd:
+                handle = wintypes.HWND(candidate)
+                if user32.IsWindowVisible(handle):
+                    visible_between.append(candidate)
+                candidate = int(user32.GetWindow(handle, 2) or 0)
+
+            # An owned dialog does not require its owner to be the immediately
+            # adjacent HWND in Z-order. WinUx legitimately keeps sibling native
+            # tools (Transfer Center, Plots, retained dialogs) between the modal
+            # and the primary owner. Raising the primary across those same-process
+            # siblings causes a one-frame DWM/non-client repaint that users see
+            # as a single app flash after the platform viewport settles. Preserve
+            # that sibling stack and repair only when a foreign/unknown process
+            # actually obscures the owner.
+            if candidate == owner_hwnd and visible_between:
+                owner_pid = _window_process_id(user32, owner_hwnd)
+                dialog_pid = _window_process_id(user32, dialog_hwnd)
+                same_process_stack = bool(owner_pid and dialog_pid == owner_pid)
+                if same_process_stack:
+                    for hwnd in visible_between:
+                        pid = _window_process_id(user32, hwnd)
+                        if not pid or pid != owner_pid:
+                            same_process_stack = False
+                            break
+                if not same_process_stack:
+                    flags = 0x0001 | 0x0002 | 0x0010  # NOSIZE | NOMOVE | NOACTIVATE
+                    if asynchronous:
+                        flags |= 0x4000  # ASYNCWINDOWPOS for a foreign GUI thread.
+                    user32.SetWindowPos(owner, dialog, 0, 0, 0, 0, flags)
+            return True
+        except (AttributeError, OSError, ValueError):
+            return False
+
     def winId(self, item):
+        # The primary DearPyGui viewport is not a secondary native-window ABI
+        # item.  Resolve its GLFW HWND directly instead of asking the custom
+        # extension for a per-item handle.  Besides being semantically correct,
+        # this path is safe for foreground/input gating and avoids the extension
+        # owner's strict GUI-thread assertion for the primary surface.
+        if self.isPrimaryItem(item):
+            return int(self.primaryWinId() or 0)
         self.require()
+        # Secondary HWNDs belong to the renderer thread.  The compiled bridge
+        # deliberately rejects cross-thread access; convert an accidental query
+        # into an unavailable handle instead of surfacing a native RuntimeError
+        # from a background/input worker. Mutating native operations still keep
+        # their strict owner-thread contract.
+        if not self.isOwnerThread():
+            return 0
         hwnd = self._rawWinId(item)
         if hwnd:
             self.synchronizeOwner(item)
         return hwnd
 
+
+    def setCloseRequestHandler(self, item, callback):
+        """Defer WM_CLOSE to the UI thread instead of destroying its HWND.
+
+        A tool asking for confirmation must remain a live native owner until
+        its application explicitly hides/destroys it after the user's answer.
+        """
+        ready = self.preserveFirstClientClick(item)
+        if ready is not True:
+            return ready
+        hwnd = int(self._rawWinId(item) or 0)
+        if not hwnd or hwnd not in self._mouse_activate_hooks:
+            return False
+        if callback is None:
+            self._close_request_callbacks.pop(hwnd, None)
+        else:
+            self._close_request_callbacks[hwnd] = callback
+        return True
 
     def preserveFirstClientClick(self, item, click_callback=None):
         """Ensure an inactive native dialog does not eat its first mouse click.
@@ -269,6 +575,20 @@ class NativeWindowBackend:
             @proc_type
             def wndproc(window, message, wparam, lparam):
                 message = int(message)
+                if message == 0x0010:  # WM_CLOSE
+                    callback = self._close_request_callbacks.get(int(hwnd))
+                    if callable(callback):
+                        try:
+                            callback()  # Enqueue only; never mutate renderer items here.
+                        except Exception:
+                            pass
+                        return 0
+                if message in (0x0201, 0x0202, 0x0204, 0x0205):
+                    # Snapshot every genuine client click before GLFW handles
+                    # it, not just the opening gesture. A later click/release
+                    # invalidates the old opening tick, even if Windows itself
+                    # then drops foreground to a different app.
+                    self._recordOwnedInteraction(hwnd, lparam)
                 if message == WM_MOUSEACTIVATE:
                     return MA_ACTIVATE
                 result = call_proc(ctypes.c_void_p(old_proc), window, message, wparam, lparam)
@@ -315,21 +635,78 @@ class NativeWindowBackend:
         except Exception:
             return False
 
-    def activateOwnedWindow(self, item):
+    def _recordOwnedInteraction(self, hwnd, lparam):
+        """Capture a click received inside this enabled native dialog only."""
+        user32 = _windows_user32()
+        if user32 is None:
+            return
+        try:
+            x = ctypes.c_short(int(lparam) & 0xffff).value
+            y = ctypes.c_short((int(lparam) >> 16) & 0xffff).value
+            rect = wintypes.RECT()
+            handle = wintypes.HWND(int(hwnd))
+            if (not user32.IsWindowEnabled(handle)
+                    or not user32.IsWindowVisible(handle)
+                    or not user32.GetClientRect(handle, ctypes.byref(rect))
+                    or not (0 <= x < rect.right and 0 <= y < rect.bottom)):
+                return
+            owner = int(self._desiredOwnerHwnd(self._configured_item_tag) or 0)
+            if not owner or user32.IsIconic(wintypes.HWND(owner)):
+                return
+            self._interaction_hwnd = int(hwnd)
+            self._interaction_open_lease = _OwnerOpenLease(
+                owner, _last_input_tick(user32), os.getpid())
+        except Exception:
+            pass
+
+    def repairOwnedInteraction(self, item):
+        """Repair modeless click activation, never reactivate it over its owner."""
+        user32 = _windows_user32()
+        lease = self._interaction_open_lease
+        if (user32 is None or lease is None or lease.last_input_tick is None
+                or int(self._rawWinId(item) or 0) != self._interaction_hwnd
+                or _last_input_tick(user32) != lease.last_input_tick):
+            return False
+        return self.activateOwnedWindow(item, opening=lease)
+
+    def beginOwnerOpen(self, item, *, owner_hwnd=0):
+        """Remember a foreground owner's user gesture before platform creation."""
+        user32 = _windows_user32()
+        if user32 is None:
+            return None
+        try:
+            if not owner_hwnd:
+                tag = self._rendererTag(item)
+                owner_hwnd = self._desiredOwnerHwnd(tag)
+            owner_hwnd = int(owner_hwnd or 0)
+            if not owner_hwnd:
+                return None
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            if int(user32.GetForegroundWindow() or 0) != owner_hwnd:
+                return None
+            live, visible = self._window_valid_visible(user32, owner_hwnd)
+            if not live or not visible or user32.IsIconic(wintypes.HWND(owner_hwnd)):
+                return None
+            return _OwnerOpenLease(owner_hwnd, _last_input_tick(user32), os.getpid())
+        except Exception:
+            return None
+
+    def activateOwnedWindow(self, item, *, opening=None):
         """Activate a newly presented owned HWND without stealing desktop focus.
 
         ImGui focus is not sufficient for secondary platform viewports: the
         first physical click may otherwise be consumed by USER32 purely to
         activate the HWND.  Activate only when the current foreground window
-        is this child or its configured owner.  If another application already
-        owns foreground, leave it alone.
+        is this child or its configured owner. A launch-time foreground lease
+        also permits repairing GLFW's automatic fallback to another app during
+        cold creation, but only if no newer user input has occurred.
 
         Returns ``None`` while the native HWND is not created yet, ``False``
         when activation is intentionally refused, and ``True`` when the child
         is ready/active.
         """
         self.require()
-        tag = int(getattr(item, "tag", item))
+        tag = self._rendererTag(item)
         hwnd = int(self._rawWinId(tag) or 0)
         if not hwnd:
             return None
@@ -345,8 +722,22 @@ class NativeWindowBackend:
                 owner_hwnd = int(self._owner_from_child(user32, hwnd) or 0)
             user32.GetForegroundWindow.restype = wintypes.HWND
             foreground = int(user32.GetForegroundWindow() or 0)
+            if foreground == hwnd:
+                return True  # Already active: do not reset focus on each render.
+            interaction = self._interaction_open_lease
+            if (self._interaction_hwnd == hwnd and interaction is not None
+                    and interaction.last_input_tick is not None
+                    and _last_input_tick(user32) == interaction.last_input_tick):
+                opening = interaction
             if foreground not in tuple(value for value in (hwnd, owner_hwnd) if value):
-                return False
+                if (not isinstance(opening, _OwnerOpenLease)
+                        or opening.owner_hwnd != owner_hwnd
+                        or opening.last_input_tick is None
+                        or _last_input_tick(user32) != opening.last_input_tick):
+                    return False
+                if foreground and _window_process_id(user32, foreground) == opening.process_id:
+                    # A new same-process dialog/tool supersedes this request.
+                    return False
             handle = wintypes.HWND(hwnd)
             if foreground != hwnd:
                 user32.BringWindowToTop.argtypes = [wintypes.HWND]
@@ -361,7 +752,7 @@ class NativeWindowBackend:
             user32.SetFocus.restype = wintypes.HWND
             user32.SetActiveWindow(handle)
             user32.SetFocus(handle)
-            return True
+            return int(user32.GetForegroundWindow() or 0) == hwnd
         except Exception:
             return False
 
@@ -473,6 +864,57 @@ class NativeWindowBackend:
             return bool(user32.SetWindowPos(
                 wintypes.HWND(hwnd), wintypes.HWND(0), 0, 0, 0, 0, flags))
         except Exception:
+            return False
+
+    def positionPopup(self, item, position, size):
+        """Give a native menu a frameless client-sized, top-most popup surface.
+
+        GLFW initially creates a decorated HWND even for ImGui NoTitleBar.
+        Leaving those invisible caption metrics in place offsets menus by a
+        caption height and lets their OS frames extend outside the work area.
+        """
+        self.require()
+        hwnd = self._rawWinId(item)
+        user32 = _windows_user32()
+        if not hwnd or user32 is None:
+            return False
+        try:
+            getter = (user32.GetWindowLongPtrW if ctypes.sizeof(ctypes.c_void_p) == 8
+                      else user32.GetWindowLongW)
+            setter = (user32.SetWindowLongPtrW if ctypes.sizeof(ctypes.c_void_p) == 8
+                      else user32.SetWindowLongW)
+            getter.argtypes = [wintypes.HWND, ctypes.c_int]
+            getter.restype = ctypes.c_ssize_t
+            setter.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+            setter.restype = ctypes.c_ssize_t
+            handle = wintypes.HWND(hwnd)
+            style = int(getter(handle, -16)) & 0xFFFFFFFF
+            # CAPTION | THICKFRAME | SYSMENU | MINIMIZEBOX | MAXIMIZEBOX.
+            desired = style & ~0x00CF0000
+            if desired != style:
+                setter(handle, -16, ctypes.c_long(desired).value)
+            extended = int(getter(handle, -20)) & 0xFFFFFFFF
+            # TOOLWINDOW instead of APPWINDOW: menus are not taskbar apps.
+            desired_ex = (extended & ~0x00040000) | 0x00000080
+            if desired_ex != extended:
+                setter(handle, -20, ctypes.c_long(desired_ex).value)
+            x, y = map(int, position)
+            width, height = map(int, size)
+            from .native_presentation import presentation_for
+            presentation = presentation_for(self.backend)
+            if presentation is not None:
+                # The renderer retains decorated frame metrics for its native
+                # viewport. Normalize its future size requests before USER32
+                # applies them, rather than correcting a visible popup later.
+                presentation.pin_popup(item, hwnd, (x, y), (width, height))
+            user32.SetWindowPos.argtypes = [
+                wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            user32.SetWindowPos.restype = wintypes.BOOL
+            return bool(user32.SetWindowPos(
+                handle, wintypes.HWND(-1), x, y, width, height,
+                0x0010 | 0x0020))  # NOACTIVATE | FRAMECHANGED
+        except (AttributeError, OSError, ValueError):
             return False
 
     def centerBeforeShow(self, item, *, width, height, owner=None, owner_hwnd=0):
@@ -653,7 +1095,7 @@ class NativeWindowBackend:
         """
         if not self.isEnabled():
             return False
-        tag = int(getattr(item, "tag", item))
+        tag = self._rendererTag(item)
         if not tag:
             return False
 

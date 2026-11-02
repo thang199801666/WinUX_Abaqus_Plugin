@@ -7,6 +7,13 @@ from ..dispatch import LatestCallQueue
 from ..core.object import Qt, QPoint, QRect, QSize, QSizePolicy, QObject, QEvent, QCloseEvent
 
 
+# Most widgets never receive worker writes. Allocate their dispatch lock/queue
+# only on demand; this one lock protects first-use racing with widget teardown.
+_updates_creation_lock = threading.Lock()
+_closed_updates = LatestCallQueue(None)
+_closed_updates.close()
+
+
 class QWidget(QObject):
     """Base retained wrapper over one Dear PyGui item.
 
@@ -47,7 +54,7 @@ class QWidget(QObject):
         self._dynamic_properties = {}
         self._tooltip = None
         self._tooltip_text = None
-        self._updates = LatestCallQueue(self._after) if self._after is not None else None
+        self._updates = None
         self._layout_manager = None
         self._window_title = ""
         self._attributes = set()
@@ -98,10 +105,27 @@ class QWidget(QObject):
             if self._updates is not None:
                 self._updates.discard(key)
             callback(*args, **kwargs)
-        elif self._updates is not None:
-            self._updates.post(key, self._deliver, callback, args, kwargs)
+        elif self._after is not None:
+            self._update_queue().post(key, self._deliver, callback, args, kwargs)
         else:
             raise RuntimeError("worker updates require a UI scheduler")
+
+    def _update_queue(self):
+        updates = self._updates
+        if updates is None:
+            with _updates_creation_lock:
+                if self._updates is None:
+                    self._updates = (_closed_updates if self._deleted
+                                     else LatestCallQueue(self._after, time_budget_ms=4.0))
+                updates = self._updates
+        return updates
+
+    def _close_updates(self):
+        with _updates_creation_lock:
+            updates = self._updates
+            self._updates = _closed_updates
+        if updates is not None:
+            updates.close()
 
     def _deliver(self, callback, args, kwargs=None):
         self._require_ui()
@@ -561,8 +585,8 @@ class QWidget(QObject):
                 return application.postEvent(self, QEvent(QEvent.LayoutRequest))
         except Exception:
             pass
-        if self._updates is not None:
-            return self._updates.post(
+        if self._after is not None:
+            return self._update_queue().post(
                 "layout-request", self.sendEvent, QEvent(QEvent.LayoutRequest))
         self.sendEvent(QEvent(QEvent.LayoutRequest))
         return True
@@ -1103,7 +1127,8 @@ class QWidget(QObject):
         self._tooltip_text = text
         try:
             if self._tooltip is None or not self.backend.does_item_exist(self._tooltip):
-                with self.backend.tooltip(self.tag) as tooltip:
+                from ..tooltip import TOOLTIP_DELAY
+                with self.backend.tooltip(self.tag, delay=TOOLTIP_DELAY, hide_on_activity=True) as tooltip:
                     self._tooltip = tooltip
                     self.backend.add_text(text)
             else:
@@ -1124,8 +1149,7 @@ class QWidget(QObject):
         self._require_ui()
         if self._deleted:
             return
-        if self._updates is not None:
-            self._updates.close()
+        self._close_updates()
         try:
             super().delete()
         finally:

@@ -3,13 +3,13 @@ from __future__ import annotations
 
 from ...ui.hosting.inprocess_dialog import TransientInProcessDialogMixin
 from ..blocking_form import BlockingDialog as BlockingForm
-from ..job_edit_form import JobEditDialog as JobEditForm
-from ..job_manager_form import JobManagerDialog as JobManagerForm
-from ..local_folder_form import LocalFolderDialog as LocalFolderForm
-from ..local_file_form import LocalFileDialog as LocalFileForm
+from ..jobs.job_edit_form import JobEditDialog as JobEditForm
+from ..jobs.job_manager_form import JobManagerDialog as JobManagerForm
+from ..selectors.local_folder_form import LocalFolderDialog as LocalFolderForm
+from ..selectors.local_file_form import LocalFileDialog as LocalFileForm
 from ..login_form import LoginForm
-from ..odb_check_form import ODBCheckDialog as ODBCheckForm
-from ..odb_extract_form import ODBExtractDialog as ODBExtractForm, ODBXYResultDialog as ODBXYResultForm
+from ..odb.odb_check_form import ODBCheckDialog as ODBCheckForm
+from ..odb.odb_extract_form import ODBExtractDialog as ODBExtractForm, ODBXYResultDialog as ODBXYResultForm
 from ..progress_form import ProgressDialog as ProgressForm
 from ..server_path_form import ServerPathDialog as ServerPathForm
 
@@ -20,11 +20,13 @@ class _TransientTool(TransientInProcessDialogMixin):
 
 class BlockingDialog(_TransientTool, BlockingForm):
     def __init__(self, view, title, message, kind="message", initial="", on_result=None,
-                 primary_text=None, secondary_text=None, intent="info", owner_hwnd=None):
-        # owner_hwnd is a process-host compatibility argument; QObject/native
-        # ownership is implicit when sharing the main QApplication.
+                 primary_text=None, secondary_text=None, intent="info", owner_hwnd=None,
+                 option_text=None, option_checked=False, parent=None):
+        # owner_hwnd is process-host compatibility; explicit visual ownership
+        # is established by parent before preparing the native modal window.
         BlockingForm.__init__(self, view, title, message, kind, initial, on_result,
-                              primary_text, secondary_text, intent)
+                              primary_text, secondary_text, intent,
+                               option_text, option_checked, parent=parent)
         self._init_inprocess_lifetime(view)
 
 
@@ -47,17 +49,21 @@ class JobManagerDialog(_TransientTool, JobManagerForm):
 
 
 class LocalFolderDialog(_TransientTool, LocalFolderForm):
-    def __init__(self, view, initial, on_selected=None):
-        LocalFolderForm.__init__(self, view, initial, on_selected)
+    def __init__(self, view, initial, on_selected=None, *, multiple=False,
+                 show_hidden=False, title=None):
+        LocalFolderForm.__init__(self, view, initial, on_selected,
+                                 multiple=multiple, show_hidden=show_hidden, title=title)
         self._init_inprocess_lifetime(view)
 
 
 class LocalFileDialog(_TransientTool, LocalFileForm):
     def __init__(self, view, initial="", on_selected=None, *, extensions=(),
-                 save=False, default_filename="", width=840, height=540):
+                 save=False, default_filename="", width=840, height=540,
+                 multiple=False, show_hidden=False, title=None):
         LocalFileForm.__init__(self, view, initial, on_selected,
                                extensions=extensions, save=save,
-                               default_filename=default_filename)
+                               default_filename=default_filename, multiple=multiple,
+                               show_hidden=show_hidden, title=title)
         self.width, self.height = int(width), int(height)
         self.preferred_size = (self.width, self.height)
         self._init_inprocess_lifetime(view)

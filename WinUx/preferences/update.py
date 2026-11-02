@@ -7,7 +7,7 @@ so Settings and startup agree on the default repository and legacy migration.
 from __future__ import annotations
 
 from .storage import JsonPreferenceStore
-from winux_update_providers import update_preferences
+from winux_runtime.update.providers import update_preferences
 
 class UpdatePreferences:
     DEFAULT_PROVIDER = "auto"

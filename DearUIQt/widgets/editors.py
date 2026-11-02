@@ -142,6 +142,11 @@ class ImGuiLineEdit(QWidget):
 
     def _set_text(self, text):
         changed = self._properties.get("value") != text
+        if not changed and self.text() != text:
+            # An active native InputText can write its private buffer back
+            # after a programmatic set. A repeated setText must reconcile the
+            # displayed value, not be dropped solely by the retained cache.
+            self.backend.set_value(self.tag, text)
         self._set_value(text)
         self._modified = self._editing_dirty = False
         if changed:
@@ -266,7 +271,7 @@ class _ImGuiAbstractSpinBox(QWidget):
     """
 
     _kind = "int"
-    _button_width = METRICS.spin_arrow_width
+    _button_width = 14
 
     def _layout_tag(self):
         return self.container
@@ -284,6 +289,8 @@ class _ImGuiAbstractSpinBox(QWidget):
         self._handlers = None
         self._arrow_handlers = []
         self._arrow_triangles = []
+        self._arrow_surfaces = []
+        self._arrow_visual_states = {}
         self._drawn_arrows = False
 
         shell_width = -1 if width is None else int(width)
@@ -361,42 +368,41 @@ class _ImGuiAbstractSpinBox(QWidget):
     def _create_spin_arrow(self, backend, height, direction):
         """Create a font-independent spin sub-control.
 
-        Real Dear PyGui backends use draw-triangle geometry. Test/minimal
+        Real Dear PyGui backends use compact Qt-style filled triangles. Test/minimal
         backends that do not expose drawlists fall back to a blank button --
         never to ``^``/``v`` glyphs that depend on the active font atlas.
         """
         if hasattr(backend, "add_drawlist") and hasattr(backend, "draw_triangle"):
             item = backend.add_drawlist(width=self._button_width, height=height)
-            # Paint only inside the existing arrow strip; the numeric editor
-            # remains white and keeps its original native input hit region.
+            # Qt/Fusion uses a narrow pair of flat sub-buttons inside the
+            # editor frame, not a separate pair of rounded push buttons.
+            background = None
             if hasattr(backend, "draw_rectangle"):
-                backend.draw_rectangle(
+                background = backend.draw_rectangle(
                     (0, 0), (self._button_width, height),
-                    color=(0, 0, 0, 0), fill=(240, 240, 240, 255), parent=item)
+                    color=(0, 0, 0, 0), fill=(245, 245, 245, 255),
+                    rounding=2, parent=item)
             cx = self._button_width * 0.5
             cy = height * 0.5
             if direction > 0:
-                points = ((cx - 3.5, cy + 1.7),
-                          (cx + 3.5, cy + 1.7),
-                          (cx, cy - 2.2))
+                points = ((cx - 2.5, cy + 1.5),
+                          (cx + 2.5, cy + 1.5),
+                          (cx, cy - 1.5))
             else:
-                points = ((cx - 3.5, cy - 1.7),
-                          (cx + 3.5, cy - 1.7),
-                          (cx, cy + 2.2))
-            # Draw the editor/button divider as a true single-pixel line in
-            # the arrow strip.  The old dedicated 1 px table column acquired
-            # extra table/child geometry on Windows and looked 2-3 px thick.
+                points = ((cx - 2.5, cy - 1.5),
+                          (cx + 2.5, cy - 1.5),
+                          (cx, cy + 1.5))
             if hasattr(backend, "draw_line"):
-                try:
-                    backend.draw_line((0.5, 0), (0.5, height),
-                                      color=(188, 188, 188, 255),
-                                      thickness=1.0, parent=item)
-                except Exception:
-                    pass
+                backend.draw_line((.5, 0), (.5, height),
+                                  color=(190, 190, 190, 255), thickness=1, parent=item)
+                if direction < 0:
+                    backend.draw_line((1, .5), (self._button_width, .5),
+                                      color=(218, 218, 218, 255), thickness=1, parent=item)
             triangle = backend.draw_triangle(
-                *points, color=(40, 40, 40, 255), fill=(40, 40, 40, 255),
-                parent=item)
+                *points, color=(100, 100, 100, 255),
+                fill=(100, 100, 100, 255), parent=item)
             self._arrow_triangles.append(triangle)
+            self._arrow_surfaces.append((item, background, triangle))
             try:
                 with backend.item_handler_registry() as registry:
                     backend.add_item_clicked_handler(
@@ -404,6 +410,9 @@ class _ImGuiAbstractSpinBox(QWidget):
                         callback=lambda *_args, _direction=direction:
                             self.stepBy(_direction),
                     )
+                    if hasattr(backend, 'add_item_visible_handler'):
+                        backend.add_item_visible_handler(
+                            callback=lambda *_args, _item=item: self._refresh_arrow_feedback(_item))
                 backend.bind_item_handler_registry(item, registry)
                 self._arrow_handlers.append(registry)
             except Exception:
@@ -416,15 +425,37 @@ class _ImGuiAbstractSpinBox(QWidget):
         )
 
     def _render_spin_arrows(self, enabled=True):
-        """Do not mutate draw-triangle items after creation.
+        for item, _background, _triangle in self._arrow_surfaces:
+            self._refresh_arrow_feedback(item, enabled=enabled)
 
-        Some Dear PyGui 2.3.1 Windows builds report a low-level
-        ``configure_item`` SystemError for draw commands.  Enabled state is
-        already enforced by ``stepBy``/``isEnabled`` and the numeric editor,
-        so keeping the geometric arrow static is both safe and behaviorally
-        correct.
-        """
-        return
+    def _refresh_arrow_feedback(self, item, enabled=None):
+        """Paint each sub-button's hover/press state without rebuilding it."""
+        if getattr(self, '_deleted', False):
+            return
+        b = self.backend
+        if enabled is None:
+            enabled = bool(self._properties.get('enabled', True))
+        try:
+            state = b.get_item_state(item) or {}
+            hovered = bool(enabled and state.get('hovered', False))
+            pressed = bool(hovered and b.is_mouse_button_down(b.mvMouseButton_Left))
+            signature = bool(enabled), hovered, pressed
+            if self._arrow_visual_states.get(item) == signature:
+                return
+            face = ((235, 235, 235, 255) if not enabled else
+                    (204, 228, 247, 255) if pressed else
+                    (229, 241, 251, 255) if hovered else (245, 245, 245, 255))
+            ink = (160, 160, 160, 255) if not enabled else (100, 100, 100, 255)
+            for arrow, background, triangle in self._arrow_surfaces:
+                if arrow == item:
+                    if background is not None:
+                        b.configure_item(background, fill=face)
+                    b.configure_item(triangle, color=ink, fill=ink)
+                    break
+            self._arrow_visual_states[item] = signature
+        except Exception:
+            # Optional decoration must not break editing on older backends.
+            return
 
     def _format_string(self):
         return "%.{}f".format(max(0, self._decimals))

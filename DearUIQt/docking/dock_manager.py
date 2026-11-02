@@ -1752,8 +1752,10 @@ class DockManager:
             return (40.0, 10.0)
         try:
             hx, hy = map(float, dpg.get_item_rect_min(handle))
+            hw, _ = map(float, dpg.get_item_rect_size(handle))
             return (max(0.0, float(mouse[0]) - hx),
-                    max(0.0, float(mouse[1]) - hy))
+                    max(0.0, float(mouse[1]) - hy),
+                    max(1.0, hw))
         except Exception:
             return (40.0, 10.0)
 
@@ -1847,8 +1849,13 @@ class DockManager:
             return False
         accepted = True
         for index, key in enumerate(keys):
-            anchor = (float(drag_anchor[0]) + 12.0 * index,
-                      float(drag_anchor[1]) + 12.0 * index)
+            if isinstance(drag_anchor, (tuple, list)) and len(drag_anchor) >= 3:
+                anchor = (float(drag_anchor[0]) + 12.0 * index,
+                          float(drag_anchor[1]) + 12.0 * index,
+                          float(drag_anchor[2]))
+            else:
+                anchor = (float(drag_anchor[0]) + 12.0 * index,
+                          float(drag_anchor[1]) + 12.0 * index)
             if not self._request_drag_tearoff(key, mouse, anchor):
                 accepted = False
         return accepted
@@ -2098,6 +2105,8 @@ class DockManager:
                 drag_anchor = (
                     max(0.0, mouse[0] - button_rect[0]),
                     max(0.0, mouse[1] - button_rect[1]),
+                    max(1.0, float(button_rect[2])),
+                    max(1.0, float(button_rect[3])),
                 )
             else:
                 drag_anchor = (40.0, 10.0)
@@ -2201,21 +2210,14 @@ class DockManager:
         self._last_layout_groups = tuple(dict(group) for group in groups)
         self._sync_split_handle_views(details["handles"])
 
-        # Start hidden; each visible layout leaf re-enables exactly one dock
-        # per tab group. Split siblings remain visible simultaneously.
-        for key, entry in self._entries.items():
-            if bool(entry.get("floating")):
-                continue
-            window = entry.get("window")
-            root = getattr(window, "root", None)
-            if root is None or not dpg.does_item_exist(root):
-                continue
-            dpg.configure_item(root, show=False)
-            effective = getattr(window, "_set_effective_visibility", None)
-            if callable(effective):
-                effective(False)
-
+        # Do not pessimistically hide every dock before revealing the active
+        # leaves.  That old two-pass approach produced hide->show churn, emitted
+        # visibilityChanged twice for still-active docks, and forced Dear PyGui
+        # to invalidate the same subtree repeatedly during dock/undock.  Resolve
+        # the desired state once and only touch visibility when it actually
+        # changes.
         used_tab_groups = set()
+        laid_out_keys = set()
         current_tab_position = self.tabPosition(self.dock_area)
         self.tab_position = current_tab_position
         for group in groups:
@@ -2255,12 +2257,15 @@ class DockManager:
                 root = getattr(window, "root", None)
                 if root is None or not dpg.does_item_exist(root):
                     continue
+                laid_out_keys.add(key)
                 requested_visible = self._window_requested_visible(window)
                 is_active = bool(key == active and requested_visible)
-                dpg.configure_item(root, show=is_active)
-                effective = getattr(window, "_set_effective_visibility", None)
-                if callable(effective):
-                    effective(is_active)
+                previous_effective = getattr(window, "_effective_visible", None)
+                if previous_effective is None or bool(previous_effective) != is_active:
+                    dpg.configure_item(root, show=is_active)
+                    effective = getattr(window, "_set_effective_visibility", None)
+                    if callable(effective):
+                        effective(is_active)
                 if not is_active:
                     continue
                 dpg.configure_item(
@@ -2268,6 +2273,22 @@ class DockManager:
                 resize = getattr(window, "resize", None)
                 if callable(resize):
                     resize(gw, content_h)
+
+        # Requested-hidden docks are not part of layout_details(). Make sure a
+        # dock that was visible in the previous topology is hidden exactly once.
+        for key, entry in self._entries.items():
+            if key in laid_out_keys or bool(entry.get("floating")):
+                continue
+            window = entry.get("window")
+            root = getattr(window, "root", None)
+            if root is None or not dpg.does_item_exist(root):
+                continue
+            previous_effective = getattr(window, "_effective_visible", None)
+            if previous_effective is None or bool(previous_effective):
+                dpg.configure_item(root, show=False)
+                effective = getattr(window, "_set_effective_visibility", None)
+                if callable(effective):
+                    effective(False)
 
         self._hide_unused_tab_views(used_tab_groups)
         self._tabs_dirty = False

@@ -1,8 +1,6 @@
 """Child-side DPG lifecycle: build, warm up invisibly, center, publish, run."""
 from __future__ import annotations
 
-import heapq
-import itertools
 import os
 from pathlib import Path
 import queue
@@ -21,6 +19,8 @@ from DearUIQt.layouts import QHBoxLayout
 from DearUIQt.gui import QCursor
 from ...services.floating_protocol import read_messages, encode_message
 from ...runtime.dpg_callbacks import run_callback_jobs
+from ...runtime.frame_clock import AdaptiveFrameClock
+from ...runtime.ui_dispatcher import UiDispatcher
 from ..native.message_pump import pump_native_messages, wait_native_messages
 from DearUIQt.input_gate import native_background_input_blocked, release_pointer_input
 
@@ -36,9 +36,9 @@ class ChildView:
     is_standalone_ui_host = True
 
     def __init__(self):
-        self.queue = []
-        self.sequence = itertools.count()
-        self.incoming = queue.Queue()
+        self._dispatcher = UiDispatcher()
+        self._frame_clock = AdaptiveFrameClock()
+        self._dispatcher.set_wake_callback(self._wake_ui)
         self._native_hwnd = 0
         self._first_presented = False
         self._presentation_visible = False
@@ -48,8 +48,14 @@ class ChildView:
         return self._native_hwnd
 
     def after(self, delay, callback, *args):
-        self.incoming.put((time.monotonic() + max(0, delay)/1000,
-                           next(self.sequence), callback, args))
+        return self._dispatcher.after(delay, callback, *args)
+
+    def after_cancel(self, token):
+        return self._dispatcher.after_cancel(token)
+
+    def _wake_ui(self):
+        self._frame_clock.work()
+        wake_native_window(self._native_hwnd)
 
     def after_render(self, callback, *args):
         self.after(0, callback, *args)
@@ -71,16 +77,7 @@ class ChildView:
             self.after(0, callback, *args)
 
     def drain(self):
-        while True:
-            try:
-                heapq.heappush(self.queue, self.incoming.get_nowait())
-            except queue.Empty:
-                break
-        for _ in range(64):
-            if not self.queue or self.queue[0][0] > time.monotonic():
-                break
-            _, _, callback, args = heapq.heappop(self.queue)
-            callback(*args)
+        self._dispatcher.drain(max_callbacks=64, time_budget_ms=6.0)
 
 
 def configure_context(view):
@@ -174,7 +171,7 @@ class PreparedViewport:
         prepare_common_form_imports()
         # Pay icon decode/Shell texture upload costs before advertising a warm
         # host. Only shared graphics are created, never a form or directory scan.
-        from ...dialogs.folder_browser_style import prepare_browser_textures
+        from ...dialogs.selectors.folder_browser_style import prepare_browser_textures
         textures = prepare_browser_textures()
         warm_icons = QHBoxLayout(parent=self.blank, spacing=0)
         for texture in textures:
@@ -185,6 +182,7 @@ class PreparedViewport:
         initial = self.wait_for_next_init()
         if initial is not None:
             return initial
+        self.native.close_activation_guard()
         self.gui.destroy()
         return None
 
@@ -210,6 +208,7 @@ class PreparedViewport:
         # SW_HIDE already excludes this host from taskbar/Alt+Tab. Preserve its
         # normal caption: toggling WS_EX_TOOLWINDOW on every lease resizes the
         # native client/swap-chain even when the dialog size did not change.
+        previous_view._dispatcher.close()
         self.view = ChildView()
         for name in ("body_font", "heading_font", "terminal_font", "ui_font_family", "ui_font_size"):
             if hasattr(previous_view, name):
@@ -303,6 +302,7 @@ class FloatingDialogRuntime:
         self._publish_preauthorized = _publish_preauthorized(initial, prepared)
         self._publish_requested = self._publish_preauthorized
         self._commit_requested = False
+        self._fast_publish = bool(initial.get("fast_publish") and not initial.get("modal"))
         self.startup = list(prepared.startup) if prepared else []
         self.timings = {}
         self._startup_frames = []
@@ -386,13 +386,16 @@ class FloatingDialogRuntime:
             user32.IsWindowEnabled.argtypes = [wintypes.HWND]
             if not user32.IsWindowEnabled(self.native.hwnd):
                 return
-        point = QCursor.pos()
-        mouse = (float(point.x()), float(point.y()))
+        current = QCursor.pos()
+        mouse = (float(current.x()), float(current.y()))
         # A merely different *valid* coordinate can mean the user moved between
         # mouse-down and dispatch. Do not replay that normal ImGui press.
         if mouse != (0.0, 0.0) and all(value >= 0 for value in mouse):
             return
         recover = getattr(self.form, "native_pointer_press", None)
+        # `point` is the client-space snapshot captured from WM_LBUTTONDOWN,
+        # matching this floating host's renderer viewport coordinates. Do not
+        # replace it with the unavailable cursor (0, 0) during lease handoff.
         if callable(recover) and recover(point):
             self._trace_browser_input("native-pointer-recovered", point)
 
@@ -571,6 +574,7 @@ class FloatingDialogRuntime:
                 message = self.incoming.get_nowait()
             except queue.Empty:
                 break
+            self.view._frame_clock.work()
             if not self._handle_command(message, preparing=preparing):
                 return
 
@@ -605,7 +609,18 @@ class FloatingDialogRuntime:
         elif command == "hide":
             self.hide()
         elif command == "begin_dock_move" and self.initial.get("kind") in ("console_dock", "plot_dock"):
-            self.native.begin_dock_move()
+            anchor = None
+            args = message.get("args") or ()
+            if args:
+                anchor = args[0]
+            # A retained dock host may currently be hidden.  Show/activate it
+            # before injecting HTCAPTION so the original mouse-down gesture can
+            # continue without requiring another click.
+            if not self.native.visible:
+                self.show()
+            elif not self.native.is_foreground():
+                self.native.activate()
+            self.native.begin_dock_move(anchor)
         else:
             deliver_command(self.form, command, message.get("args", []))
         return True
@@ -810,9 +825,16 @@ class FloatingDialogRuntime:
                 self._render_settled_frame()
                 self._render_settled_frame()
         self.stage = "center-native-window"
-        anchor = (initial.get("payload") or {}).get("_dock_drag_anchor")
-        if (initial.get("kind") not in ("console_dock", "plot_dock")
-                or not self.native.position_for_tearoff(anchor)):
+        payload = initial.get("payload") or {}
+        anchor = payload.get("_dock_drag_anchor")
+        saved_geometry = payload.get("_saved_geometry")
+        restored_geometry = bool(
+            initial.get("kind") == "plot_dock"
+            and anchor is None
+            and self.native.restore_geometry(saved_geometry))
+        if (not restored_geometry
+                and (initial.get("kind") not in ("console_dock", "plot_dock")
+                     or not self.native.position_for_tearoff(anchor))):
             self.native.center(owner)
         self.startup.append({"stage": "prepared", "cloaked": cloaked(self.native.hwnd),
                              "rect": window_rect(self.native.hwnd)})
@@ -860,12 +882,14 @@ class FloatingDialogRuntime:
         self.stage = "commit-handshake"
         self.emit("staged", hwnd=self.native.hwnd, pid=os.getpid(),
                   visible=bool(self.desired_visible),
-                  foreground=bool(self.native.is_foreground()))
-        if not self._wait_for_publish_commit():
-            if self.form.winfo_exists():
-                raise RuntimeError(
-                    "Timed out waiting for the parent to commit the floating dialog.")
-            return
+                  foreground=bool(self.native.is_foreground()),
+                  publish_commit_required=not self._fast_publish)
+        if not self._fast_publish:
+            if not self._wait_for_publish_commit():
+                if self.form.winfo_exists():
+                    raise RuntimeError(
+                        "Timed out waiting for the parent to commit the floating dialog.")
+                return
         self.stage = "reveal-native-window"
         self.native.commit_publish(self.desired_visible)
         self.gui.configureViewport(vsync=True)
@@ -874,6 +898,15 @@ class FloatingDialogRuntime:
         if self.desired_visible:
             if not self.native.is_foreground():
                 self.native.activate()
+            # A dock tear-off originates from an already-held title-bar press.
+            # Enter the native move loop in this process immediately after the
+            # HWND is revealed instead of waiting for ready -> parent -> IPC.
+            # This is what makes the new floating window stay attached to the
+            # user's cursor during the very first undock gesture.
+            tearoff_anchor = (initial.get("payload") or {}).get("_dock_drag_anchor")
+            if (initial.get("kind") in ("console_dock", "plot_dock")
+                    and tearoff_anchor is not None):
+                self.native.begin_dock_move(tearoff_anchor)
             self._focus_form()
         self._trace_browser_input("ready")
         self.stage = "ready-layout-diagnostics"
@@ -893,6 +926,30 @@ class FloatingDialogRuntime:
         if initial.get("kind") == "plotdigitizer":
             self.view.after(150, self._start_selector_prewarm)
 
+    def _wait_for_frame(self):
+        """Service IPC/timers independently of painting, including hidden tools."""
+        while self.gui.isRunning() and self.form.winfo_exists():
+            self._drain_commands()
+            if not self.form.winfo_exists():
+                return False
+            self._drain_form_callbacks()
+            self.view.drain()
+            if not self.form.winfo_exists():
+                return False
+            delay = self.view._frame_clock.delay(
+                foreground=self.native.is_foreground()) if self.native.visible else 1.0
+            if self.native.visible and delay <= .001:
+                return True
+            deadline = self.view._dispatcher.next_deadline_ms()
+            if deadline is not None:
+                delay = min(delay, deadline / 1000.0)
+            if self.view._dispatcher.has_immediate_work() or not self.incoming.empty():
+                delay = 0.0
+            if not wait_native_messages(max(1, int(delay * 1000)),
+                                        on_input=self.view._frame_clock.input):
+                return False
+        return False
+
     def run(self):
         if self.prepared is None:
             _RUNTIME_IO_POOL.start(self._read_commands)
@@ -900,24 +957,12 @@ class FloatingDialogRuntime:
         clean = False
         try:
             self._build()
-            while self.gui.isRunning() and self.form.winfo_exists():
-                self._drain_commands()
-                if not self.form.winfo_exists():
-                    break
-                self._drain_form_callbacks()
-                self.view.drain()
-                if self.native.visible:
-                    self.gui.renderFrame()
-                    self.view.mark_presented()
-                    from ..cursor import apply_tool_cursor
-                    apply_tool_cursor(self.view)
-                else:
-                    # Qt blocks the GUI thread in the platform event dispatcher
-                    # while a hidden top-level has no paint work. IPC queues a
-                    # native wake message, so activate/hide is observed
-                    # immediately instead of waiting for a 12 ms polling sleep.
-                    if not wait_native_messages(12):
-                        break
+            while self._wait_for_frame():
+                self.gui.renderFrame()
+                self.view._frame_clock.presented()
+                self.view.mark_presented()
+                from ..cursor import apply_tool_cursor
+                apply_tool_cursor(self.view)
             try:
                 return_focus = bool(self.native and self.native.is_foreground())
                 if return_focus and self.native and self.native.visible:
@@ -979,4 +1024,7 @@ class FloatingDialogRuntime:
                 self.emit("idle", item_count=self.gui.itemCount())
             else:
                 self.reusable = False
+                self.view._dispatcher.close()
+                if self.native:
+                    self.native.close_activation_guard()
                 self.gui.destroy()

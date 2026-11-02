@@ -1,5 +1,34 @@
 # Changelog
 
+## 1.1.7 - 2026-11-02
+
+### Improved
+- Faster Plot Digitizer tick recognition with bounded caches and cancellable raster verification.
+- Recognition of blurred decimal labels, faint ticks, rotated year labels and irregular date spacing without forcing numerical sequences.
+- Manual endpoint calibration preserves recognized axes and confirms complete pairs together.
+- Home and Data ribbon workflow, with compact canvas-local Fit Image, Actual Size and zoom controls.
+- Larger overlay artwork, transparent idle backgrounds and explicit hover/pressed feedback.
+- Direct Plot Digitizer launcher and reorganized runtime bootstrap package.
+
+### Fixed
+- Disabled overlay buttons no longer inherit oversized padding or clip the last icon.
+- Pointer routing avoids duplicate button activation and double zoom.
+- Extract stays disabled until a curve color is selected.
+- Undo/Redo cancels pending background work; Smart Region and its OCR results share one history entry.
+- Internal plot-box seeds are not treated as confirmed axis calibration.
+
+### Validation and limitations
+- Overlay geometry, rendered hover/press pixels, extraction pointer routing, ribbon and calibration checks passed with Abaqus Python.
+- No claim is made that unreadable or fully covered axis labels can be recovered.
+- An existing statusbar resize/layout regression remains unresolved.
+
+### Installation
+- Download `WinUx_1.1.7_FULL.zip` and extract into the WinUx plugin directory, or use the stable updater.
+- Close WinUx and finish active transfers before replacing files.
+- Includes per-file integrity checks, release metadata and a SHA-256 checksum.
+- Preserves the previous public release's flat bootstrap modules for older updater compatibility.
+- Development tests, documentation, tools, caches and private settings are excluded from the installation ZIP.
+
 ## 1.1.5 - 2026-10-20
 
 ### Improved

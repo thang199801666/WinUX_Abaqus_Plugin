@@ -1,6 +1,8 @@
 """Shared retained selection/navigation behavior for item views."""
 from __future__ import annotations
 
+from time import monotonic
+
 from ..core.object import Signal, Qt, QPoint, QRect
 from ..core.input import QGlobalInputBinding
 from ..gui.system import QCursor
@@ -28,8 +30,20 @@ class _QtAbstractItemView(QWidget):
         self._row_delegates = {}
         self._column_delegates = {}
         self._selection_model = QItemSelectionModel(parent=self)
+        self._selection_model_connections = []
+        self._selection_sync_depth = 0
+        self._connect_selection_model()
         self._persistent_editors = {}
         self._index_widgets = {}
+        # DearPyGui selectable callbacks are delivered on release. On some
+        # hosts its transient ``is_mouse_button_double_clicked`` flag has
+        # already cleared by then, so retain a tiny Qt-style click history as
+        # a backend-independent fallback. This keeps QListView/QListWidget
+        # ``doubleClicked`` deterministic without changing single-click
+        # selection semantics.
+        self._double_click_interval = 0.50
+        self._last_row_click_key = None
+        self._last_row_click_at = 0.0
         self._install_focus_tracking()
 
     def _install_focus_tracking(self):
@@ -114,6 +128,10 @@ class _QtAbstractItemView(QWidget):
         return bool(self._has_focus)
 
     def setFocus(self):
+        # Keep QApplication's keyboard receiver in sync with native row focus.
+        # Otherwise a previously focused InputText can consume Delete even
+        # after this view reports hasFocus() and highlights a selected row.
+        super().setFocus()
         self._set_view_focus(True)
         self._focus_current()
         return self
@@ -125,24 +143,86 @@ class _QtAbstractItemView(QWidget):
     def _selection_model_command(self):
         return QItemSelectionModel.Select
 
+    def _key_for_model_index(self, index):
+        if (not isinstance(index, QModelIndex) or not index.isValid()
+                or index.model() is not self._model or index.parent().isValid()):
+            return None
+        row_key = getattr(self, '_model_key_for_row', None)
+        if callable(row_key):
+            key = row_key(index.row())
+        else:
+            if index.column() != 0:
+                return None
+            key = index.row()
+        return key if key in self._state._key_index else None
+
+    def _connect_selection_model(self):
+        for connection in self._selection_model_connections:
+            connection.disconnect()
+        self._selection_model_connections = [
+            self._selection_model.selectionChanged.connect(self._model_selection_changed),
+            self._selection_model.currentChanged.connect(self._model_current_changed),
+            self._selection_model._structureRemapped.connect(self._model_structure_remapped),
+        ]
+
+    def _model_structure_remapped(self):
+        self._pull_model_selection(emit=False)
+
+    def _model_selection_changed(self, *_args):
+        self._pull_model_selection(selection=True, current=False)
+
+    def _model_current_changed(self, *_args):
+        self._pull_model_selection(selection=False, current=True)
+
+    def _pull_model_selection(self, *, selection=True, current=True, emit=True):
+        if self._deleted or self._selection_sync_depth:
+            return
+        old_selected, old_current = set(self.selected), self.current
+        if selection:
+            keys = {self._key_for_model_index(index) for index in self._selection_model.selectedIndexes()}
+            keys.discard(None)
+            self._state.selected = keys
+        if current:
+            self.current = self._key_for_model_index(self._selection_model.currentIndex())
+            self.anchor = self.current
+        self._sync_selection_visuals()
+        if emit:
+            if old_current != self.current:
+                self.currentChanged.emit(self.current)
+                text_signal = getattr(self, 'currentTextChanged', None)
+                if text_signal is not None:
+                    text_signal.emit(self.currentText())
+            if old_selected != self.selected:
+                self.selectionChanged.emit(set(self.selected))
+
     def _sync_model_selection(self):
         if self._model is None:
             return
         selection_model = self._selection_model
-        selection_model.clearSelection()
         command = self._selection_model_command()
+        indexes = []
         for key in self.selectedKeys():
             index = self._model_index_for_key(key)
             if index is not None and index.isValid():
-                selection_model.select(index, command)
-        current = self._model_index_for_key(self.current)
-        if current is not None and current.isValid():
+                indexes.append(index)
+        # Replace the complete selection in one transaction. Clearing and then
+        # selecting each key separately exposed partial selections to observers
+        # and repeatedly copied/sorted the growing selection-model state.
+        self._selection_sync_depth += 1
+        try:
+            selection_model.select(indexes, command | QItemSelectionModel.Clear)
+            current = self._model_index_for_key(self.current)
+            if current is None or not current.isValid():
+                current = QModelIndex()
             selection_model.setCurrentIndex(current, QItemSelectionModel.NoUpdate)
+        finally:
+            self._selection_sync_depth -= 1
 
     def model(self):
         return self._model
 
     def setModel(self, model):
+        self._require_ui()
         if model is self._model:
             return self
         self._clear_index_editors()
@@ -153,16 +233,44 @@ class _QtAbstractItemView(QWidget):
                 pass
         self._model_connections.clear()
         self._model = model
-        self._selection_model.setModel(model)
+        # A view switching models must not retarget a selection model shared
+        # with other views. Qt replaces it; the previous object is not deleted.
+        self._selection_model = QItemSelectionModel(model, parent=self)
+        self._connect_selection_model()
+        self._state.selected.clear()
+        self.current = self.anchor = None
         if model is not None:
             for name in ("modelReset", "dataChanged", "rowsInserted",
-                         "rowsRemoved", "columnsInserted", "columnsRemoved",
-                         "layoutChanged", "headerDataChanged"):
+                          "rowsRemoved", "columnsInserted", "columnsRemoved", "rowsMoved", "columnsMoved",
+                          "layoutChanged", "headerDataChanged", "_headerTaken"):
                 signal = getattr(model, name, None)
                 if signal is not None:
-                    self._model_connections.append(signal.connect(self._model_changed))
+                    callback = self._model_reset if name == 'modelReset' else self._model_notification
+                    self._model_connections.append(signal.connect(callback))
         self._model_changed()
+        self._pull_model_selection(emit=False)
         return self
+
+    def _model_reset(self, *_args):
+        if self._deleted:
+            return
+        self._clear_index_editors()
+        # A shared selection model may have connected its reset slot *after*
+        # this view. Do not depend on modelReset connection ordering.
+        self._selection_model.reset()
+        self._state.selected.clear()
+        self.current = self.anchor = None
+        self._model_changed()
+        # A structural table renderer may choose a first current row internally;
+        # reset must leave the public current index invalid and selection empty.
+        self._pull_model_selection(emit=False)
+
+    def _model_notification(self, *args):
+        self._model_changed(*args)
+        if not (len(args) >= 2 and isinstance(args[0], QModelIndex) and isinstance(args[1], QModelIndex)):
+            # Also pull after rebuilding native keys. A shared selection model
+            # may remap either before or after this renderer's model slot.
+            self._pull_model_selection(emit=False)
 
     def _model_changed(self, *_args):
         """Hook for concrete views to rebuild from an attached model."""
@@ -186,11 +294,17 @@ class _QtAbstractItemView(QWidget):
         return self._selection_model
 
     def setSelectionModel(self, selection_model):
+        self._require_ui()
         if selection_model is None:
             selection_model = QItemSelectionModel(self._model, parent=self)
-        if selection_model.model() is not self._model:
-            selection_model.setModel(self._model)
+        if (not isinstance(selection_model, QItemSelectionModel) or selection_model._deleted
+                or selection_model.model() is not self._model):
+            raise ValueError('selection model must be live and use the view model')
+        if selection_model is self._selection_model:
+            return self
         self._selection_model = selection_model
+        self._connect_selection_model()
+        self._pull_model_selection()
         return self
 
     def currentIndex(self):
@@ -199,7 +313,9 @@ class _QtAbstractItemView(QWidget):
     def setCurrentIndex(self, index):
         if not isinstance(index, QModelIndex):
             index = QModelIndex()
-        self._selection_model.setCurrentIndex(index, QItemSelectionModel.ClearAndSelect)
+        if index.isValid() and index.model() is not self._model:
+            return self
+        self._selection_model.setCurrentIndex(index, self._selection_model_command() | QItemSelectionModel.Clear)
         return self
 
     def itemDelegate(self, index=None):
@@ -401,12 +517,16 @@ class _QtAbstractItemView(QWidget):
             self.selectionChanged.emit(set(self.selected))
 
     def selectedKeys(self):
-        return [key for key in self._state.keys if key in self.selected]
+        # Keep visible model order without scanning every unselected row.
+        positions = self._state._key_index
+        return sorted((key for key in self.selected if key in positions),
+                      key=positions.__getitem__)
 
-    def setCurrentKey(self, key, *, select=True):
+    def setCurrentKey(self, key, *, select=True, focus=True):
         if key not in self._state._key_index:
             return False
-        self._set_view_focus(True)
+        if focus:
+            self._set_view_focus(True)
         old_current = self.current
         changed = self._state.select(key, selected=True) if select else False
         self.current = key
@@ -418,7 +538,8 @@ class _QtAbstractItemView(QWidget):
         if changed:
             self.selectionChanged.emit(set(self.selected))
         self._sync_model_selection()
-        self._focus_current()
+        if focus:
+            self._focus_current()
         return True
 
     def navigate(self, key, ctrl=False, shift=False):
@@ -486,15 +607,43 @@ class _QtAbstractItemView(QWidget):
             self.currentChanged.emit(self.current)
         if changed:
             self.selectionChanged.emit(set(self.selected))
-        if self._is_double_click():
+        if self._is_double_click(key):
             self.doubleClicked.emit(key)
             self.activated.emit(key)
 
-    def _is_double_click(self):
+    def _is_double_click(self, key=None):
+        """Return whether this delivered row click completes a double-click.
+
+        Prefer the renderer's native double-click state when it is still
+        available. DearPyGui can clear that transient state before a
+        selectable's release callback, however, so pair two callbacks on the
+        same stable row key inside the platform double-click window as a
+        fallback. Reset the pair after a match to avoid a third rapid click
+        producing a second activation.
+        """
+        native = False
         try:
-            return bool(self.backend.is_mouse_button_double_clicked(self.backend.mvMouseButton_Left))
+            native = bool(self.backend.is_mouse_button_double_clicked(
+                self.backend.mvMouseButton_Left))
         except Exception:
-            return False
+            native = False
+
+        now = monotonic()
+        previous_key = self._last_row_click_key
+        previous_at = self._last_row_click_at
+        paired = (
+            key is not None
+            and previous_key == key
+            and 0.0 <= now - previous_at <= self._double_click_interval
+        )
+        if native or paired:
+            self._last_row_click_key = None
+            self._last_row_click_at = 0.0
+            return True
+
+        self._last_row_click_key = key
+        self._last_row_click_at = now
+        return False
 
     def _sync_selection_visuals(self):
         raise NotImplementedError
@@ -523,6 +672,9 @@ class _QtAbstractItemView(QWidget):
             except Exception:
                 pass
         self._model_connections.clear()
+        for connection in self._selection_model_connections:
+            connection.disconnect()
+        self._selection_model_connections.clear()
         registry = self._focus_handler_registry
         self._focus_handler_registry = None
         if registry is not None:

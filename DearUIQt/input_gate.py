@@ -34,6 +34,8 @@ from .backends import dpg
 
 _pointer_owner = None
 _popup_input_owners = []
+_popup_release_pending = False
+_popup_release_started_down = False
 _popup_release_guard_until_frame = -1
 _protected_items = set()
 # Optional z-order-aware hit tests for native modeless surfaces.
@@ -305,24 +307,30 @@ def acquire_popup_input(owner):
     share the same foreground contract while every background/global handler is
     suppressed.  QMenu uses this from ``popup()`` until the root menu hides.
     """
+    global _popup_release_pending, _popup_release_started_down
     global _popup_release_guard_until_frame
     if owner is None:
         return False
     if owner not in _popup_input_owners:
         _popup_input_owners.append(owner)
+    # A newly opened popup starts a new pointer-ownership epoch. Do not let a
+    # release guard from an older popup swallow input intended for this one.
+    _popup_release_pending = False
+    _popup_release_started_down = False
     _popup_release_guard_until_frame = -1
     return True
 
 
 def release_popup_input(owner, *, consume_gesture=False):
-    """Release popup ownership and optionally consume the current callback frame.
+    """Release popup ownership and optionally consume its closing gesture.
 
-    Dear PyGui global click handlers are all dispatched from the same mouse
-    event.  A popup can therefore hide itself before a background handler runs.
-    Qt does not let that closing click fall through to the widget underneath, so
-    the final popup release can latch the *current frame* without swallowing the
-    next independent press.
+    Dear PyGui may report a menu-row ``clicked`` callback while the physical
+    left button is still down. If QMenu only blocked the frame in which it hid,
+    the later mouse-up could be delivered to an Explorer/ListView underneath
+    and collapse a multi-selection. Qt keeps the popup mouse grab until that
+    complete press/release gesture is over, so mirror that contract here.
     """
+    global _popup_release_pending, _popup_release_started_down
     global _popup_release_guard_until_frame
     if owner is None:
         return False
@@ -331,12 +339,63 @@ def release_popup_input(owner, *, consume_gesture=False):
         _popup_input_owners.remove(owner)
         removed = True
     if removed and not _popup_input_owners and consume_gesture:
-        _popup_release_guard_until_frame = _frame_count()
+        started_down = bool(_mouse_button_down())
+        _popup_release_pending = True
+        _popup_release_started_down = started_down
+        # If the action fired on mouse-up, consuming the current frame is
+        # sufficient. If it fired on mouse-down, wait for the real release and
+        # then retain one extra frame so release-phase global handlers are also
+        # unable to click through.
+        _popup_release_guard_until_frame = -1 if started_down else _frame_count()
     return removed
+
+
+def _popup_release_is_blocking():
+    """Return True while the just-closed popup still owns its mouse gesture."""
+    global _popup_release_pending, _popup_release_started_down
+    global _popup_release_guard_until_frame
+
+    if not _popup_release_pending:
+        return False
+
+    down = bool(_mouse_button_down())
+    frame = _frame_count()
+    if down:
+        if not _popup_release_started_down:
+            # The popup was already closed after mouse-up; a new down-state is
+            # an independent click and must not be swallowed by the old guard.
+            _popup_release_pending = False
+            _popup_release_guard_until_frame = -1
+            return False
+        return True
+
+    if _popup_release_started_down:
+        _popup_release_started_down = False
+    if _popup_release_guard_until_frame < 0:
+        _popup_release_guard_until_frame = frame + 1
+    if frame <= _popup_release_guard_until_frame:
+        return True
+
+    _popup_release_pending = False
+    _popup_release_started_down = False
+    _popup_release_guard_until_frame = -1
+    return False
 
 
 def popup_input_active():
     return bool(_popup_input_owners)
+
+
+def popup_input_is_blocked(owner=None):
+    """Popup-only guard for foreground controls with their own hit surfaces.
+
+    Unlike pointer_input_is_blocked(), this does not mistake a control's own
+    protected surface for another widget. It still consumes a menu's complete
+    closing gesture so global handlers cannot activate controls underneath it.
+    """
+    if _popup_input_owners:
+        return owner not in _popup_input_owners
+    return _popup_release_is_blocking()
 
 
 def acquire_pointer_input(owner):
@@ -542,6 +601,7 @@ def pointer_input_is_blocked(owner=None):
     Explorer rows now under the cursor.
     """
     global _surface_press_item, _surface_press_started_down, _release_guard_until_frame
+    global _popup_release_pending, _popup_release_started_down
     global _popup_release_guard_until_frame
 
     if native_background_input_blocked():
@@ -553,10 +613,8 @@ def pointer_input_is_blocked(owner=None):
     # also activating controls underneath through Dear PyGui global handlers.
     if _popup_input_owners:
         return owner not in _popup_input_owners
-    if _popup_release_guard_until_frame >= 0:
-        if _frame_count() <= _popup_release_guard_until_frame:
-            return True
-        _popup_release_guard_until_frame = -1
+    if _popup_release_is_blocking():
+        return True
 
     if _pointer_owner is not None:
         return _pointer_owner is not owner
@@ -593,7 +651,8 @@ def pointer_input_is_blocked(owner=None):
 
 
 def reset_pointer_input_gate():
-    global _pointer_owner, _popup_release_guard_until_frame
+    global _pointer_owner, _popup_release_pending, _popup_release_started_down
+    global _popup_release_guard_until_frame
     global _surface_press_item, _surface_press_started_down
     global _release_guard_until_frame
     global _native_surface_press_hwnd, _native_surface_press_started_down
@@ -602,6 +661,8 @@ def reset_pointer_input_gate():
     global _native_modal_release_guard_until_frame
     _pointer_owner = None
     _popup_input_owners.clear()
+    _popup_release_pending = False
+    _popup_release_started_down = False
     _popup_release_guard_until_frame = -1
     _surface_press_item = None
     _surface_press_started_down = False

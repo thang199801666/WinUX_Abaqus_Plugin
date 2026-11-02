@@ -1,138 +1,161 @@
 # DearUIQt
 
-DearUIQt is a reusable retained-mode desktop GUI library with a Qt-inspired API
-and a Dear PyGui renderer.  It is application-independent: **DearUIQt must not import WinUx**.
+Thư viện UI Python dùng DearPyGui/native host, tổ chức API theo QtCore, QtGui,
+QtWidgets. Mục tiêu là phát triển một **subset có contract rõ ràng theo Qt 6.8**,
+không phải bản thay thế PySide6/PyQt đầy đủ và không đổi backend mặc định.
 
-An experimental [native multi-window backend](native/README.md) now builds
-independent Win32 windows in one process/context, without Qt or per-dialog IPC.
-Library hosts enable it explicitly. WinUx selects an ABI-matched installed
-runtime automatically and routes its reference tools to retained native forms.
+## Kế hoạch và trạng thái
 
-## Public package layout
+- [ROADMAP.md](ROADMAP.md): milestone, phạm vi tương thích, khác biệt đã biết,
+  điều kiện nghiệm thu và migration.
+- [PERFORMANCE.md](PERFORMANCE.md): tối ưu đã đo, giới hạn benchmark và test.
+- [../tests/README.md](../tests/README.md): hướng dẫn chạy hồi quy.
 
-- `DearUIQt.core` — QObject, events, signals, geometry, timers, threads, futures and processes.
-- `DearUIQt.gui` — actions, palette/style, retained `QPainter`/`QPen`/`QBrush`, owned `QPaintLayer`/font/texture resources, system facades (`QCursor`, `QKeyboard`, `QClipboard`, `QFontMetrics`, `QScreen`), `QStandardItem` and other non-widget GUI types.
-- `DearUIQt.widgets` — controls, windows, dialogs, `QCanvas`/`QViewportCanvas`, non-owning `QRetainedItem` adapters, `QToolTip`, `QPlotWidget`/axes/series, docking and composite widgets such as `QInlineEditPanel`.
-- `DearUIQt.layouts` — box/grid/form layouts and splitter primitives.
-- `DearUIQt.modelview` — item models and list/table/tree views.
-- `DearUIQt.backends` — renderer boundary; Dear PyGui is loaded lazily and can be injected in tests.
-- `DearUIQt.interop` — public interoperability adapters (currently Tk/ttk scrollers) that keep consuming applications away from backend implementation modules.
-- `DearUIQt.themes` — renderer-neutral theme specs, QObject-owned `QTheme` resources and backend-resolving public theme factories.
-- `DearUIQt.docking`, `DearUIQt.ribbon` — higher-level desktop shell components.
-- `DearUIQt.runtime` — standalone host and `QGuiRuntime` context/viewport/render-loop lifecycle boundary.
+Thứ tự phát triển: Core/lifecycle → Model/View semantics → model transactions →
+geometry/DPI → input/widgets → tài nguyên/dữ liệu lớn → tích hợp ứng dụng.
+Không ưu tiên benchmark hơn tính đúng theo Qt.
 
-`DearUIQt.QtCore`, `QtGui`, `QtWidgets`, `DearUIQt.qt` and historical ImGui names
-remain compatibility facades. New application code should prefer the public
-packages above.
+## API qua Qt facades
 
-## Dependency direction
+```python
+from DearUIQt.QtCore import QItemSelectionModel
+from DearUIQt.QtGui import QStandardItem, QStandardItemModel
 
-```text
-application (WinUx, other apps)
-        ↓
-widgets / modelview / layouts / gui
-        ↓
-core
-        ↓
-backends (Dear PyGui today)
+model = QStandardItemModel()
+model.appendRow(QStandardItem("Example"))
+selection = QItemSelectionModel(model)
+selection.setCurrentIndex(model.index(0, 0), selection.ClearAndSelect)
+selection.clearCurrentIndex()  # Giữ selected items.
+selection.reset()              # Xóa selection/current, không phát signal.
 ```
 
-Application-specific behavior belongs in the consuming application, never in
-DearUIQt. Backend-specific native calls are being progressively isolated behind
-`DearUIQt.backends` and widget implementation modules.
+Widgets dùng `DearUIQt.QtWidgets`; các namespace `core/gui/widgets/modelview`
+hiện có vẫn được giữ. Khởi tạo/render widget cần GUI runtime và đúng UI thread.
+Core/standard item model có thể kiểm thử độc lập không cần WinUx hoặc GPU.
 
-### Renderer-neutral application code
+## Mốc đầu đã triển khai: M1.1
 
-Application modules should import widgets from `DearUIQt.widgets`, policy from
-`DearUIQt.gui`, and declarative styling from `DearUIQt.themes`. Public theme factories
-resolve the active renderer automatically, so consumers should call e.g.
-`tool_bar_theme()` rather than passing a Dear PyGui module. `ThemeSpec`, `ThemeTarget`,
-`ThemeColor` and `ThemeStyle` keep renderer constants out of application code. `ThemeSpec.createObject()` / `QTheme` provide QObject ownership for materialized theme lifetime so consuming applications do not manually delete renderer theme ids.
+Vòng đời `QItemSelectionModel`: reset im lặng, clear/current độc lập,
+`modelChanged`, no-op khi gán cùng model và tháo kết nối model cũ.
 
-`DearUIQt.backends` is reserved for low-level drawing/plot/native escape hatches while
-those surfaces are progressively wrapped. Retained drawing now starts at `QCanvas` +
-`QPainter`; retained history/XY plotting starts at `QPlotWidget` + `QPlotAxis` + `QLineSeries`; application renderers should migrate shape creation there instead of calling
-backend `draw_*` functions directly. Pointer, modifier-key, clipboard, text-measurement and viewport
-queries belong to `QCursor`, `QKeyboard`, `QClipboard`, `QFontMetrics` and `QScreen`; `QCursor.buttons()` also exposes mouse-button state to standalone/floating hosts without requiring a QApplication. Application
-startup/shutdown/render-loop ownership plus viewport configuration/size changes belong to `QGuiRuntime`. Application-wide fonts are installed with `QGuiRuntime.setApplicationFont()` and QObject-owned `QFontDatabase` resources rather than renderer font registries. Deferred retained synchronization uses `invokeAfterFrames()` / `invokeNextFrame()` rather than application-owned frame callbacks. Modeless transient surfaces use `QPopupPanel` / `QModelessMenu`; item/global legacy renderer handlers migrate through `QItemInputBinding` / `QGlobalInputBinding` so application modules do not own native handler registries. Popup/menu and viewport
-styling share semantic factories (`menu_surface_theme`, `menu_button_theme`,
-`menu_image_button_theme`, `viewport_surface_theme`, `compact_layout_surface_theme`,
-`floating_window_theme`) so consumers do not duplicate renderer constants or native theme
-construction. Direct `dearpygui` imports are intentionally kept out of consumers so backend
-selection and testing remain centralized.
+```powershell
+abaqus python tests/test_dearuiqt_qt_selection_lifecycle.py
+abaqus python tests/test_dearuiqt_qt_selection_lifecycle_ui.py
+```
 
-## Dialog and convenience-widget policy
+M1.2a cũng đã tách **Current selection** khỏi **keyboard current index**. Cờ
+`SelectCurrent`/`ToggleCurrent` thay lớp selection tương tác; muốn đổi current
+index hãy gọi `setCurrentIndex()` tường minh.
 
-`QDialog` follows Qt result semantics (`Accepted` / `Rejected`, `done()`,
-`result()`, `open()` and `exec()`).  The older `QtDialog` class remains a
-compatibility form base for applications that historically used `accept()` to
-run validation/default actions rather than finish the dialog. Its retained body is exposed
-through `contentWidget()` so subclasses can configure/layout the body through QWidget APIs
-instead of reaching for the native renderer tag. Generic value/item/visibility operations are available through
-`control_value()`, `set_control_value()`, `set_control_items()` and `set_control_visible()`; wrappers are preferred
-when present and legacy native tags remain a compatibility fallback.
+```powershell
+abaqus python tests/test_dearuiqt_qt_selection_current.py
+```
 
-`QComboBox`, `QListWidget`/`QListWidgetItem` and
-`QTreeWidget`/`QTreeWidgetItem` are QObject-owned public convenience widgets.
-The tree/list convenience views retain item ownership, Qt item-data roles and
-selection state while renderer-specific row hit targets stay inside
-`DearUIQt.modelview`. `QAbstractItemDelegate` and `QStyledItemDelegate` provide
-the public extension point for richer model/view presentation.
+**Migration:** nghe `model.modelReset` nếu cần tải lại UI sau reset. Không dựa
+vào selectionChanged/currentChanged khi model reset. Các gap như
+tree/cell selection, auto-scroll và persistent-index remapping được ghi trong
+roadmap; không nên suy ra mức tương thích từ tên class.
 
-`QStandardItem/QStandardItemModel` provide the QtGui item-owned model for list/table/tree data, while `QModelIndex` and abstract models remain in `core`. `QTableView` supports delegate-driven persistent editors and in-place `dataChanged` refreshes so editing does not rebuild native rows.
+M1.2b/c và M1.3a đã bổ sung query hàng/cột đầy đủ, range API và shared selection
+hai chiều cho list/table dạng hàng. Xem roadmap để biết migration corner accessors
+và setSelectionModel. Chưa nghiệm thu toàn bộ Qt.
 
-Item views own retained focus and pointer routing through `QGlobalInputBinding` rather than application-owned renderer registries. `QtListView` exposes reusable `itemGeometry()`, `keyAt()` and `indexAt()` hit-testing, while `QAbstractItemView` provides horizontal/vertical scroll values and `scrollBy()`. Filesystem/explorer surfaces should consume these APIs instead of duplicating renderer rectangle and scroll queries. Application-wide Fusion styling can be installed through `fusion_desktop_theme()` and `QGuiRuntime.setApplicationTheme()` without exposing renderer theme constants.
+Chạy bộ contract đã triển khai:
 
-`QListWidget.setItemWidget()` supports transient row editors such as inline
-`QLineEdit` rename controls without forcing consuming applications to rebuild
-native Selectables. `QInlineEditPanel` provides the reusable top-level variant
-for Explorer-style rename overlays, including text measurement, source-item
-occlusion, pointer protection and owned theme lifetime. Applications should not
-reimplement those renderer details around an ad-hoc input window.
+```powershell
+abaqus python tests/run_dearuiqt_qt_contracts.py
+abaqus python tests/test_dearuiqt_qt_shared_selection_ui.py
+```
 
-`QMenu` is the canonical retained popup renderer. It owns physical popup input
-shielding, nested popup hit-testing, viewport clamping, checkable/action state,
-keyboard navigation and a dedicated accelerator/shortcut column. Application
-features should provide declarative action specs instead of maintaining a second
-popup renderer.
+Oracle runtime riêng **Qt 6.8.3** đã đối chiếu **1.018 snapshot selection**, hiện
+không có khác biệt; không đồng nghĩa toàn Qt tương đương. Cách chạy và phạm vi:
+[../tests/QT_ORACLE.md](../tests/QT_ORACLE.md).
 
-`QTableWidget` accepts renderer-neutral sizing policies such as
-`QTableWidget.FixedFit`; worksheet/editor styling belongs in declarative theme
-factories such as `worksheet_theme_spec()` rather than renderer constants in the
-consumer.
+M2a bổ sung row/count transactions, lazy empty cells và ownership validation.
+Oracle cấu trúc **229 snapshot khớp Qt 6.8.3**; tổng bộ contract **55 test đạt**.
+M2 chưa hoàn tất persistent-index/selection remapping; migration ở ROADMAP.md.
 
-## Retained native and resource migration boundary
+M2b hiện thêm persistent-index remap/invalidation cho row/column transactions,
+subtree removal/reset và basic sort: **40 snapshot Qt C++ profile khớp**, tổng
+**72 contract test đạt**. PySide clear-wrapper signals khác Qt C++ được lưu riêng
+và ghi rõ trong QT_ORACLE.md. Selection remapping/arbitrary moves vẫn còn gap.
 
-Specialized high-throughput renderers sometimes retain native item ids while their
-application logic is migrated incrementally. `QRetainedItem` is the canonical
-non-owning facade for those existing ids: geometry, visibility, hover/active state,
-focus discovery, values, parent/type inspection, scroll state, theme/font binding and
-configuration stay behind DearUIQt instead of leaking backend calls into consumers.
-It does **not** take native ownership unless explicitly requested. During hierarchy
-migration it also provides `reparent()`, `setLabel()` and `setTexture()` so existing
-retained items can move between Qt-style hosts without application-side renderer calls.
-Transitional inspection of renderer-owned surfaces stays behind `nativeState()`,
-`nativeConfiguration()` and `childItems()`; retained visibility re-synchronizes with the native item before Qt-style
-show/hide transitions so legacy mutations cannot be coalesced incorrectly.
+M2c bổ sung selection/current remap qua insert/remove và basic sort:
+**272 snapshot khớp Qt 6.8.3**, tổng **86 contract tests đạt**; GUI shared
+list/table theo item qua thay đổi hàng. Move và toàn layout/column/setItem
+selection lifecycle vẫn là gap; xem ROADMAP.md để biết phạm vi hiện tại.
 
-Renderer resources follow QObject ownership as well. `QFontDatabase`/`QFont`,
-`QTextureRegistry`/`QTexture`, `QPaintLayer`, `QViewportCanvas` and `QToolTip` own native resource
-lifetime and expose stable ids only as a compatibility bridge. Application code
-should pass these objects directly to QWidget/QPainter APIs wherever supported and
-should not create/delete font registries, texture registries, draw layers or tooltip
-containers itself. `QTextureRegistry.loadFile()` is the canonical image-file-to-texture
-path for toolbar/icon consumers. Frame-level button/key queries belong to `QCursor` and
-`QKeyboard`, not direct renderer polling.
+M2d bổ sung setItem/takeItem selection lifecycle trong phạm vi đã test:
+**116 snapshot khớp Qt 6.8.3**, tổng **98 contract tests đạt**. Bao gồm range
+corners, subtree detach/reinsert và thứ tự layout observers; move, toàn column
+API và layout hints vẫn chưa hoàn tất.
 
-Historical `ImGuiComboBox` / `QtComboBox` remain compatibility leaves for code
-that depends on the older editable-combo implementation details.
+M2e bổ sung column count/convenience transactions: **130 snapshot khớp Qt 6.8.3**,
+tổng **110 contract tests đạt**. Header lifecycle, mọi overload và moves vẫn
+chưa được nghiệm thu; xem ROADMAP.md và tests/QT_ORACLE.md để biết phạm vi.
 
-## Interoperability boundary
+M2f bổ sung header data/item lifecycle: **135 snapshot khớp Qt 6.8.3**, tổng
+**123 contract tests đạt**, có GUI generated headers. Default labels 1-based;
+numeric/None Display/Edit data giữ đúng kiểu. Removed/replaced Python items còn
+reference được detach, không mô phỏng deleted Shiboken wrapper; move/full layout
+vẫn còn gap. Phạm vi và migration được ghi trong ROADMAP.md.
 
-Consumers that must coexist with another desktop toolkit should use public adapters from
-`DearUIQt.interop` rather than importing renderer-specific helpers from `DearUIQt.backends`.
-For example, Tk/ttk scroller integration is exposed as `QNativeScrollerMetrics`,
-`configure_ttk_scroller_styles()` and `make_ttk_scroller()`. This keeps backend ownership
-inside DearUIQt while allowing transitional multi-toolkit applications to migrate incrementally.
-`StandaloneUiHost` follows the same rule: its backend argument is optional and production
-hosts resolve the active renderer internally, while explicit injection remains available for tests.
+M2g bổ sung **custom-model move protocol**: **115 snapshot khớp Qt 6.8.3**, tổng
+**137 contract tests đạt**, có GUI shared list/table. QStandardItemModel vẫn từ
+chối moveRows/moveColumns như Qt; subclass custom model phải tự sửa storage giữa
+begin/end. Cross-parent columns, full layout/reset và lifetime vẫn còn gap.
+
+M2h kiểm chứng cross-parent columns (**105 snapshot**) và sửa reset observer
+visibility (**9 snapshot**, tìm/sửa 4 sai khác). Tổng **153 contract tests đạt**,
+có GUI reset đổi size/empty/repopulate. Vẫn là Qt subset: full layout/reentry,
+unequal-row-count transfers và deleted-item lifetime chưa tương đương toàn bộ.
+
+M2i bổ sung recursive standard-item sort/typed layout signals: **117 snapshot
+khớp Qt 6.8.3**, tổng **167 contract tests đạt**, có GUI shared sort. Xem migration
+cho layout handlers và QStandardItem() empty data trong ROADMAP.md. Các kiểu
+QVariant/locale và toàn layout/reentry/lifetime vẫn chưa được nghiệm thu.
+
+M2j thêm checkIndex và bounded model audits: **70 snapshot khớp Qt 6.8.3**, tổng
+**180 contract tests đạt**, gồm 300 seeded mutations/audits. Qt reference fixture
+qua real model tester với 0 failure; DearUIQt helper vẫn là subset test-only,
+không thay thế Qt tester đầy đủ. Full model/view parity chưa được tuyên bố.
+
+Tối ưu S1 giảm disjoint selection commit từ **2.329 → 7,31 ms** trong benchmark
+2.000 ranges + 100 additions (median 5, khoảng 319x); tổng **260 tests đạt**.
+State/range/signal contracts được giữ. Đây là Python bookkeeping, không phải
+GUI FPS hoặc tốc độ mọi selection command; xem PERFORMANCE.md để tái lập.
+
+Tối ưu S2 cho 500 hàng x 8 cột: **1.498 → 109 ms** (~13,7x), và 500 cột x
+8 hàng: **1.663 → 114 ms** (~14,5x), median 5. Giữ range/target order và
+fallback cho rectangle/combined axes; toàn bộ probe Qt hiện có và GUI regression đạt.
+
+S3 giữ ordered corner handles của `QItemSelection.select()` đúng Qt, thay vì
+dựng lại index. Benchmark 40.000 ô giảm thêm ~20–21% (median 5); probe identity
+mới có 10 snapshots khớp Qt 6.8.3. Muốn refresh corners hãy lấy model.index()
+mới rõ ràng; xem PERFORMANCE.md cho migration và giới hạn đo.
+
+S4 tăng tốc `selectedRows/selectedColumns` với live Deselect/Toggle khoảng
+**2,9–3,3x** ở 2.000 sections x 8 ô (median 5), dùng blocker index cục bộ
+trong mỗi query. Không cache flags/selection giữa các lần gọi; Qt contracts giữ
+nguyên. Đây là Python query timing, không phải GUI FPS.
+
+S5 tính membership delta ngay khi cập nhật, bỏ bookkeeping lặp. Chọn lại vùng
+40.000 ô giảm **234 → 148 ms (~1,58x)**, median 5; Deselect/Toggle cải thiện
+ít hơn khi observer đọc toàn payload. Giữ exact query/signal order, kể cả parent
+khác nhau; xem PERFORMANCE.md cho benchmark và phạm vi.
+
+S6 bỏ kiểm tra corner lặp khi singleton dùng cùng một handle: đọc 40.000
+singleton payload indexes giảm **388 → 246 ms (~1,58x)**; bulk row-select có
+đọc signal/commit giảm **930 → 764 ms (~1,22x)**, median 5. Không cache flags
+hoặc enumeration, không thay backend; toàn bộ probe Qt/GUI regression đạt.
+
+S7 loại range không giao nhau theo tọa độ trước khi hỏi model: merge 1.000
+ranges + 100 incoming disjoint nhanh hơn khoảng **14,8–15,5x** (median 5).
+Probe mới có **221 snapshots khớp Qt 6.8.3**; cả 14 probe và GUI regression đạt.
+Pair search vẫn bậc hai; không suy ra dense-overlap speedup hay GUI FPS.
+
+M2k thêm `QStandardItem.setRowCount(rows)` cho child table và invisible root:
+resize trong một transaction, giữ columns/lazy cells; equal/negative count là
+no-op theo Qt. Probe mới **39 snapshots khớp Qt 6.8.3**; cả **15 probe** và GUI
+regression đạt. Với 2.000 rows, batching giảm structural notifications từ
+**4.000 xuống 2** so với lặp từng hàng; xem PERFORMANCE.md cho timing/tradeoffs.

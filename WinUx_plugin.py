@@ -38,7 +38,14 @@ def _package_revision(directory):
         path = os.path.join(os.path.abspath(directory), "update_manifest.json")
         with open(path, "r") as handle:
             value = json.load(handle)
-        return int(value.get("package_revision", -1))
+        with open(os.path.join(directory, "VERSION"), "r") as handle:
+            version = handle.read().strip()
+        if value.get('version') != version:
+            return -1
+        revision = value.get('package_revision', -1)
+        if isinstance(revision, bool) or str(revision).strip() != str(int(revision)):
+            return -1
+        return max(-1, int(revision))
     except Exception:
         return -1
 
@@ -57,7 +64,18 @@ def _prefer_bundled_hotfix(active_version, active_dir=None):
     if bundled_key < active_key:
         return False
     bundled_dir = os.path.dirname(os.path.abspath(__file__))
-    return _package_revision(bundled_dir) > _package_revision(active_dir or "")
+    bundled_revision = _package_revision(bundled_dir)
+    active_revision = _package_revision(active_dir or "")
+    if bundled_revision > active_revision:
+        return True
+    # The runtime-package migration can retain the same public version and
+    # revision. Do not let an equal, legacy flat bootstrap shadow that package.
+    return bool(
+        bundled_revision >= active_revision
+        and os.path.isfile(os.path.join(bundled_dir, "winux_runtime", "launcher.py"))
+        and active_dir
+        and not os.path.isfile(os.path.join(active_dir, "winux_runtime", "launcher.py"))
+    )
 
 
 def _release_key(value):
@@ -123,11 +141,19 @@ def _activate_self_updated_bootstrap():
     previous = state.get("previous_versions")
     if isinstance(previous, list):
         versions.extend(str(item).strip() for item in previous if str(item).strip())
-    required = ("winux_launcher.py", "winux_updater.py", "run_winux.py", "VERSION")
+    new_required = (
+        os.path.join("winux_runtime", "launcher.py"),
+        os.path.join("winux_runtime", "update", "updater.py"),
+        "run_winux.py",
+        "VERSION",
+    )
+    legacy_required = ("winux_launcher.py", "winux_updater.py", "run_winux.py", "VERSION")
     for version in versions:
         safe = "".join(ch if ch.isalnum() or ch in "._+-" else "_" for ch in version)
         candidate = os.path.join(root, "versions", safe)
-        if not all(os.path.isfile(os.path.join(candidate, name)) for name in required):
+        has_new_layout = all(os.path.isfile(os.path.join(candidate, name)) for name in new_required)
+        has_legacy_layout = all(os.path.isfile(os.path.join(candidate, name)) for name in legacy_required)
+        if not (has_new_layout or has_legacy_layout):
             continue
         try:
             with open(os.path.join(candidate, "VERSION"), "r") as handle:
@@ -144,7 +170,12 @@ def _activate_self_updated_bootstrap():
 
 _activate_self_updated_bootstrap()
 
-from winux_launcher import launch_winux, resolve_project_dir
+try:
+    from winux_runtime.launcher import launch_winux, resolve_project_dir
+except ImportError:
+    # Compatibility with immutable bootstrap versions created before the
+    # runtime package was consolidated under ``winux_runtime``.
+    from winux_launcher import launch_winux, resolve_project_dir
 
 
 

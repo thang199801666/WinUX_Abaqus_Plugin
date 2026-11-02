@@ -1,30 +1,40 @@
-"""Persistent user preferences and their shared storage primitives."""
+"""Persistent user preferences with lazy public exports.
 
-from .abaqus_versions import AbaqusVersionPreferences
-from .dialog_geometry import DialogGeometryPreferences
-from .general import GeneralPreferences
-from .inp import INPPreferences
-from .job_manager import JobManagerPreferences
-from .login import LoginPreferences
-from .navigation import NavigationPreferences
-from .performance import PerformancePreferences
-from .plot_digitizer import PlotDigitizerPreferences
-from .storage import JsonPreferenceStore, user_profile_path
-from .update import UpdatePreferences
+Individual preference stores are independent.  Importing one should not import
+all of the others, especially during application startup.
+"""
+from __future__ import annotations
 
-__all__ = [
-    "AbaqusVersionPreferences",
-    "DialogGeometryPreferences",
-    "GeneralPreferences",
-    "INPPreferences",
-    "JobManagerPreferences",
-    "JsonPreferenceStore",
-    "LoginPreferences",
-    "NavigationPreferences",
-    "PerformancePreferences",
-    "PlotDigitizerPreferences",
-    "UpdatePreferences",
-    "user_profile_path",
-]
+from importlib import import_module
 
-from .sites import SitePreferences
+_LAZY_PREFERENCES = {
+    "AbaqusVersionPreferences": (".abaqus_versions", "AbaqusVersionPreferences"),
+    "DialogGeometryPreferences": (".dialog_geometry", "DialogGeometryPreferences"),
+    "GeneralPreferences": (".general", "GeneralPreferences"),
+    "INPPreferences": (".inp", "INPPreferences"),
+    "JobManagerPreferences": (".job_manager", "JobManagerPreferences"),
+    "LoginPreferences": (".login", "LoginPreferences"),
+    "NavigationPreferences": (".navigation", "NavigationPreferences"),
+    "PerformancePreferences": (".performance", "PerformancePreferences"),
+    "PlotDigitizerPreferences": (".plot_digitizer", "PlotDigitizerPreferences"),
+    "UpdatePreferences": (".update", "UpdatePreferences"),
+    "JsonPreferenceStore": (".storage", "JsonPreferenceStore"),
+    "user_profile_path": (".storage", "user_profile_path"),
+    "SitePreferences": (".sites", "SitePreferences"),
+}
+
+__all__ = list(_LAZY_PREFERENCES)
+
+
+def __getattr__(name):
+    target = _LAZY_PREFERENCES.get(name)
+    if target is None:
+        raise AttributeError("module {!r} has no attribute {!r}".format(__name__, name))
+    module_name, attribute_name = target
+    value = getattr(import_module(module_name, __name__), attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

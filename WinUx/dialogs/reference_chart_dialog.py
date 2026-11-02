@@ -1,4 +1,3 @@
-"""Public Reference Chart API on the shared DearUIQt event loop."""
-from .native_reference_tools import ReferenceChartDialog
-
-__all__ = ["ReferenceChartDialog"]
+"""Compatibility alias. Canonical implementation: :mod:`WinUx.dialogs.reference.reference_chart_dialog`."""
+from .._compat import alias_module
+alias_module(__name__, "WinUx.dialogs.reference.reference_chart_dialog")

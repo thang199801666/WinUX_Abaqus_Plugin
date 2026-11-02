@@ -7,6 +7,7 @@ methods; Dear PyGui-specific selectable/draw-list plumbing stays here.
 from __future__ import annotations
 
 from itertools import count
+from contextlib import contextmanager, ExitStack
 
 from ..core.object import Qt, Signal
 from ..gui.palette import QtFusionMetrics
@@ -14,6 +15,17 @@ from ..widgets.widget import QWidget
 
 
 _TREE_KEYS = count(1)
+
+
+@contextmanager
+def _batch_tree_updates(items, target):
+    # Moving items may invalidate several source trees as well as the target.
+    trees = dict.fromkeys([target] + [item._tree for item in items])
+    with ExitStack() as stack:
+        for tree in trees:
+            if tree is not None:
+                stack.enter_context(tree.batchUpdate())
+        yield
 
 
 class QTreeWidgetItem:
@@ -112,7 +124,14 @@ class QTreeWidgetItem:
         return self._adopt(child)
 
     def addChildren(self, children):
-        return [self._adopt(child) for child in list(children or ())]
+        children = list(children or ())
+        for child in children:
+            if not isinstance(child, QTreeWidgetItem):
+                raise TypeError("tree child must be QTreeWidgetItem")
+            if child is self or self._is_descendant_of(child):
+                raise ValueError("cannot create a cyclic tree")
+        with _batch_tree_updates(children, self._tree):
+            return [self._adopt(child) for child in children]
 
     def insertChild(self, index, child):
         return self._adopt(child, index)
@@ -309,6 +328,7 @@ class QTreeWidget(QWidget):
         self._current = None
         self._rendered = {}
         self._item_by_native = {}
+        self._item_by_overlay_handler = {}
         self._handler_registries = []
         self._header_hidden = True
         self._indentation = max(0, int(indentation))
@@ -318,6 +338,35 @@ class QTreeWidget(QWidget):
         self._expand_on_item_click = False
         self._text_overlay = None
         self._root_sections_visible = True
+        self._batch_depth = 0
+        self._rebuild_pending = False
+        self._selection_visual_current = None
+        self._selection_visual_full_sync = True
+        self._selection_visual_retry = set()
+        # Match QTreeView/QListView: the native child remains the scroll owner,
+        # while the application-wide scroller paints and handles its gutter.
+        from ..backends.shared_scrollers import register_scroll_surface
+        register_scroll_surface(backend, tag)
+
+    @contextmanager
+    def batchUpdate(self):
+        """Coalesce native tree rebuilds until the outermost batch exits.
+
+        Ownership, item values and signals change immediately. Native row IDs
+        and layoutChanged update on exit, including exceptional exit; this is
+        not a rollback transaction. Nesting is supported on the UI thread.
+        """
+        self._require_ui()
+        if self._deleted:
+            raise RuntimeError("cannot batch updates on a deleted tree")
+        self._batch_depth += 1
+        try:
+            yield self
+        finally:
+            self._batch_depth -= 1
+            if not self._batch_depth and self._rebuild_pending:
+                self._rebuild_pending = False
+                self._rebuild()
 
     def setRootSectionsVisible(self, visible):
         """Show section headers, or present their children as a flat Places list."""
@@ -375,7 +424,11 @@ class QTreeWidget(QWidget):
         return self.insertTopLevelItem(len(self._top_level), item)
 
     def addTopLevelItems(self, items):
-        return [self.addTopLevelItem(item) for item in list(items or ())]
+        items = list(items or ())
+        if any(not isinstance(item, QTreeWidgetItem) for item in items):
+            raise TypeError("top-level item must be QTreeWidgetItem")
+        with _batch_tree_updates(items, self):
+            return [self.addTopLevelItem(item) for item in items]
 
     def insertTopLevelItem(self, index, item):
         if not isinstance(item, QTreeWidgetItem):
@@ -424,6 +477,8 @@ class QTreeWidget(QWidget):
         return None
 
     def clear(self):
+        if self._current is not None:
+            self._current._selected = False
         for item in self._top_level:
             item._set_tree(None)
         self._top_level.clear()
@@ -556,10 +611,19 @@ class QTreeWidget(QWidget):
             pass
         self._rendered.clear()
         self._item_by_native.clear()
+        self._item_by_overlay_handler.clear()
+        self._selection_visual_current = None
+        self._selection_visual_full_sync = True
+        self._selection_visual_retry.clear()
 
     def _rebuild(self):
         if getattr(self, "_deleted", False):
             return
+        if self._batch_depth:
+            self._rebuild_pending = True
+            return
+        if self._current is not None and self._current._tree is not self:
+            self.setCurrentItem(None)
         self._clear_native()
         first_root = True
         for root in self._top_level:
@@ -672,9 +736,10 @@ class QTreeWidget(QWidget):
                     (text_x, text_y), item.text(0), parent=overlay,
                     size=self._text_overlay["size"], color=self._text_overlay["color"])
             registry = b.add_item_handler_registry()
-            b.add_item_clicked_handler(
+            handler = b.add_item_clicked_handler(
                 parent=registry, button=b.mvMouseButton_Left,
                 callback=self._overlay_clicked, user_data=native_user_data)
+            self._item_by_overlay_handler[handler] = item
             b.bind_item_handler_registry(overlay, registry)
             self._handler_registries.append(registry)
             self._item_by_native[overlay] = item
@@ -697,18 +762,29 @@ class QTreeWidget(QWidget):
         return None
 
     def _native_clicked(self, sender, app_data=None, user_data=None):
-        item = self._item_by_native.get(sender) or self._item_for_user_data(user_data)
+        if self._deleted or self._rebuild_pending:
+            return
+        # UserRole is not a native identity: a rebuilt row can reuse the same
+        # payload while a callback for its old selectable is still queued.
+        item = self._item_by_native.get(sender)
         self._activate_pointer_item(item, sender, app_data)
 
     def _overlay_clicked(self, sender, app_data=None, user_data=None):
-        item = self._item_for_user_data(user_data)
+        if self._deleted or self._rebuild_pending:
+            return
+        item = self._item_by_overlay_handler.get(sender)
         self._activate_pointer_item(item, sender, app_data)
 
     def _activate_pointer_item(self, item, sender=None, app_data=None):
         del sender, app_data
-        if item is None or not item.isEnabled():
+        if item is None or item._tree is not self or not item.isEnabled():
             return
+        already_current = item is self._current
         self.setCurrentItem(item)
+        if already_current:
+            # Selectable toggles its bool before delivering the callback. Qt
+            # SingleSelection keeps this row selected on a repeated click.
+            self._sync_selection(dirty_items=(item,))
         self.itemClicked.emit(item, 0)
         double = False
         try:
@@ -721,20 +797,41 @@ class QTreeWidget(QWidget):
         if item.childCount() and self._expand_on_item_click and not double:
             item.setExpanded(not item.isExpanded())
 
-    def _sync_selection(self):
-        for item, visual in tuple(self._rendered.items()):
+    def _sync_selection(self, *, dirty_items=()):
+        if self._batch_depth:
+            self._rebuild_pending = True
+            return
+        if self._selection_visual_full_sync:
+            dirty = set(self._rendered)
+        else:
+            dirty = set()
+            if self._selection_visual_current is not self._current:
+                dirty.update((self._selection_visual_current, self._current))
+        dirty.update(dirty_items)
+        dirty.update(self._selection_visual_retry)
+        self._selection_visual_retry.clear()
+        for item in dirty:
+            visual = self._rendered.get(item)
+            if visual is None:
+                continue
             selected = item is self._current
             item._selected = selected
             try:
                 self.backend.set_value(visual["selectable"], selected)
             except Exception:
-                pass
+                self._selection_visual_retry.add(item)
+        self._selection_visual_current = self._current
+        self._selection_visual_full_sync = False
 
     def _item_expansion_changed(self, item):
         self._rebuild()
         (self.itemExpanded if item.isExpanded() else self.itemCollapsed).emit(item)
 
     def _item_changed(self, item, column, role):
+        if self._batch_depth:
+            self._rebuild_pending = True
+            self.itemChanged.emit(item, column)
+            return
         visual = self._rendered.get(item)
         if visual is not None and column == 0:
             try:
@@ -761,6 +858,9 @@ class QTreeWidget(QWidget):
 
     def delete(self):
         self._clear_native()
+        if self._current is not None:
+            self._current._selected = False
+        self._current = None
         for item in self._top_level:
             item._set_tree(None)
         self._top_level.clear()

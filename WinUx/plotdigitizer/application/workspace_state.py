@@ -24,19 +24,34 @@ def normalize_workspace_state(state, engine=None):
         return [number(item, name, minimum) for item in value]
 
     for key, choices, default in (
-        ("tool", ("axes", "manual", "automatic", "data", "settings"), "axes"),
-        ("ribbon_tab", ("home", "view"), "home"),
+        ("tool", ("axes", "extract", "manual", "automatic", "data", "settings"), "axes"),
+        ("ribbon_tab", ("home", "data", "view"), "home"),
         ("coordinate_mode", ("Chart X/Y", "Image pixels"), "Chart X/Y"),
         ("export_scope", ("All datasets", "Active dataset"), "All datasets"),
     ):
         result[key] = state.get(key, default)
         if result[key] not in choices:
             raise ValueError("Invalid saved {}.".format(key))
+    result['tool'] = {'manual': 'extract', 'automatic': 'extract'}.get(result['tool'], result['tool'])
+    # Version-1 projects may remember the former View ribbon tab. Its commands
+    # now live above the canvas, so keep the project readable and open Home.
+    if result['ribbon_tab'] == 'view':
+        result['ribbon_tab'] = 'home'
+    default_method = ('manual' if engine is not None and engine.calibration.box_rect is None else 'smart')
+    result['calibration_method'] = state.get('calibration_method', default_method)
+    if result['calibration_method'] not in ('manual', 'smart'):
+        raise ValueError('Invalid saved calibration method.')
     for key, default in (("auto_fit", True), ("edit_enabled", False),
                          ("ribbon_minimized", False), ("export_sort_x", False)):
         result[key] = state.get(key, default)
         if not isinstance(result[key], bool):
             raise ValueError("Invalid saved {}.".format(key))
+    result["export_sort"] = state.get("export_sort", "x" if result["export_sort_x"] else "original")
+    if result["export_sort"] not in ("original", "x", "y"):
+        raise ValueError("Invalid saved CSV sort order.")
+    # Keep version-1 projects readable by older builds without losing the new
+    # Y choice when this build reloads and saves the workspace.
+    result["export_sort_x"] = result["export_sort"] == "x"
     result["scale"] = number(state.get("scale", 1), "image scale", 1e-12)
     result["zoom"] = number(state.get("zoom", 1), "zoom", 0.05, 40)
     result["pan"] = pair(state.get("pan", [0, 0]), "pan")
@@ -92,13 +107,25 @@ def normalize_workspace_state(state, engine=None):
     result["pick_mode"] = state.get("pick_mode")
     if result["pick_mode"] not in modes:
         raise ValueError("Invalid saved picking mode.")
+    if result["pick_mode"] in ("manual", "delete"):
+        # Old point-picking sessions now use Edit, never click-to-delete.
+        result["pick_mode"] = None
+        result["edit_enabled"] = True
     sequence = state.get("calibration_sequence", [])
     if not isinstance(sequence, list) or any(key not in ("x1", "x2", "y1", "y2") for key in sequence):
         raise ValueError("Invalid saved calibration sequence.")
-    result["calibration_sequence"] = list(sequence)
+    # Multi-anchor pick sequences were removed: each anchor button now owns
+    # one explicit pick.  Keep accepting the legacy field so older projects
+    # still load, but never resume an automatic 4-point sequence.
+    result["calibration_sequence"] = []
     disclosures = state.get("disclosures", {})
-    if not isinstance(disclosures, dict) or any(key not in ("axes", "advanced", "reduction") or
+    if not isinstance(disclosures, dict) or any(key not in ("axes", "advanced", "reduction", "data_options") or
                                               not isinstance(value, bool) for key, value in disclosures.items()):
         raise ValueError("Invalid saved panel options.")
     result["disclosures"] = dict(disclosures)
+    # The redesigned Options panel briefly used a display-oriented id. Accept
+    # that alias, but retain the original project key on all future saves.
+    if "data_options" in result["disclosures"]:
+        opened = result["disclosures"].pop("data_options")
+        result["disclosures"].setdefault("reduction", opened)
     return result

@@ -68,6 +68,37 @@ class QCursor:
         return QCursor.pos(backend=backend)
 
     @staticmethod
+    def viewportPos(*, backend=None):
+        """Sample the live cursor in the primary viewport's client coordinates.
+
+        Unlike renderer mouse state this can be sampled immediately before
+        painting a drag overlay, without waiting for another input/render turn.
+        Falls back to pos() when no native primary window is available.
+        """
+        b = _backend(backend)
+        try:
+            from ..backends.native_windows import NativeWindowBackend
+            point = NativeWindowBackend(b).cursorClientPosition()
+            if point is not None:
+                return QPoint(*point)
+        except (AttributeError, OSError, ValueError, TypeError):
+            pass
+        return QCursor.pos(backend=b)
+
+    @staticmethod
+    def paintPos(*, backend=None):
+        """Live cursor in QViewportCanvas coordinates, including native viewports."""
+        b = _backend(backend)
+        try:
+            from ..backends.native_windows import NativeWindowBackend
+            point = NativeWindowBackend(b).cursorPaintPosition()
+            if point is not None:
+                return QPoint(*point)
+        except (AttributeError, OSError, ValueError, TypeError):
+            pass
+        return QCursor.pos(backend=b)
+
+    @staticmethod
     def localPos(*, backend=None):
         """Return renderer-local cursor position for retained hit-testing."""
         b = _backend(backend)
@@ -262,8 +293,15 @@ class QClipboard:
     def __init__(self, *, backend=None):
         self._backend = _backend(backend)
 
+    def _native_windows(self):
+        import os
+        return os.name == 'nt' and str(getattr(self._backend, '__name__', '')).startswith('dearpygui.')
+
     def text(self, mode=Clipboard):
         del mode
+        if self._native_windows():
+            from ..backends.native_clipboard import text
+            return text()
         getter = getattr(self._backend, "get_clipboard_text", None)
         if not callable(getter):
             return ""
@@ -274,6 +312,9 @@ class QClipboard:
 
     def setText(self, text, mode=Clipboard):
         del mode
+        if self._native_windows():
+            from ..backends.native_clipboard import set_text
+            return set_text(str(text or ''))
         setter = getattr(self._backend, "set_clipboard_text", None)
         if not callable(setter):
             return False

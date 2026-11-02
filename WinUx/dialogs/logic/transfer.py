@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import time
+import weakref
 
 from .formatting import format_size, format_time
 
 
 class TransferItemRow:
     """Thread-neutral transfer row model; rendering belongs to the front end."""
+
+    STATISTICS_INTERVAL = .2
 
     def __init__(self, task, name, placeholder=False):
         self.task = task
@@ -17,6 +20,7 @@ class TransferItemRow:
         self._sample_time = None
         self._sample_done = 0.0
         self._smoothed_speed = 0.0
+        self._last_statistics_time = None
         self.row_id = task.center._next_row_id()
         self.task.center._row_to_task[self.row_id] = task
         self.task.center.post("add_row", self.row_id, self.task.operation, self.name)
@@ -25,7 +29,10 @@ class TransferItemRow:
         return self.row_id in self.task.center._row_to_task
 
     def rename(self, name):
+        old_name = self.name
         self.name = str(name)
+        self.task._unindex_row(self, old_name)
+        self.task._index_row(self)
         self.placeholder = False
         if self.exists():
             self.task.center.update_row(self.row_id, name=self.name)
@@ -52,6 +59,7 @@ class TransferItemRow:
             self._sample_time = now
             self._sample_done = done
             self._smoothed_speed = 0.0
+            self._last_statistics_time = None
         else:
             elapsed = now - self._sample_time
             delta = done - self._sample_done
@@ -66,25 +74,28 @@ class TransferItemRow:
                 self._sample_time = now
                 self._sample_done = done
 
-        speed = self._smoothed_speed
-        remaining = max(0.0, total - done)
-        eta = remaining / speed if speed > 0.0 else None
-        size_text = "{} / {}".format(format_size(done), format_size(total))
-        if speed > 0.0 and ratio < 1.0:
-            statistics = "{} | {}/s | {} remaining".format(
-                size_text, format_size(speed), format_time(eta))
-        elif ratio >= 1.0:
-            statistics = "{} | Finishing transfer...".format(size_text)
-        else:
-            statistics = "{} | Measuring speed...".format(size_text)
-
         status = "Finalizing..." if ratio >= 1.0 else "Running"
+        values = {}
+        if (self._last_statistics_time is None or ratio >= 1.0 or
+                now - self._last_statistics_time >= self.STATISTICS_INTERVAL):
+            self._last_statistics_time = now
+            speed = self._smoothed_speed
+            remaining = max(0.0, total - done)
+            eta = remaining / speed if speed > 0.0 else None
+            size_text = '{} / {}'.format(format_size(done), format_size(total))
+            if speed > 0.0 and ratio < 1.0:
+                statistics = '{} | {}/s | {} remaining'.format(size_text, format_size(speed), format_time(eta))
+            elif ratio >= 1.0:
+                statistics = '{} | Finishing transfer...'.format(size_text)
+            else:
+                statistics = '{} | Measuring speed...'.format(size_text)
+            values['statistics'] = statistics
         self.task.center.update_row(
             self.row_id,
             ratio=ratio,
-            statistics=statistics,
             status=status,
             state="finalizing" if ratio >= 1.0 else "running",
+            **values,
         )
         self.state = "finalizing" if ratio >= 1.0 else "running"
 
@@ -125,6 +136,7 @@ class TransferItemRow:
             state="failed")
 
     def destroy(self):
+        self.task._unindex_row(self, self.name)
         self.task.center._row_to_task.pop(self.row_id, None)
         self.task.center.post("remove_row", self.row_id)
 
@@ -140,8 +152,46 @@ class TransferTaskHandle:
         self.started_at = time.monotonic()
         self.state = "running"
         self.rows = []
+        self._rows_by_name = {}
+        self._rows_by_leaf = {}
         self._active_row = None
+        self._retry_callback = None
+        self._retry_pending = False
+        self._progress_delivery = None
         self._build_rows()
+
+    def set_progress_delivery(self, delivery):
+        self._progress_delivery = weakref.ref(delivery)
+
+    def flush_progress(self, time_budget_ms=3):
+        delivery = self._progress_delivery() if self._progress_delivery is not None else None
+        if delivery is not None:
+            delivery.flush_progress(time_budget_ms=time_budget_ms)
+
+    def set_retry(self, callback):
+        self._retry_callback = callback
+
+    def retry_ready(self):
+        self._retry_pending = False
+        if self.state != 'failed' or not callable(self._retry_callback):
+            return
+        for row in self.rows:
+            if row.exists() and row.state in ('failed', 'skipped'):
+                self.center.update_row(row.row_id, action='Retry', action_enabled=True)
+
+    def request_retry(self):
+        if self.state != 'failed' or self._retry_pending or not callable(self._retry_callback):
+            return False
+        self._retry_pending = True
+        for row in self.rows:
+            if row.exists() and row.state in ('failed', 'skipped'):
+                self.center.update_row(row.row_id, action_enabled=False)
+        try:
+            self._retry_callback(self)
+        except Exception:
+            self.retry_ready()
+            raise
+        return True
 
     @staticmethod
     def _deduplicate_items(items):
@@ -162,9 +212,39 @@ class TransferTaskHandle:
     def _build_rows(self):
         if self.items:
             for item in self.items:
-                self.rows.append(TransferItemRow(self, item))
+                self._append_row(item)
         else:
-            self.rows.append(TransferItemRow(self, "Preparing...", placeholder=True))
+            self._append_row('Preparing...', placeholder=True)
+
+    def _index_row(self, row):
+        self._rows_by_name[row.name] = row
+        leaf = self._leaf_name(row.name)
+        previous = self._rows_by_leaf.get(leaf)
+        if previous is None:
+            self._rows_by_leaf[leaf] = row
+        elif isinstance(previous, list):
+            if row not in previous:
+                previous.append(row)
+        elif previous is not row:
+            self._rows_by_leaf[leaf] = [previous, row]
+
+    def _unindex_row(self, row, name):
+        if self._rows_by_name.get(name) is row:
+            self._rows_by_name.pop(name, None)
+        leaf = self._leaf_name(name)
+        previous = self._rows_by_leaf.get(leaf)
+        if previous is row:
+            self._rows_by_leaf.pop(leaf, None)
+        elif isinstance(previous, list) and row in previous:
+            previous.remove(row)
+            if len(previous) == 1:
+                self._rows_by_leaf[leaf] = previous[0]
+
+    def _append_row(self, name, placeholder=False):
+        row = TransferItemRow(self, name, placeholder=placeholder)
+        self.rows.append(row)
+        self._index_row(row)
+        return row
 
     def winfo_exists(self):
         return any(row.exists() for row in self.rows)
@@ -185,36 +265,27 @@ class TransferTaskHandle:
             return self.rows[0]
 
         leaf = self._leaf_name(name)
-        if self._active_row is not None:
-            if (self._active_row.name == name or
-                    self._leaf_name(self._active_row.name) == leaf):
-                return self._active_row
-
-        exact_matches = [row for row in self.rows if row.name == name]
-        if exact_matches:
+        exact = self._rows_by_name.get(name)
+        if exact is not None:
+            return exact
+        if self._active_row is not None and self._leaf_name(self._active_row.name) == leaf:
+            return self._active_row
+        matches = self._rows_by_leaf.get(leaf)
+        if isinstance(matches, list):
             return next(
-                (row for row in exact_matches
-                 if row.state not in ("completed", "failed", "cancelled")),
-                exact_matches[-1],
+                (row for row in matches
+                  if row.state not in ("completed", "failed", "cancelled")),
+                matches[-1],
             )
-        leaf_matches = [
-            row for row in self.rows if self._leaf_name(row.name) == leaf]
-        if leaf_matches:
-            return next(
-                (row for row in leaf_matches
-                 if row.state not in ("completed", "failed", "cancelled")),
-                leaf_matches[-1],
-            )
-
-        row = TransferItemRow(self, name)
-        self.rows.append(row)
-        return row
+        if matches is not None:
+            return matches
+        return self._append_row(name)
 
     def update_progress(
             self, name, current_done, current_total,
             overall_done, overall_total):
         del overall_done, overall_total
-        if not self.winfo_exists() or self.state != "running":
+        if self.state != "running" or not self.winfo_exists():
             return
         row = self._row_for_name(name)
         if (self._active_row is not None and self._active_row is not row and
@@ -266,6 +337,7 @@ class TransferTaskHandle:
                     action="Dismiss", action_enabled=True,
                     state=row.state)
         self.center.task_failed(self)
+        self.retry_ready()
 
     def cancel(self, *_args):
         if self.state != "running":
@@ -287,7 +359,7 @@ class TransferCenterLogic:
 
     WIDTH = 700
     HEIGHT = 245
-    AUTO_REMOVE_DELAY_MS = 900
+    AUTO_REMOVE_DELAY_MS = 120
 
     def _next_row_id(self):
         return next(self._row_ids)
@@ -326,6 +398,12 @@ class TransferCenterLogic:
             return
         if task.state in ("running", "cancelling"):
             task.cancel()
+        elif task.state == 'failed' and callable(task._retry_callback):
+            row = next((row for row in task.rows if row.row_id == row_id), None)
+            if row is not None and row.state in ('failed', 'skipped'):
+                task.request_retry()
+            else:
+                self.remove_task(task)
         else:
             self.remove_task(task)
             self._hide_if_idle()
@@ -363,7 +441,9 @@ class TransferCenterLogic:
             self._active_batch_failed = False
         task = TransferTaskHandle(self, operation, cancel_event, items)
         self.tasks.append(task)
-        self.show()
+        visible = getattr(self, 'isVisible', None)
+        if not callable(visible) or not visible():
+            self.show()
         return task
 
     def schedule_auto_remove(self, task):
@@ -401,6 +481,7 @@ class TransferCenterLogic:
         self.show()
 
     def remove_task(self, task):
+        task._retry_callback = None
         if task in self.tasks:
             self.tasks.remove(task)
         for row in list(getattr(task, "rows", [])):

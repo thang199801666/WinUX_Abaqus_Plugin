@@ -3,27 +3,95 @@ from __future__ import annotations
 import posixpath
 import shutil
 import stat
+import time
 from pathlib import PurePosixPath
 
 from ..models import FileItem, FileSystemModel
 from .ssh_serialization import _serialized_wire_call
+from .remote_identity import RemoteIdentityNames
+from .transfer.conflicts import TransferItemState
 
 
 class RemoteFilesystemMixin:
     """Remote browsing and filesystem mutation over the shared SSH transport."""
 
     @_serialized_wire_call
+    def transfer_path_metadata(self, path):
+        if not self.connected:
+            raise RuntimeError('Not connected to an SSH server')
+        try:
+            return TransferItemState.from_stat(self.sftp.lstat(str(self.normalize(path))))
+        except OSError as exc:
+            if exc.errno == 2:
+                return None
+            raise
+
+    def transfer_directory_metadata(self, folder, *, limit=10000, check=lambda: None):
+        """Bounded metadata-only listing; do not resolve owners or follow links."""
+        if not self.connected:
+            raise RuntimeError('Not connected to an SSH server')
+        from .transfer.tree import read_sftp_directory
+        with self._auxiliary_session() as (_, sftp):
+            return read_sftp_directory(sftp, self.normalize(folder), limit=limit, check=check)
+
+    @_serialized_wire_call
+    def transfer_metadata(self, paths):
+        """One attribute listing per parent; no owner lookup or UI row building."""
+        if not self.connected:
+            raise RuntimeError('Not connected to an SSH server')
+        groups, result = {}, {}
+        for path in paths:
+            path = self.normalize(path)
+            groups.setdefault(path.parent, []).append(path)
+        for parent, requested in groups.items():
+            entries = {entry.filename: entry for entry in self.sftp.listdir_attr(str(parent))}
+            for path in requested:
+                attr = entries.get(path.name)
+                result[str(path)] = TransferItemState.from_stat(attr) if attr is not None else None
+        return result
+
+    @_serialized_wire_call
+    def list_directory_names(self, folder):
+        """Name-only preflight: do not resolve owners/groups or build row data."""
+        if not self.connected:
+            raise RuntimeError('Not connected to an SSH server')
+        return self.sftp.listdir(str(self.normalize(folder)))
+
+    @_serialized_wire_call
     def list_directory(self, folder):
         if not self.connected:
             raise RuntimeError("Not connected to an SSH server")
         folder = self.normalize(folder)
+        attrs = self.sftp.listdir_attr(str(folder))
+        client = getattr(self, 'client', None)
+        if (not hasattr(self, '_identity_names') or
+                getattr(self, '_identity_names_client', None) is not client):
+            self._identity_names = RemoteIdentityNames()
+            self._identity_names_client = client
+        uids = {attr.st_uid for attr in attrs if getattr(attr, 'st_uid', None) is not None}
+        gids = {attr.st_gid for attr in attrs if getattr(attr, 'st_gid', None) is not None}
+        owners, groups = self._identity_names.resolve(uids, gids, self._lookup_identity_names)
         items = []
-        for attr in self.sftp.listdir_attr(str(folder)):
+        for attr in attrs:
             is_dir = stat.S_ISDIR(attr.st_mode)
             items.append(FileItem(attr.filename, folder / attr.filename, is_dir,
                                   attr.st_size or 0, attr.st_mtime or 0,
-                                  is_hidden=attr.filename.startswith(".")))
+                                  is_hidden=attr.filename.startswith("."),
+                                  mode=getattr(attr, "st_mode", None),
+                                  uid=getattr(attr, "st_uid", None),
+                                  gid=getattr(attr, "st_gid", None),
+                                  accessed=getattr(attr, "st_atime", None),
+                                  owner_name=owners.get(getattr(attr, 'st_uid', None), ''),
+                                  group_name=groups.get(getattr(attr, 'st_gid', None), ''),
+                                  is_symlink=stat.S_ISLNK(attr.st_mode)))
         return sorted(items, key=lambda item: (not item.is_dir, item.name.casefold()))
+
+    def _lookup_identity_names(self, command):
+        _stdin, stdout, stderr = self._exec_command_streams(command, timeout=5)
+        try:
+            return stdout.read().decode('utf-8', 'replace')
+        finally:
+            stdout.channel.close()
 
     @_serialized_wire_call
     def search_directories(self, text, limit=100):
@@ -68,19 +136,57 @@ class RemoteFilesystemMixin:
 
     @_serialized_wire_call
     def transfer(self, remote_paths, remote_folder, move=False, cancel=None):
-        """Copy or move remote items within the connected server."""
+        """Copy or move items entirely on the connected server.
+
+        Earlier builds implemented remote copy by opening each source through
+        SFTP and writing it back through SFTP.  Although no temporary file was
+        created, every byte still travelled server -> WinUX -> server.  Use the
+        host filesystem instead so same-server clipboard operations are as
+        cheap as running ``cp``/``mv`` directly in an SSH terminal.
+        """
+        if not self.connected:
+            raise RuntimeError("Not connected to an SSH server")
         remote_folder = self.normalize(remote_folder)
         created = []
         for source in remote_paths:
             self._cancelled(cancel)
             source = self.normalize(source)
             target = self.unique_target(remote_folder / source.name)
-            if move:
-                self.sftp.rename(str(source), str(target))
-            else:
-                self._copy_path(source, target, cancel)
+            command = "{} -- {} {}".format(
+                "mv" if move else "cp -a",
+                self._shell_quote(source), self._shell_quote(target))
+            self._run_server_file_command(command, cancel=cancel)
             created.append(target)
         return created
+
+    def _run_server_file_command(self, command, cancel=None):
+        """Run one quiet filesystem command on the remote host.
+
+        The exec channel is polled so application shutdown/cancellation can
+        close it without waiting for a large server-side recursive copy.
+        ``cp``/``mv`` are intentionally run on the server; stdout/stderr are
+        expected to remain tiny and are consumed only after completion.
+        """
+        _stdin, stdout, stderr = self._exec_command_streams(command, timeout=None)
+        channel = stdout.channel
+        try:
+            while not channel.exit_status_ready():
+                self._cancelled(cancel)
+                time.sleep(0.05)
+            status = channel.recv_exit_status()
+            output = stdout.read().decode("utf-8", "replace").strip()
+            error = stderr.read().decode("utf-8", "replace").strip()
+        except Exception:
+            try:
+                channel.close()
+            except Exception:
+                pass
+            raise
+        if status != 0:
+            raise RuntimeError(
+                error or output or
+                "Remote filesystem command failed with exit code {}".format(status))
+        return True
 
     @_serialized_wire_call
     def _copy_path(self, source, target, cancel=None):

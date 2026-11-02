@@ -12,7 +12,9 @@ PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_DIR not in sys.path:
     sys.path.insert(0, PROJECT_DIR)
 
-from winux_update_manifest import read_version, source_descriptor, write_manifest
+from winux_runtime.update.manifest import (
+    build_manifest, load_manifest, read_version, source_descriptor, write_manifest,
+)
 from tools.build_github_release_metadata import write_metadata
 
 
@@ -42,7 +44,13 @@ def build_release(source_dir, output_dir, expected_tag=None):
             "*.md", "*.markdown",
         ))
         # Never publish the working tree's potentially stale manifest.
-        write_manifest(stage)
+        try:
+            source_manifest = load_manifest(source_dir)
+        except ValueError:
+            source_manifest = {}
+        revision = (source_manifest.get("package_revision", 1)
+                    if source_manifest.get("version") == version else 1)
+        write_manifest(stage, manifest=build_manifest(stage, package_revision=revision))
         descriptor = source_descriptor(stage, verify_hashes=True)
         package = os.path.join(output_dir, "WinUx_{}_FULL.zip".format(version))
         with zipfile.ZipFile(package, "w", zipfile.ZIP_DEFLATED) as archive:

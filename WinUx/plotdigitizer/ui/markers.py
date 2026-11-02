@@ -25,13 +25,17 @@ class MarkerMetrics:
 
 
 def marker_metrics(zoom, source='auto', size_scale=1.0):
+    """Return one shared screen-space marker size for every point source.
+
+    ``source`` is intentionally retained for API compatibility and visibility /
+    selection routing, but it must not change the painted marker size.  Manual,
+    automatic and resampled points therefore remain visually uniform.
+    """
     zoom = float(zoom)
     if not math.isfinite(zoom) or zoom <= 0:
         zoom = 1.0
-    manual = source == 'manual'
     size_scale = max(0.5, min(2.5, float(size_scale)))
-    base_radius = min(7.0 if manual else 5.5,
-                      max(2.5 if manual else 2.0, (4.0 if manual else 3.0) * math.sqrt(zoom)))
+    base_radius = min(5.5, max(2.0, 3.0 * math.sqrt(zoom)))
     radius = base_radius * size_scale
     return MarkerMetrics(radius, min(26.0, max(5.5, radius + 3)), max(8.0, radius + 3))
 
@@ -123,3 +127,23 @@ def draw_marker(parent, center, radius, style='circle', *, color=(255, 255, 255,
         return
 
     painter.drawEllipse((cx, cy), radius, fill=color, color=outline, thickness=thickness)
+
+
+def draw_axis_marker(parent, center, axis, *, kind='tick', radius=6,
+                     color=(0, 120, 215, 255)):
+    """Axes use a literal asterisk; the shared X1/Y1 origin is a hollow donut."""
+    painter = QPainter(parent)
+    x, y = center
+    r = float(radius)
+    if kind == 'origin':
+        # Transparent fill keeps the hole open over both light and dark charts.
+        for thickness, ink in ((5, (255, 255, 255, 255)), (3, color)):
+            painter.drawEllipse((x, y), r, fill=(0, 0, 0, 0), color=ink, thickness=thickness)
+        return
+    # Three crossing strokes form '*', not the dataset's filled star polygon.
+    segments = [((x - r * math.cos(angle), y - r * math.sin(angle)),
+                 (x + r * math.cos(angle), y + r * math.sin(angle)))
+                for angle in (math.pi / 2, math.pi / 6, -math.pi / 6)]
+    for thickness, ink in ((4, (255, 255, 255, 255)), (2, color)):
+        for a, b in segments:
+            painter.drawLine(a, b, color=ink, thickness=thickness)

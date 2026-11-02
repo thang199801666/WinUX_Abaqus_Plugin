@@ -143,6 +143,9 @@ class DialogBase:
             if child != content and dpg.does_item_exist(child):
                 dpg.move_item(child, parent=content)
         self.content = content
+        from ..backends import get_backend
+        from ..backends.shared_scrollers import register_scroll_surface
+        register_scroll_surface(get_backend(), content)
 
     def _bind_resize_handler(self):
         """Reflow dialog-owned widgets whenever the native window is resized."""

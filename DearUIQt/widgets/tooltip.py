@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 from .widget import QWidget
+from ..tooltip import TOOLTIP_DELAY
 
 
 class QToolTip(QWidget):
     """Renderer tooltip surface owned as a normal DearUIQt widget."""
     def __init__(self, target, *, parent=None, after=None, backend=None,
-                 delay=0.45, hide_on_activity=True, show=False, tag=None):
+                  delay=TOOLTIP_DELAY, hide_on_activity=True, show=True, tag=None):
+        # ``show`` enables Dear PyGui's delayed hover tooltip; False disables
+        # it entirely. Automatic tooltips must be enabled by default, while
+        # manually populated Explorer tooltips still explicitly use show=False.
+        if parent is None and isinstance(target, QWidget):
+            parent = target
         backend, _ = self._construction(parent, backend)
         native_target = getattr(target, "tag", target)
         kwargs = {
