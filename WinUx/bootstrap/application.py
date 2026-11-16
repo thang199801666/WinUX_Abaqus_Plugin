@@ -9,6 +9,8 @@ from __future__ import annotations
 import sys
 import time
 
+from winux_runtime.startup_timing import note_startup_milestone
+
 from ..diagnostics import (
     install_crash_logging,
     log_event,
@@ -30,11 +32,13 @@ def run(controller_factory=None):
         if controller_factory is None:
             # Import only after crash hooks are active so import/ABI failures
             # from Dear PyGui are written to the diagnostic logs.
-            from ..controller import WinUXController
+            from ..app.controller import WinUXController
             controller_factory = WinUXController
         log_event("Startup controller import elapsed={:.3f}s".format(time.perf_counter()-started))
+        note_startup_milestone("controller imported")
         controller = controller_factory()
         log_event("Startup controller/view ready elapsed={:.3f}s".format(time.perf_counter()-started))
+        note_startup_milestone("controller and view constructed")
         controller.run()
     except Exception:
         log_exception(

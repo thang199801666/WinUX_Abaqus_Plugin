@@ -5,14 +5,15 @@ from ..core import Qt
 
 
 class ComboPopup(QMenu):
+    ROW_HEIGHT = 28
     ICON_SLOT = 0
     CHECK_SLOT = 0
     ARROW_SLOT = 0
-    ROW_PAD_X = 2
+    ROW_PAD_X = 4
     LABEL_PAD = 6
-    WINDOW_PAD_X = 1
-    WINDOW_PAD_Y = 1
-    TEXT_Y_NUDGE = -3
+    WINDOW_PAD_X = 4
+    WINDOW_PAD_Y = 4
+    TEXT_Y_NUDGE = -3  # Match the renderer's text-ink baseline inside the taller row.
 
     def __init__(self, *args, **kwargs):
         self._choice_themes = {}
@@ -34,6 +35,7 @@ class ComboPopup(QMenu):
                     b.add_theme_style(b.mvStyleVar_WindowPadding, 0, 0)
                     b.add_theme_style(b.mvStyleVar_ItemSpacing, 0, 0)
                     b.add_theme_style(b.mvStyleVar_ChildBorderSize, 0)
+                    b.add_theme_style(b.mvStyleVar_ChildRounding, 3)
         self._choice_themes[key] = theme
         return theme
 
@@ -43,15 +45,21 @@ class ComboPopup(QMenu):
             with b.theme_component(b.mvAll):
                 b.add_theme_color(b.mvThemeCol_WindowBg, p.BASE)
                 b.add_theme_color(b.mvThemeCol_ChildBg, p.BASE)
-                b.add_theme_color(b.mvThemeCol_Border, p.BORDER_DARK)
-                b.add_theme_style(b.mvStyleVar_WindowPadding, 1, 1)
+                b.add_theme_color(b.mvThemeCol_Border, p.BORDER)
+                b.add_theme_style(b.mvStyleVar_WindowPadding, self.WINDOW_PAD_X, self.WINDOW_PAD_Y)
                 b.add_theme_style(b.mvStyleVar_ItemSpacing, 0, 0)
-                b.add_theme_style(b.mvStyleVar_WindowRounding, 0)
+                b.add_theme_style(b.mvStyleVar_WindowRounding, 5)
                 b.add_theme_style(b.mvStyleVar_WindowBorderSize, 1)
-                b.add_theme_style(b.mvStyleVar_ChildRounding, 0)
-                b.add_theme_style(b.mvStyleVar_ChildBorderSize, 1)
+                b.add_theme_style(b.mvStyleVar_ChildRounding, 3)
+                b.add_theme_style(b.mvStyleVar_ChildBorderSize, 0)
         self._surface_theme = theme
         b.bind_item_theme(self.tag, theme)
+
+    def refreshTheme(self):
+        self._choice_themes = {}
+        result = super().refreshTheme()
+        self._apply_surface()
+        return result
 
     def _estimate_width(self, specs):
         return self._min_width
@@ -70,9 +78,15 @@ class ComboPopup(QMenu):
     def _set_row_hover(self, action_id, hovered):
         parts = self._items.get(action_id)
         if parts is None:
-            return
+            return False
+        state = (bool(hovered), False)
+        if self._row_hover_state.get(str(action_id)) == state:
+            return False
+        self._row_hover_state[str(action_id)] = state
         self.backend.bind_item_theme(parts["row"], self._theme(hovered))
         self.backend.bind_item_theme(parts["label"], self._theme(hovered, text=True))
+        self._request_popup_update(self._row_dirty_region(action_id))
+        return True
 
     def configureChoices(self, labels, width, max_rows):
         self._min_width = self._max_width = max(24, int(width))
@@ -98,6 +112,20 @@ class ComboPopup(QMenu):
                 self.backend.set_y_scroll(self.tag, max(0, top + self.ROW_HEIGHT - height))
         except Exception:
             pass
+
+    def resizeToAnchor(self, width):
+        """Resize existing choice rows without rebuilding or losing selection/scroll."""
+        width = max(24, int(width))
+        if width == self._min_width:
+            return
+        self._min_width = self._max_width = width
+        limits = ({} if self._parent_window is not None else {
+            'min_size': (width, 1), 'max_size': (width, self.backend.get_item_configuration(self.tag)['height'])})
+        self.backend.configure_item(self.tag, width=width, **limits)
+        row_width = max(1, width - 2 * self.WINDOW_PAD_X)
+        for parts in self._items.values():
+            self.backend.configure_item(parts['row'], width=row_width)
+            self.backend.configure_item(parts['arrow'], width=row_width)
 
     def navigate(self, command):
         # A combo list stops at either end instead of wrapping like QMenu.

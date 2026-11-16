@@ -20,7 +20,7 @@ __all__ = ["WinUXController", "run"]
 
 def __getattr__(name):
     if name == "WinUXController":
-        from .controller import WinUXController
+        from .app.controller import WinUXController
         return WinUXController
     if name == "run":
         from .bootstrap.application import run

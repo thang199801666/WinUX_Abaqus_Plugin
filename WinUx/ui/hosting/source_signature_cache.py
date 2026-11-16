@@ -7,6 +7,8 @@ import struct
 import threading
 from typing import NamedTuple
 
+from DearUIQt.core import QObject, QThread, Signal, Qt
+
 
 class SourceSnapshot(NamedTuple):
     signature: tuple
@@ -158,6 +160,22 @@ class _DirectoryChanges:
         self.events = []
 
 
+class _SourceSignatureWorker(QObject):
+    """QObject worker owning the long-lived native source watch."""
+
+    def __init__(self, cache, thread):
+        super().__init__()
+        self.finished = Signal(self)
+        self._cache = cache
+        self._thread = thread
+
+    def run(self):
+        try:
+            self._cache._run(self._thread)
+        finally:
+            self.finished.emit()
+
+
 class SourceSignatureCache:
     def __init__(self, root, scan, on_refresh):
         self.root = Path(root)
@@ -167,7 +185,13 @@ class SourceSignatureCache:
         self._generation = 0
         self._backend = None
         self.failed = self._closed = False
-        self.thread = threading.Thread(target=self._run, name="dialog-source-watch", daemon=True)
+        self.thread = QThread(name="dialog-source-watch", daemon=True)
+        self._worker = _SourceSignatureWorker(self, self.thread)
+        self._worker.moveToThread(self.thread)
+        self.thread.started.connect(self._worker.run, receiver=self._worker)
+        self._worker.finished.connect(
+            self.thread.quit, connection_type=Qt.DirectConnection)
+        self.thread.finished.connect(self._worker.deleteLater, receiver=self._worker)
         self.thread.start()
 
     @property
@@ -198,7 +222,7 @@ class SourceSignatureCache:
                 return None
             return SourceSnapshot(self._signature, self._generation)
 
-    def _run(self):
+    def _run(self, thread=None):
         backend = None
         try:
             # Watching the parent also catches replacement/rename of the root.
@@ -207,7 +231,8 @@ class SourceSignatureCache:
                 self._backend = backend
             while True:
                 with self._lock:
-                    if self._closed or self.failed:
+                    if (self._closed or self.failed or
+                            (thread is not None and thread.isInterruptionRequested())):
                         break
                     self._poll_locked()
                     needs_scan = self._signature is None
@@ -238,8 +263,13 @@ class SourceSignatureCache:
             if backend is not None:
                 backend.dispose()
 
-    def close(self):
+    def close(self, *, wait=False, timeout=1.0):
         with self._lock:
             self._closed = True
+            thread = self.thread
+            if thread is not None:
+                thread.requestInterruption()
             if self._backend is not None:
                 self._backend.stop()
+        if wait and thread is not None and not thread.isCurrentThread():
+            thread.wait(max(0.0, float(timeout)) * 1000.0)

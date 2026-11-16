@@ -1,53 +1,28 @@
-"""Generate WinUx update_manifest.json after a release is fully published.
+"""Refresh the main deployment manifest without publishing/installing a release.
 
-Flat deployment example:
-    abaqus python tools/build_update_manifest.py .
-
-Versioned release example:
-    python tools/build_update_manifest.py releases/1.1.0 \
-        --manifest-root . --release-path releases/1.1.0 --revision 12
+Usage: abaqus python tools/build_update_manifest.py --revision 2
 """
-from __future__ import print_function
-
 import argparse
-import os
+from pathlib import Path
 import sys
 
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_DIR = os.path.dirname(SCRIPT_DIR)
-if PROJECT_DIR not in sys.path:
-    sys.path.insert(0, PROJECT_DIR)
-
-from winux_update_manifest import build_manifest, write_manifest  # noqa: E402
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from winux_runtime.update.manifest import build_manifest, source_descriptor, write_manifest
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Build a WinUx update manifest.")
-    parser.add_argument("release_dir", nargs="?", default=".")
-    parser.add_argument("--manifest-root", default=None)
-    parser.add_argument("--release-path", default=".")
-    parser.add_argument("--revision", type=int, default=1)
-    parser.add_argument("--released", default=None)
-    args = parser.parse_args(argv)
-
-    release_dir = os.path.abspath(args.release_dir)
-    manifest_root = os.path.abspath(args.manifest_root or release_dir)
-    manifest = build_manifest(
-        release_dir,
-        release_path=args.release_path,
-        package_revision=args.revision,
-        released=args.released,
-    )
-    if not os.path.isdir(manifest_root):
-        os.makedirs(manifest_root)
-    path = write_manifest(manifest_root, manifest=manifest)
-    print("WinUx update manifest written: {}".format(path))
-    print("Version: {}".format(manifest["version"]))
-    print("Files: {}".format(manifest["file_count"]))
-    print("Package SHA-256: {}".format(manifest["package_sha256"]))
-    return 0
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--revision', type=int, required=True)
+    args = parser.parse_args()
+    if args.revision < 1:
+        parser.error('revision must be positive')
+    manifest = build_manifest(str(ROOT), package_revision=args.revision)
+    write_manifest(str(ROOT), manifest=manifest)
+    source_descriptor(str(ROOT), verify_hashes=True)
+    print('VERIFIED: {} revision {} | {} files | {}'.format(
+        manifest['version'], manifest['package_revision'], manifest['file_count'], ROOT))
 
 
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == '__main__':
+    main()

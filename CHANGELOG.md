@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.1.7 - 2026-11-16
+
+- Consolidate the current source under product version 1.1.7 (package revision 103).
+- Restore the 1.1.12 DearUIQt owned-dialog host and fix interrupted message content construction.
+- Preserve native dialog teardown and serialized session-tab presentation.
+- Synchronize spreadsheet current cells on repeated range selection without requesting scrolling.
+- Validate scroll retention across seven control types and real-controller Local/Server panes.
+- Verify 21 native dialog types in normal/PiP modes, physical Login/OK/Cancel/X, 63 dialog unit tests and 42 item-view unit tests.
+- Release smoke suite: 98 passed. Verify FULL and merged 1.1.6 + CHANGES-ONLY manifests, legacy bootstrap compatibility and SHA-256 checksums.
+- Higher-numbered development installations require manual FULL installation; downgrade protection is unchanged.
+
 ## 1.1.5 - 2026-10-20
 
 ### Improved

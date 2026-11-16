@@ -115,6 +115,53 @@ class DockLayoutTree:
         group = self.group_of(key)
         return None if group is None else group.get("active")
 
+    def topology_for(self, key):
+        """Return a defensive retained-topology snapshot for *key*.
+
+        The snapshot deliberately exposes stable semantic metadata instead of
+        leaking mutable layout-tree node dictionaries to QDockWidget users.
+        ``splitPath`` identifies the nearest split parent by child indexes from
+        the area root; it is intended for retained state/signals/diagnostics,
+        not as a persistent serialization key.
+        """
+        key = str(key)
+        found = self._find(key)
+        if found is None:
+            return {
+                "area": None, "tabGroupId": None, "tabifiedKeys": (),
+                "activeTabKey": None, "splitOrientation": None,
+                "splitPath": None,
+            }
+        area, group, parent, _index = found
+        split_orientation = None
+        split_path = None
+        if parent is not None and parent.get("type") == "split":
+            split_orientation = parent.get("orientation")
+            root = self.roots.get(area)
+            path = []
+
+            def locate(node, target, current):
+                if node is target:
+                    return tuple(current)
+                if not isinstance(node, dict) or node.get("type") != "split":
+                    return None
+                for child_index, child in enumerate(node.get("children") or ()):
+                    result = locate(child, target, current + [child_index])
+                    if result is not None:
+                        return result
+                return None
+
+            split_path = locate(root, parent, path)
+        keys = tuple(group.get("keys") or ())
+        return {
+            "area": area,
+            "tabGroupId": group.get("id"),
+            "tabifiedKeys": tuple(candidate for candidate in keys if candidate != key),
+            "activeTabKey": group.get("active"),
+            "splitOrientation": split_orientation,
+            "splitPath": split_path,
+        }
+
     def set_active(self, key):
         key = str(key)
         group = self.group_of(key)

@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 import copy
+import ast
 import csv
+import io
+import json
 import math
 import re
+import tokenize
 import uuid
 
 from ..preferences.storage import JsonPreferenceStore
@@ -53,6 +57,106 @@ def validate_reference(series):
     return {"id": str(series.get("id") or uuid.uuid4().hex), "name": name,
             "points": points, "enabled": bool(series.get("enabled", True)),
             "kind": "xy"}
+
+
+def reduce_reference_samples(points, max_error_ratio=0.0001):
+    """Return an error-bounded subset of an XY reference curve.
+
+    ``max_error_ratio`` is measured in a normalized XY space where each axis
+    spans 0..1.  This makes the reduction insensitive to engineering units
+    (for example millimetres on X and newtons on Y) while retaining the
+    original acquisition order, endpoints, reversals and sharp turns.
+
+    A ratio of ``0`` is lossless with respect to the polyline geometry: only
+    duplicate/redundant collinear samples can disappear.  Positive ratios are
+    bounded Ramer-Douglas-Peucker simplification; every omitted point remains
+    within the requested normalized distance of the replacement segment.
+    """
+    if isinstance(max_error_ratio, bool):
+        raise ValueError("Reduction error must be a finite, non-negative ratio.")
+    try:
+        max_error_ratio = float(max_error_ratio)
+    except (TypeError, ValueError):
+        raise ValueError("Reduction error must be a finite, non-negative ratio.") from None
+    if not math.isfinite(max_error_ratio) or max_error_ratio < 0:
+        raise ValueError("Reduction error must be a finite, non-negative ratio.")
+
+    numeric = []
+    for point in points or []:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise ValueError("Each reference point must contain X and Y.")
+        numeric.append([_number(point[0]), _number(point[1])])
+    if len(numeric) <= 2:
+        return numeric
+
+    xs = [point[0] for point in numeric]
+    ys = [point[1] for point in numeric]
+    x_min, x_max = min(xs), max(xs)
+    y_min, y_max = min(ys), max(ys)
+    x_span = x_max - x_min
+    y_span = y_max - y_min
+
+    # Degenerate axes are valid (vertical/horizontal curves).  A zero span
+    # contributes no normalized distance on that axis rather than dividing by
+    # an arbitrary engineering-unit scale.
+    normalized = [
+        ((point[0] - x_min) / x_span if x_span else 0.0,
+         (point[1] - y_min) / y_span if y_span else 0.0)
+        for point in numeric
+    ]
+
+    def segment_distance(point, first, last):
+        dx, dy = last[0] - first[0], last[1] - first[1]
+        length_sq = dx * dx + dy * dy
+        if length_sq == 0.0:
+            return math.hypot(point[0] - first[0], point[1] - first[1])
+        projection = ((point[0] - first[0]) * dx + (point[1] - first[1]) * dy) / length_sq
+        projection = max(0.0, min(1.0, projection))
+        return math.hypot(
+            point[0] - (first[0] + projection * dx),
+            point[1] - (first[1] + projection * dy))
+
+    # ``0`` means geometrically exact for practical double precision.  Use a
+    # machine-scale epsilon so values produced by decimal->binary conversion
+    # do not manufacture false curvature on an otherwise straight segment.
+    effective_error = max(max_error_ratio, 1.0e-12)
+
+    # Iterative Ramer-Douglas-Peucker. Preserve real reversals explicitly: a
+    # later endpoint can otherwise enclose a backtracking path whose samples
+    # happen to remain close to the same segment.
+    keep = {0, len(normalized) - 1}
+    distinct = []
+    for index, point in enumerate(normalized):
+        if not distinct or point != normalized[distinct[-1]]:
+            distinct.append(index)
+    for first, middle, last in zip(distinct, distinct[1:], distinct[2:]):
+        previous = (normalized[middle][0] - normalized[first][0],
+                    normalized[middle][1] - normalized[first][1])
+        following = (normalized[last][0] - normalized[middle][0],
+                     normalized[last][1] - normalized[middle][1])
+        dot = previous[0] * following[0] + previous[1] * following[1]
+        cross = previous[0] * following[1] - previous[1] * following[0]
+        if dot < 0 or (max_error_ratio == 0 and abs(cross) > 1.0e-12):
+            keep.add(middle)
+
+    anchors = sorted(keep)
+    pending = list(zip(anchors, anchors[1:]))
+    while pending:
+        first, last = pending.pop()
+        if last - first < 2:
+            continue
+        furthest, distance = first + 1, -1.0
+        for index in range(first + 1, last):
+            candidate = segment_distance(
+                normalized[index], normalized[first], normalized[last])
+            if candidate > distance:
+                furthest, distance = index, candidate
+        if distance > effective_error:
+            keep.add(furthest)
+            pending.extend(((first, furthest), (furthest, last)))
+
+    retained = sorted(keep)
+    return [numeric[index] for index in retained]
 
 
 def _table(text, base_name):
@@ -459,11 +563,16 @@ class _FormulaExpr:
         self.args = list(args or [])
 
 
-def _formula_split_args(text):
-    args, start, depth = [], 0, 0
+def _formula_top_level(text):
+    """Lex separators without treating regex groups/classes as arithmetic."""
+    depth = 0
     quote = None
+    character_class = False
+    quantifier_end = -1
     escaped = False
     for index, char in enumerate(text):
+        if index <= quantifier_end:
+            continue
         if escaped:
             escaped = False
             continue
@@ -471,32 +580,62 @@ def _formula_split_args(text):
             escaped = True
             continue
         if quote:
-            if char == quote:
+            if quote == "/" and char == "[":
+                character_class = True
+            elif quote == "/" and char == "]":
+                character_class = False
+            elif char == quote and not character_class:
                 quote = None
             continue
+        if character_class:
+            if char == "]":
+                character_class = False
+            continue
+        if char == "[":
+            character_class = True
+            continue
+        if char == "{":
+            quantifier = re.match(r"\{\d+(?:,\d*)?\}", text[index:])
+            if quantifier is not None:
+                quantifier_end = index + len(quantifier.group()) - 1
+                continue
         if char in ("'", '"'):
             quote = char
             continue
+        if char == "/":
+            previous = text[:index].rstrip()
+            if (not previous or previous[-1] in "(,+-*/%") and re.search(r"(?<!\\)/", text[index + 1:]):
+                quote = char
+                continue
         if char == "(":
             depth += 1
         elif char == ")":
             depth -= 1
             if depth < 0:
                 raise ValueError("Unexpected ')' in formula.")
-        elif char == "," and depth == 0:
-            args.append(text[start:index].strip())
-            start = index + 1
+        elif depth == 0:
+            yield index, char
     if quote:
         raise ValueError("Unterminated quoted selector in formula.")
     if depth != 0:
         raise ValueError("Unbalanced parentheses in formula.")
+    if character_class:
+        raise ValueError("Unterminated regex character class in formula.")
+
+
+def _formula_split_args(text):
+    args, start = [], 0
+    for index, char in _formula_top_level(text):
+        if char == ",":
+            args.append(text[start:index].strip())
+            start = index + 1
     tail = text[start:].strip()
     if tail or args:
         args.append(tail)
     return args
 
 
-def _parse_formula_expr(text):
+def _parse_legacy_formula_expr(text):
     text = str(text or "").strip()
     if not text:
         raise ValueError("Enter a formula.")
@@ -504,26 +643,225 @@ def _parse_formula_expr(text):
         return _FormulaExpr("number", float(text))
     except ValueError:
         pass
-    if ((text.startswith('"') and text.endswith('"')) or
-            (text.startswith("'") and text.endswith("'"))):
+    tokens = list(_formula_top_level(text))
+    numeric_expression = bool(re.fullmatch(r"[\d.eE+\-*/%()\s]+", text))
+    # Unquoted selectors are regular expressions. Require spaces around binary
+    # operators so .*, RF[1-3], A+B and other existing regexes keep their meaning.
+    for operators in ("+-", "*/%"):
+        for index, char in reversed(tokens):
+            if char not in operators or index == 0 or index == len(text) - 1:
+                continue
+            previous = text[:index].rstrip()
+            if not previous:
+                continue
+            percentage_operand = False
+            if previous.endswith("%"):
+                try:
+                    float(previous[:-1])
+                    percentage_operand = True
+                except ValueError:
+                    pass
+            if previous[-1] in "+-*/%" and not percentage_operand and (
+                    numeric_expression or len(previous) == 1 or previous[-2].isspace()):
+                continue
+            if numeric_expression and char in "+-" and text[index - 1] in "eE":
+                continue
+            spaced = text[index - 1].isspace() and text[index + 1].isspace()
+            if spaced or numeric_expression:
+                return _FormulaExpr("binary", char, [
+                    _parse_legacy_formula_expr(text[:index]), _parse_legacy_formula_expr(text[index + 1:])])
+    if text[0] in "+-":
+        return _FormulaExpr("unary", text[0], [_parse_legacy_formula_expr(text[1:])])
+    # Numeric percentage literals are useful for scaling, e.g. 50% * regex.
+    if text.endswith("%"):
+        try:
+            return _FormulaExpr("number", float(text[:-1]) / 100.0)
+        except ValueError:
+            pass
+    if text[0] in ("'", '"', "/") and text[-1] == text[0] and not tokens:
         return _FormulaExpr("selector", text[1:-1])
-    if text.startswith("/") and text.endswith("/") and len(text) >= 2:
-        return _FormulaExpr("selector", text[1:-1])
+    if text.startswith("(") and text.endswith(")") and not tokens:
+        inner = _parse_legacy_formula_expr(text[1:-1])
+        if inner.kind != "selector":
+            return inner
 
     match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\s*\(", text)
     if match and text.endswith(")"):
         name = match.group(1).lower()
         open_index = text.find("(", match.start(1) + len(match.group(1)))
         body = text[open_index + 1:-1]
-        return _FormulaExpr("call", name, [_parse_formula_expr(arg) for arg in _formula_split_args(body)])
+        return _FormulaExpr("call", name, [_parse_legacy_formula_expr(arg) for arg in _formula_split_args(body)])
     return _FormulaExpr("selector", text)
+
+
+_FORMULA_MATH = {
+    'abs': abs, 'negate': lambda value: -value, 'sqrt': math.sqrt,
+    'square': lambda value: value * value, 'sin': math.sin, 'cos': math.cos,
+    'tan': math.tan, 'asin': math.asin, 'acos': math.acos, 'atan': math.atan,
+    'sinh': math.sinh, 'cosh': math.cosh, 'tanh': math.tanh,
+    'exp': math.exp, 'ln': math.log, 'log': math.log, 'log10': math.log10,
+}
+_FORMULA_FUNCTIONS = set(_FORMULA_MATH) | {
+    'combine', 'add', 'subtract', 'multiply', 'divide', 'average',
+    'magnitude', 'scale', 'offset',
+}
+
+
+def _uses_explicit_regex(text):
+    previous = None
+    try:
+        for token in tokenize.generate_tokens(io.StringIO(str(text)).readline):
+            if previous == (tokenize.NAME, 'regex') and token.string == '(':
+                return True
+            if token.type not in (tokenize.NL, tokenize.NEWLINE, tokenize.COMMENT):
+                previous = (token.type, token.string)
+    except (tokenize.TokenError, IndentationError):
+        pass
+    return False
+
+
+def _parse_explicit_formula(text):
+    """Parse Python/Abaqus-style arithmetic with explicitly delimited regexes.
+
+    Whitelisted AST only: never eval, attribute access, indexing or Python code.
+    Strings are Python string literals, including raw strings for backslashes.
+    """
+    text = str(text or '').strip()
+    if not text:
+        raise ValueError('Enter a formula.')
+    if len(text) > 16384:
+        raise ValueError('Formula is too long (maximum 16384 characters).')
+    try:
+        tree = ast.parse(text, mode='eval')
+    except (SyntaxError, ValueError, RecursionError) as exc:
+        raise ValueError('Invalid formula. Use regex("pattern") for names and ordinary + - * / ** expressions.') from exc
+    if sum(1 for _ in ast.walk(tree)) > 512:
+        raise ValueError('Formula is too complex.')
+    operators = {ast.Add: '+', ast.Sub: '-', ast.Mult: '*', ast.Div: '/', ast.Mod: '%', ast.Pow: '**'}
+
+    def convert(node, depth=0):
+        if depth > 64:
+            raise ValueError('Formula nesting is too deep.')
+        child = lambda value: convert(value, depth + 1)
+        if isinstance(node, ast.Constant) and type(node.value) in (int, float):
+            try:
+                value = float(node.value)
+            except OverflowError as exc:
+                raise ValueError('Formula numbers must be finite.') from exc
+            if not math.isfinite(value):
+                raise ValueError('Formula numbers must be finite.')
+            return _FormulaExpr('number', value)
+        if isinstance(node, ast.Name) and node.id in ('pi', 'e'):
+            return _FormulaExpr('number', getattr(math, node.id))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            return _FormulaExpr('unary', '+' if isinstance(node.op, ast.UAdd) else '-', [child(node.operand)])
+        if isinstance(node, ast.BinOp) and type(node.op) in operators:
+            return _FormulaExpr('binary', operators[type(node.op)], [child(node.left), child(node.right)])
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and not node.keywords:
+            name = node.func.id
+            if name == 'regex':
+                if len(node.args) != 1 or not isinstance(node.args[0], ast.Constant) or not isinstance(node.args[0].value, str):
+                    raise ValueError('Use regex("pattern") with one quoted pattern.')
+                pattern = node.args[0].value
+                try:
+                    re.compile(pattern, re.IGNORECASE)
+                except (re.error, RecursionError) as exc:
+                    raise ValueError('Invalid regex: {}'.format(exc)) from exc
+                if any(ord(char) < 32 and char not in '\n\t\r' for char in pattern):
+                    raise ValueError('Use a raw string for regex backslashes, e.g. regex(r"\\bU3\\b").')
+                return _FormulaExpr('selector', pattern)
+            if name in ('pow', 'power'):
+                if len(node.args) != 2:
+                    raise ValueError('{}() expects 2 arguments.'.format(name))
+                return _FormulaExpr('binary', '**', [child(arg) for arg in node.args])
+            if name not in _FORMULA_FUNCTIONS:
+                raise ValueError("Unknown formula function '{}'.".format(name))
+            count = len(node.args)
+            required = 1 if name in _FORMULA_MATH else 2
+            if count < required or (name in set(_FORMULA_MATH) | {'combine', 'scale', 'offset'} and count != required):
+                raise ValueError('{}() expects {} argument(s).'.format(name, required))
+            return _FormulaExpr('call', name, [child(arg) for arg in node.args])
+        raise ValueError('Select names with regex("pattern"). Only numbers, supported functions and + - * / ** % are allowed.')
+    return convert(tree.body)
+
+
+def _parse_formula_expr(text):
+    return _parse_explicit_formula(text) if _uses_explicit_regex(text) else _parse_legacy_formula_expr(text)
+
+
+def normalize_reference_formula(formula, *, canonical=False):
+    """Convert saved legacy selectors to explicit regex() without evaluating data."""
+    if _uses_explicit_regex(formula) and not canonical:
+        return str(formula).strip()
+    expr = _parse_formula_expr(formula)
+    def render(node):
+        if node.kind == 'selector':
+            # Slash delimiters in old generated rules escaped '/', which is
+            # not special in a Python regex. Canonical comparison may remove
+            # that redundant escape, but must preserve paired backslashes.
+            pattern = re.sub(r'(?<!\\)((?:\\\\)*)\\/', r'\1/', node.value) if canonical else node.value
+            return 'regex({})'.format(json.dumps(pattern, ensure_ascii=False))
+        if node.kind == 'number':
+            return repr(float(node.value))
+        if node.kind == 'unary':
+            return render(node.args[0]) if node.value == '+' else '-({})'.format(render(node.args[0]))
+        if node.kind == 'binary':
+            return '({} {} {})'.format(render(node.args[0]), node.value, render(node.args[1]))
+        return '{}({})'.format(node.value, ', '.join(render(arg) for arg in node.args))
+    return render(expr)
 
 
 def _formula_source_name(row):
     return str(row.get("displayName") or row.get("name") or row.get("output") or row.get("id") or "History Output")
 
 
-def _selector_curves(pattern, history_outputs):
+_UR_RF_COMPONENT = re.compile(r"(?<![A-Za-z0-9_])(RF|U)([123])((?:_[A-Za-z0-9]+)*)(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+def _reference_component(row):
+    output = str(row.get("output") or "").strip()
+    # Structured Abaqus output names are authoritative. A description merely
+    # mentioning U3 must not turn an energy/UR/custom output into displacement.
+    match = (_UR_RF_COMPONENT.fullmatch(output) if output else
+             _UR_RF_COMPONENT.search(_formula_source_name(row)))
+    if match is None:
+        return None
+    return match.group(1).upper(), int(match.group(2)), match.group(3).upper()
+
+
+def _reference_context(row):
+    context = row.get("historyRegion") or row.get("regionDescription")
+    if not context:
+        label = _formula_source_name(row)
+        match = _UR_RF_COMPONENT.search(label)
+        context = label[match.end():].strip(" :;,") if match is not None else ""
+    return " ".join(str(context or "").split()).casefold()
+
+
+def _formula_selector_text(row, pattern):
+    text = "\n".join(str(row.get(key) or "") for key in
+                     ("displayName", "name", "output", "historyRegion", "id"))
+    # Generated selectors explicitly request these reserved metadata lines.
+    # Keep the original haystack/anchor semantics for every existing formula.
+    if "@reference-" in pattern:
+        component = _reference_component(row)
+        output = "{}{}{}".format(*component) if component is not None else ""
+        step = " ".join(str(row.get("step") or "").split()).casefold()
+        text += "\n@reference-output={}\n@reference-step={}\n@reference-region={}".format(
+            output, step, _reference_context(row))
+    return text
+
+
+def _formula_pattern_matches(row, pattern, regex, explicit=False):
+    if explicit and '@reference-' not in pattern:
+        # regex("^U3$") must match a name, not a concatenation padded with
+        # empty metadata lines. Legacy rules keep their historical haystack.
+        return any(regex.search(str(row.get(key))) for key in
+                   ('displayName', 'name', 'output', 'historyRegion', 'id') if row.get(key))
+    return regex.search(_formula_selector_text(row, pattern))
+
+
+def _selector_curves(pattern, history_outputs, *, explicit=False):
     try:
         regex = re.compile(str(pattern or ""), re.IGNORECASE)
     except re.error as exc:
@@ -531,9 +869,7 @@ def _selector_curves(pattern, history_outputs):
     matched, available = [], []
     for row in history_outputs or []:
         name = _formula_source_name(row)
-        haystack = "\n".join(str(row.get(key) or "") for key in
-                             ("displayName", "name", "output", "historyRegion", "id"))
-        if regex.search(haystack):
+        if _formula_pattern_matches(row, str(pattern or ''), regex, explicit):
             matched.append(name)
             points = []
             for point in row.get("points") or []:
@@ -594,27 +930,77 @@ def _formula_name(function, curves):
     return "{}({})".format(function, ", ".join(names))
 
 
-def _evaluate_formula_expr(expr, history_outputs):
+def _evaluate_formula_expr(expr, history_outputs, *, strict=False):
     if expr.kind == "number":
         return float(expr.value)
     if expr.kind == "selector":
-        return _selector_curves(expr.value, history_outputs)
+        return _selector_curves(expr.value, history_outputs, explicit=strict)
+    if expr.kind == "unary":
+        value = _evaluate_formula_expr(expr.args[0], history_outputs, strict=strict)
+        factor = -1 if expr.value == "-" else 1
+        if not isinstance(value, list):
+            return factor * value
+        return [{"name": "{}({})".format(expr.value, curve["name"]),
+                 "points": [[x, factor * y] for x, y in curve["points"]]} for curve in value]
+    if expr.kind == "binary":
+        values = [_evaluate_formula_expr(arg, history_outputs, strict=strict) for arg in expr.args]
+
+        def operation(a, b):
+            if expr.value == "+": return a + b
+            if expr.value == "-": return a - b
+            if expr.value == "*": return a * b
+            if expr.value == "/": return a / b
+            if expr.value == "%": return a % b
+            if expr.value == "**": return math.pow(a, b)
+            raise AssertionError(expr.value)
+
+        if not any(isinstance(value, list) for value in values):
+            try:
+                result = operation(*values)
+            except (ZeroDivisionError, ValueError, OverflowError) as exc:
+                raise ValueError("Invalid arithmetic domain, overflow or division by zero in formula.") from exc
+            if not math.isfinite(result):
+                raise ValueError("Arithmetic expression produced a non-finite value.")
+            return result
+        result = []
+        for group in _formula_curve_groups(values):
+            curves = [item for item in group if isinstance(item, dict)]
+            aligned = _formula_align(curves)
+            if not aligned:
+                raise ValueError("Matched History Outputs do not share common sample times.")
+            points = []
+            for x, ys in aligned:
+                samples = iter(ys)
+                operands = [next(samples) if isinstance(item, dict) else item for item in group]
+                try:
+                    out = operation(*operands)
+                except (ZeroDivisionError, ValueError, OverflowError) as exc:
+                    if strict:
+                        raise ValueError('Invalid arithmetic domain, overflow or division by zero in formula.') from exc
+                    continue  # Same sample-skipping policy as divide().
+                if strict and not math.isfinite(out):
+                    raise ValueError('Arithmetic expression produced a non-finite value.')
+                if math.isfinite(out):
+                    points.append([x, out])
+            if not points:
+                raise ValueError("Arithmetic expression produced no finite points.")
+            names = [item["name"] if isinstance(item, dict) else "{:g}".format(item) for item in group]
+            result.append({"name": "({} {} {})".format(names[0], expr.value, names[1]), "points": points})
+        return result
 
     fn = expr.value
     aliases = {"sum": "add", "sub": "subtract", "mul": "multiply",
                "div": "divide", "avg": "average", "mean": "average",
                "mag": "magnitude", "neg": "negate"}
     fn = aliases.get(fn, fn)
-    supported = {"combine", "add", "subtract", "multiply", "divide",
-                 "average", "magnitude", "abs", "negate", "sqrt",
-                 "square", "scale", "offset"}
+    supported = _FORMULA_FUNCTIONS
     if fn not in supported:
         raise ValueError("Unknown formula function '{}'.".format(expr.value))
-    values = [_evaluate_formula_expr(arg, history_outputs) for arg in expr.args]
+    values = [_evaluate_formula_expr(arg, history_outputs, strict=strict) for arg in expr.args]
 
-    if fn in {"abs", "negate", "sqrt", "square"}:
-        if len(values) != 1 or not isinstance(values[0], list):
-            raise ValueError("{}() expects one History Output expression.".format(fn))
+    if fn in _FORMULA_MATH:
+        if len(values) != 1:
+            raise ValueError("{}() expects one expression.".format(fn))
     elif fn in {"scale", "offset"}:
         if len(values) != 2 or not isinstance(values[0], list) or isinstance(values[1], list):
             raise ValueError("{}() expects (series, number).".format(fn))
@@ -625,18 +1011,30 @@ def _evaluate_formula_expr(expr, history_outputs):
         if len(values) < 2 or not all(isinstance(value, list) for value in values):
             raise ValueError("{}() expects two or more History Output expressions.".format(fn))
 
-    if fn in {"abs", "negate", "sqrt", "square"}:
+    if fn in _FORMULA_MATH:
+        operation = _FORMULA_MATH[fn]
+        if not isinstance(values[0], list):
+            try:
+                out = operation(values[0])
+            except (ValueError, OverflowError, ZeroDivisionError) as exc:
+                raise ValueError('Invalid domain or overflow in {}().'.format(fn)) from exc
+            if not math.isfinite(out):
+                raise ValueError('Non-finite result in {}().'.format(fn))
+            return out
         result = []
         for curve in values[0]:
             points = []
             for x, y in curve["points"]:
-                if fn == "abs": out = abs(y)
-                elif fn == "negate": out = -y
-                elif fn == "sqrt":
-                    if y < 0: continue
-                    out = math.sqrt(y)
-                else: out = y * y
-                points.append([x, out])
+                try:
+                    out = operation(y)
+                except (ValueError, OverflowError, ZeroDivisionError) as exc:
+                    if strict:
+                        raise ValueError('Invalid domain or overflow in {}().'.format(fn)) from exc
+                    continue
+                if strict and not math.isfinite(out):
+                    raise ValueError('Non-finite result in {}().'.format(fn))
+                if math.isfinite(out):
+                    points.append([x, out])
             result.append({"name": "{}({})".format(fn, curve["name"]), "points": points})
         return result
 
@@ -671,10 +1069,15 @@ def _evaluate_formula_expr(expr, history_outputs):
                         zero = True
                         break
                     out /= value
-                if zero: continue
+                if zero:
+                    if strict:
+                        raise ValueError('Division by zero in formula.')
+                    continue
             elif fn == "average": out = sum(ys) / len(ys)
             elif fn == "magnitude": out = math.sqrt(sum(value * value for value in ys))
             else: raise AssertionError(fn)
+            if strict and not math.isfinite(out):
+                raise ValueError("Formula '{}' produced a non-finite value.".format(fn))
             if math.isfinite(out):
                 points.append([x, out])
         if not points:
@@ -683,25 +1086,28 @@ def _evaluate_formula_expr(expr, history_outputs):
     return result
 
 
-def validate_reference_formula(formula):
+def validate_reference_formula(formula, *, explicit_regex=False):
     """Validate formula syntax without requiring any current History Output."""
-    expr = _parse_formula_expr(formula)
-    if expr.kind != "call":
+    explicit = explicit_regex or _uses_explicit_regex(formula)
+    expr = _parse_explicit_formula(formula) if explicit else _parse_formula_expr(formula)
+    if expr.kind not in {"call", "binary", "unary"} and not (explicit and expr.kind == 'selector'):
         raise ValueError(
-            "A formula must start with a function, for example "
-            "combine(.*U1, .*RF1).")
-    allowed = {
-        "combine", "add", "subtract", "multiply", "divide", "average",
-        "magnitude", "abs", "negate", "sqrt", "square", "scale", "offset",
-    }
+            "Use a function, signed selector or arithmetic expression, for example "
+            'combine(regex(".*U3.*"), -regex(".*RF3.*")).')
+    allowed = _FORMULA_FUNCTIONS
+    selectors = []
 
     def visit(node):
+        if node.kind == 'selector':
+            selectors.append(node)
         if node.kind == "call":
             if str(node.value).casefold() not in allowed:
                 raise ValueError("Unknown formula function '{}'.".format(node.value))
-            for child in node.args:
-                visit(child)
+        for child in node.args:
+            visit(child)
     visit(expr)
+    if explicit and not selectors:
+        raise ValueError('Use at least one regex("pattern") History Output selector.')
     return True
 
 
@@ -717,25 +1123,26 @@ def resolve_reference_formula_ids(formula, history_outputs):
     def collect(node):
         if node.kind == "selector":
             selectors.append(str(node.value or ""))
-        elif node.kind == "call":
+        else:
             for child in node.args:
                 collect(child)
     collect(expr)
 
     ids = []
+    explicit = _uses_explicit_regex(formula)
     for selector in selectors:
         pattern = re.compile(selector, re.IGNORECASE)
         for row in history_outputs or []:
-            if pattern.search(_formula_source_name(row)):
+            if _formula_pattern_matches(row, selector, pattern, explicit):
                 item_id = str(row.get("id") or "")
                 if item_id and item_id not in ids:
                     ids.append(item_id)
     return ids
 
 
-def make_formula_reference(formula, name=None, enabled=True):
+def make_formula_reference(formula, name=None, enabled=True, *, explicit_regex=False):
     """Create a persistent regex/formula rule without evaluating Plot data."""
-    validate_reference_formula(formula)
+    validate_reference_formula(formula, explicit_regex=explicit_regex)
     formula = str(formula).strip()
     label = str(name or "").strip() or formula
     return validate_reference({
@@ -743,6 +1150,77 @@ def make_formula_reference(formula, name=None, enabled=True):
         "formula": formula,
         "enabled": enabled,
     })
+
+
+def generate_reference_ur_rf(history_outputs=None, *, directions=(1, 2, 3),
+                             antialiasing=True, reverse_u=False, reverse_rf=True):
+    """Generate same-direction U/RF rules, scoped per Plot step/history region.
+
+    Catalog metadata is sufficient; point data need not be loaded yet. Without
+    a catalog, return portable component-regex templates instead of inventing
+    node identities. Never zip unrelated regions or broadcast a missing pair.
+    """
+    if isinstance(directions, (str, int)):
+        directions = (directions,)
+    try:
+        axes = tuple(dict.fromkeys(int(axis) for axis in directions))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Choose direction 1, 2 or 3.") from exc
+    if not axes or any(axis not in (1, 2, 3) for axis in axes):
+        raise ValueError("Choose direction 1, 2 or 3.")
+    rows = list(history_outputs or [])
+
+    def rule(axis, suffix, step="", region="", *, scoped=False):
+        def selector(component, reverse):
+            variable = "{}{}{}".format(component, axis, suffix)
+            if scoped:
+                pattern = (r"(?m)^@reference-output=" + re.escape(variable) + r"$"
+                           + r"(?=[\s\S]*^@reference-step=" + re.escape(step) + r"$)"
+                           + r"(?=[\s\S]*^@reference-region=" + re.escape(region) + r"$)")
+            else:
+                pattern = r".*\b" + re.escape(variable) + r"\b.*"
+            return ("-" if reverse else "") + 'regex({})'.format(json.dumps(pattern, ensure_ascii=False))
+
+        formula = "combine({}, {})".format(selector("U", reverse_u), selector("RF", reverse_rf))
+        name = "U{}-RF{}{}".format(axis, axis, suffix)
+        if region:
+            name += " | " + region
+        if step:
+            name += " | " + step
+        return make_formula_reference(formula, name)
+
+    if not rows:
+        suffix = "_ANTIALIASING" if antialiasing else ""
+        return [rule(axis, suffix) for axis in axes]
+
+    groups = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        component = _reference_component(row)
+        if component is None:
+            continue
+        kind, axis, suffix = component
+        filtered = "ANTIALIASING" in suffix.split("_")
+        if axis not in axes or (antialiasing and not filtered) or (not antialiasing and suffix):
+            continue
+        step = " ".join(str(row.get("step") or "").split()).casefold()
+        region = _reference_context(row)
+        group = groups.setdefault((axis, suffix, step, region), {"U": {}, "RF": {}})
+        identity = str(row.get("id") or "") or id(row)
+        group[kind][identity] = row
+
+    generated = []
+    for (axis, suffix, step, region), pair in sorted(groups.items()):
+        if not pair["U"] or not pair["RF"]:
+            continue
+        if len(pair["U"]) != 1 or len(pair["RF"]) != 1:
+            raise ValueError("Ambiguous U{0}/RF{0} pair in the same step/region; more than one matching output exists.".format(axis))
+        generated.append(rule(axis, suffix, step, region, scoped=True))
+    if not generated:
+        raise ValueError("No same-direction U/RF {}pair found in the same step and history region.".format(
+            "ANTIALIASING " if antialiasing else "unfiltered "))
+    return generated
 
 
 def evaluate_reference_formula(formula, history_outputs):
@@ -753,9 +1231,11 @@ def evaluate_reference_formula(formula, history_outputs):
     validated reference-series dictionaries ready for the Reference Chart library.
     """
     expr = _parse_formula_expr(formula)
-    if expr.kind != "call":
-        raise ValueError("A formula must start with a function, for example combine(.*U1, .*RF1).")
-    curves = _evaluate_formula_expr(expr, history_outputs)
+    if expr.kind not in {"call", "binary", "unary"} and not (_uses_explicit_regex(formula) and expr.kind == 'selector'):
+        raise ValueError('Use regex("pattern") in a formula, for example combine(regex(".*U3.*"), -regex(".*RF3.*")).')
+    curves = _evaluate_formula_expr(expr, history_outputs, strict=_uses_explicit_regex(formula))
+    if not isinstance(curves, list):
+        raise ValueError("A reference formula must use at least one History Output expression.")
     return [validate_reference(curve) for curve in curves]
 
 

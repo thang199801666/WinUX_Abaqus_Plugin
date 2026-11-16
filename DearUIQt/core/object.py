@@ -14,6 +14,36 @@ class Qt:
     Horizontal = 1
     Vertical = 2
 
+    # Qt.AlignmentFlag values.  These are intentionally Qt-compatible so
+    # layout/widget code can keep familiar bitwise alignment contracts.
+    AlignLeft = 0x0001
+    AlignRight = 0x0002
+    AlignHCenter = 0x0004
+    AlignJustify = 0x0008
+    AlignAbsolute = 0x0010
+    AlignTop = 0x0020
+    AlignBottom = 0x0040
+    AlignVCenter = 0x0080
+    AlignBaseline = 0x0100
+    AlignHorizontal_Mask = AlignLeft | AlignRight | AlignHCenter | AlignJustify | AlignAbsolute
+    AlignVertical_Mask = AlignTop | AlignBottom | AlignVCenter | AlignBaseline
+    AlignCenter = AlignHCenter | AlignVCenter
+
+    # Qt.TextFlag subset used by QFontMetrics/QLabel layout negotiation.
+    TextSingleLine = 0x0100
+    TextDontClip = 0x0200
+    TextExpandTabs = 0x0400
+    TextShowMnemonic = 0x0800
+    TextWordWrap = 0x1000
+    TextWrapAnywhere = 0x2000
+    TextIncludeTrailingSpaces = 0x08000000
+
+    # Qt.TextElideMode values.
+    ElideLeft = 0
+    ElideRight = 1
+    ElideMiddle = 2
+    ElideNone = 3
+
     # Qt.ScrollBarPolicy values.  DearUIQt backends may map AlwaysOn and
     # AsNeeded to the same native primitive when the renderer has no separate
     # always-visible scrollbar mode, but applications can retain the Qt API.
@@ -63,6 +93,32 @@ class Qt:
     MatchCaseSensitive = 0x0010
     MatchWrap = 0x0020
     MatchRecursive = 0x0040
+
+    # Qt.DockWidgetArea values used by QMainWindow/QDockWidget.
+    NoDockWidgetArea = 0x00
+    LeftDockWidgetArea = 0x01
+    RightDockWidgetArea = 0x02
+    TopDockWidgetArea = 0x04
+    BottomDockWidgetArea = 0x08
+    AllDockWidgetAreas = (
+        LeftDockWidgetArea | RightDockWidgetArea
+        | TopDockWidgetArea | BottomDockWidgetArea)
+
+    # Qt.WindowState values used by QWidget top-level presentation APIs.
+    WindowNoState = 0x00000000
+    WindowMinimized = 0x00000001
+    WindowMaximized = 0x00000002
+    WindowFullScreen = 0x00000004
+    WindowActive = 0x00000008
+
+    # Qt.FocusPolicy values.  These keep Qt's bit layout so callers can use
+    # ``policy & Qt.TabFocus`` / ``policy & Qt.ClickFocus`` exactly as they do
+    # with a native Qt binding.
+    NoFocus = 0x0
+    TabFocus = 0x1
+    ClickFocus = 0x2
+    StrongFocus = TabFocus | ClickFocus | 0x8
+    WheelFocus = StrongFocus | 0x4
 
     # Keyboard modifier bit flags use Qt-compatible values so wrapper code can
     # retain the familiar ``event.modifiers() & Qt.ControlModifier`` contract
@@ -142,6 +198,12 @@ class Qt:
 
     # QWidget attribute used by close() ownership semantics.
     WA_DeleteOnClose = 55
+
+    # Qt.ShortcutContext values.
+    WidgetShortcut = 0
+    WindowShortcut = 1
+    ApplicationShortcut = 2
+    WidgetWithChildrenShortcut = 3
 
 
 class QPoint:
@@ -573,28 +635,68 @@ class QMargins:
 
 
 class QSizePolicy:
-    """Small Qt-compatible widget sizing policy.
+    """Qt-compatible retained widget sizing policy.
 
-    The policy is retained metadata used by DearUIQt layouts.  It deliberately
-    stays toolkit-neutral: layouts can decide whether a hidden item contributes
-    a size hint without crossing into DearPyGui, while future backends can map
-    the horizontal/vertical policies to native stretch behaviour.
+    The object is a compact value type: every QWidget owns one policy, so using
+    slots avoids a per-widget instance dictionary while keeping copy/value
+    semantics.  The policy/flag values match Qt's public QSizePolicy enums.
+
+    Height-for-width and width-for-height are metadata contracts.  Concrete
+    widgets/layouts may opt in by setting the corresponding flag and overriding
+    ``heightForWidth``/``widthForHeight``; DearUIQt does not invent a ratio.
     """
 
-    Fixed = 0
-    Minimum = 1
-    Maximum = 4
-    Preferred = 5
-    Expanding = 7
-    MinimumExpanding = 3
-    Ignored = 13
+    # Qt QSizePolicy::PolicyFlag values. Policies below are the same bitwise
+    # combinations used by Qt (for example Preferred == Grow|Shrink).
+    GrowFlag = 0x1
+    ExpandFlag = 0x2
+    ShrinkFlag = 0x4
+    IgnoreFlag = 0x8
 
-    def __init__(self, horizontal=Preferred, vertical=Preferred):
+    Fixed = 0
+    Minimum = GrowFlag
+    Maximum = ShrinkFlag
+    Preferred = GrowFlag | ShrinkFlag
+    Expanding = GrowFlag | ShrinkFlag | ExpandFlag
+    MinimumExpanding = GrowFlag | ExpandFlag
+    Ignored = GrowFlag | ShrinkFlag | IgnoreFlag
+
+    # Qt QSizePolicy::ControlType values. Keeping them here avoids a backend-
+    # specific control classification table and lets styles/layouts make the
+    # same kind of spacing decisions later in M3.
+    DefaultType = 0x00000001
+    ButtonBox = 0x00000002
+    CheckBox = 0x00000004
+    ComboBox = 0x00000008
+    Frame = 0x00000010
+    GroupBox = 0x00000020
+    Label = 0x00000040
+    Line = 0x00000080
+    LineEdit = 0x00000100
+    PushButton = 0x00000200
+    RadioButton = 0x00000400
+    Slider = 0x00000800
+    SpinBox = 0x00001000
+    TabWidget = 0x00002000
+    ToolButton = 0x00004000
+
+    __slots__ = (
+        "_horizontal", "_vertical",
+        "_horizontal_stretch", "_vertical_stretch",
+        "_retain_size_when_hidden",
+        "_height_for_width", "_width_for_height",
+        "_control_type",
+    )
+
+    def __init__(self, horizontal=Preferred, vertical=Preferred, controlType=DefaultType):
         self._horizontal = int(horizontal)
         self._vertical = int(vertical)
         self._horizontal_stretch = 0
         self._vertical_stretch = 0
         self._retain_size_when_hidden = False
+        self._height_for_width = False
+        self._width_for_height = False
+        self._control_type = int(controlType)
 
     def horizontalPolicy(self):
         return self._horizontal
@@ -626,6 +728,24 @@ class QSizePolicy:
     def setRetainSizeWhenHidden(self, retain):
         self._retain_size_when_hidden = bool(retain)
 
+    def hasHeightForWidth(self):
+        return self._height_for_width
+
+    def setHeightForWidth(self, enabled):
+        self._height_for_width = bool(enabled)
+
+    def hasWidthForHeight(self):
+        return self._width_for_height
+
+    def setWidthForHeight(self, enabled):
+        self._width_for_height = bool(enabled)
+
+    def controlType(self):
+        return self._control_type
+
+    def setControlType(self, control_type):
+        self._control_type = int(control_type)
+
     def expandingDirections(self):
         directions = 0
         if self._horizontal in (self.Expanding, self.MinimumExpanding):
@@ -634,12 +754,34 @@ class QSizePolicy:
             directions |= Qt.Vertical
         return directions
 
+    def transpose(self):
+        """Swap horizontal/vertical policy metadata in-place, as Qt does."""
+        self._horizontal, self._vertical = self._vertical, self._horizontal
+        self._horizontal_stretch, self._vertical_stretch = (
+            self._vertical_stretch, self._horizontal_stretch)
+        self._height_for_width, self._width_for_height = (
+            self._width_for_height, self._height_for_width)
+
+    def transposed(self):
+        other = self.copy()
+        other.transpose()
+        return other
+
     def copy(self):
-        other = QSizePolicy(self._horizontal, self._vertical)
+        other = QSizePolicy(self._horizontal, self._vertical, self._control_type)
         other._horizontal_stretch = self._horizontal_stretch
         other._vertical_stretch = self._vertical_stretch
         other._retain_size_when_hidden = self._retain_size_when_hidden
+        other._height_for_width = self._height_for_width
+        other._width_for_height = self._width_for_height
         return other
+
+    def __repr__(self):
+        return ("QSizePolicy({}, {}, hStretch={}, vStretch={}, hfw={}, wfh={}, "
+                "controlType={})").format(
+            self._horizontal, self._vertical, self._horizontal_stretch,
+            self._vertical_stretch, self._height_for_width,
+            self._width_for_height, self._control_type)
 
     def __eq__(self, other):
         if not isinstance(other, QSizePolicy):
@@ -649,7 +791,10 @@ class QSizePolicy:
             self._vertical == other._vertical and
             self._horizontal_stretch == other._horizontal_stretch and
             self._vertical_stretch == other._vertical_stretch and
-            self._retain_size_when_hidden == other._retain_size_when_hidden
+            self._retain_size_when_hidden == other._retain_size_when_hidden and
+            self._height_for_width == other._height_for_width and
+            self._width_for_height == other._width_for_height and
+            self._control_type == other._control_type
         )
 
 
@@ -689,7 +834,18 @@ class QEvent:
     StyleChange = 25
     PaletteChange = 26
     ApplicationPaletteChange = 27
+    ScreenChangeInternal = 28
+    DevicePixelRatioChange = 29
+    Wheel = 30
+    Shortcut = 31
+    WindowStateChange = 32
+    Move = 33
+    Resize = 34
+    Expose = 35
+    ActivationChange = 36
     User = 1000
+
+    __slots__ = ("_type", "payload", "_accepted")
 
     def __init__(self, event_type, **payload):
         self._type = int(event_type)
@@ -710,89 +866,21 @@ class QEvent:
 
 
 class QCloseEvent(QEvent):
+    __slots__ = ()
+
     def __init__(self):
         super().__init__(QEvent.Close)
 
 
-class QKeyEvent(QEvent):
-    """Toolkit-neutral Qt-style keyboard event.
-
-    DearPyGui key constants are intentionally preserved as the key value.  The
-    retained wrapper therefore does not need a second key-code translation
-    table, while modifiers use stable Qt-compatible bit flags.
-    """
-
-    def __init__(self, event_type, key, modifiers=Qt.NoModifier, *, text="",
-                 auto_repeat=False, count=1):
-        if event_type not in (QEvent.KeyPress, QEvent.KeyRelease, QEvent.ShortcutOverride):
-            raise ValueError("QKeyEvent requires a keyboard QEvent type")
-        super().__init__(event_type)
-        self._key = key
-        self._modifiers = int(modifiers)
-        self._text = str(text or "")
-        self._auto_repeat = bool(auto_repeat)
-        self._count = max(1, int(count))
-
-    def key(self):
-        return self._key
-
-    def modifiers(self):
-        return self._modifiers
-
-    def text(self):
-        return self._text
-
-    def isAutoRepeat(self):
-        return self._auto_repeat
-
-    def count(self):
-        return self._count
-
-
-class QMouseEvent(QEvent):
-    """Toolkit-neutral Qt-style pointer event.
-
-    Positions are retained as global/client coordinates supplied by the host
-    bridge.  Optimized surfaces can therefore participate in Qt-like dispatch
-    without becoming QWidget instances or polling a second native callback
-    stream.
-    """
-
-    def __init__(self, event_type, position=(0.0, 0.0), *,
-                 button=Qt.NoButton, buttons=Qt.NoButton,
-                 modifiers=Qt.NoModifier):
-        if event_type not in (
-                QEvent.MouseButtonPress, QEvent.MouseButtonRelease,
-                QEvent.MouseMove):
-            raise ValueError("QMouseEvent requires a mouse QEvent type")
-        super().__init__(event_type)
-        try:
-            x, y = position
-        except (TypeError, ValueError):
-            raise TypeError("position must be a two-value sequence")
-        self._position = QPointF(x, y)
-        self._button = int(button)
-        self._buttons = int(buttons)
-        self._modifiers = int(modifiers)
-
-    def position(self):
-        return self._position
-
-    def globalPosition(self):
-        return self._position
-
-    def button(self):
-        return self._button
-
-    def buttons(self):
-        return self._buttons
-
-    def modifiers(self):
-        return self._modifiers
+# GUI input event implementations live in DearUIQt.gui.events.
+# Compatibility aliases are imported near the end of this module so existing
+# QtCore imports continue to work while QtCore no longer owns the classes.
 
 
 class QChildEvent(QEvent):
     """Qt-style child ownership notification delivered to the parent object."""
+
+    __slots__ = ("_child",)
 
     def __init__(self, event_type, child):
         if event_type not in (QEvent.ChildAdded, QEvent.ChildRemoved):
@@ -810,19 +898,48 @@ class QChildEvent(QEvent):
         return self.type() == QEvent.ChildRemoved
 
 
+# Shared only by short connection-publication steps, never by slot invocation
+# or user-defined callable equality. No per-signal mutex allocation is needed.
+_SIGNAL_CONNECTION_LOCK = threading.Lock()
+
+
 class SignalConnection:
+    __slots__ = ("signal", "slot", "receiver", "queued", "active")
+
     def __init__(self, signal, slot, receiver, queued):
         self.signal, self.slot, self.receiver, self.queued = signal, slot, receiver, queued
         self.active = True
 
+    def queue(self, args):
+        """Queue delivery against the receiver's *current* thread affinity.
+
+        A receiver may legally move after emit() but before its queued slot is
+        delivered.  The first scheduler callback therefore acts only as a wake
+        token; QObject._queue_to_affinity forwards it to the latest affinity if
+        the object moved in the meantime.
+        """
+        receiver = self.receiver
+        if receiver is None or receiver._deleted or not self.active:
+            return False
+        return receiver._queue_to_affinity(self.deliver, args)
+
     def disconnect(self):
-        if not self.active:
-            return
-        self.active = False
-        self.signal._slots.remove(self)
-        if self.receiver is not None:
-            self.receiver._connections.discard(self)
-        self.slot = self.receiver = None
+        with _SIGNAL_CONNECTION_LOCK:
+            if not self.active:
+                return
+            self.active = False
+            slots = self.signal._slots
+            if len(slots) == 1:
+                if slots[0] is self:
+                    self.signal._slots = ()
+            elif slots:
+                self.signal._slots = tuple(connection for connection in slots if connection is not self)
+            # Keep strong locals until after unlocking: releasing the last slot
+            # reference may run a finalizer that connects/disconnects a signal.
+            slot, receiver = self.slot, self.receiver
+            if receiver is not None:
+                receiver._connections.discard(self)
+            self.slot = self.receiver = None
 
     def deliver(self, args):
         if self.active and (self.receiver is None or not self.receiver._deleted):
@@ -833,8 +950,13 @@ class SignalConnection:
 
 
 class Signal:
+    __slots__ = ("_slots", "owner")
+
     def __init__(self, owner=None):
-        self._slots = []
+        # Most widget signals are never connected. Share the empty tuple and
+        # publish immutable snapshots only when connections actually change.
+        # Emission can iterate its original snapshot without allocating a copy.
+        self._slots = ()
         self.owner = owner
 
     def connect(self, slot, connection_type=None, *, receiver=None, queued=None):
@@ -857,18 +979,26 @@ class Signal:
             raise RuntimeError("cannot connect a deleted receiver")
         if queued and (receiver is None or getattr(receiver, "_after", None) is None):
             raise ValueError("queued connections require a receiver with a UI scheduler")
-        for connection in self._slots:
-            if connection.slot == slot and connection.receiver is receiver and connection.queued == queued:
+        while True:
+            snapshot = self._slots
+            for connection in snapshot:
+                if connection.slot == slot and connection.receiver is receiver and connection.queued == queued:
+                    return connection
+            connection = SignalConnection(self, slot, receiver, queued)
+            with _SIGNAL_CONNECTION_LOCK:
+                if self._slots is not snapshot:
+                    continue
+                self._slots = snapshot + (connection,)
+                if receiver is not None:
+                    receiver._connections.add(connection)
                 return connection
-        connection = SignalConnection(self, slot, receiver, queued)
-        self._slots.append(connection)
-        if receiver is not None:
-            receiver._connections.add(connection)
-        return connection
 
     def disconnect(self, slot=None):
         if slot is None:
-            for connection in tuple(self._slots):
+            with _SIGNAL_CONNECTION_LOCK:
+                connections = self._slots
+                self._slots = ()
+            for connection in connections:
                 connection.disconnect()
         else:
             for connection in tuple(self._slots):
@@ -878,7 +1008,7 @@ class Signal:
     def emit(self, *args):
         if self.owner is not None and (self.owner._signals_blocked or self.owner._deleted):
             return
-        for connection in tuple(self._slots):
+        for connection in self._slots:
             if not connection.active:
                 continue
             auto_queue = (connection.queued is None and connection.receiver is not None and
@@ -886,13 +1016,29 @@ class Signal:
             if connection.queued or auto_queue:
                 if getattr(connection.receiver, "_after", None) is None:
                     raise RuntimeError("cross-thread signal delivery requires a receiver scheduler")
-                connection.receiver._after(0, connection.deliver, args)
+                connection.queue(args)
             else:
                 connection.deliver(args)
 
 
+def _remove_owned_child(parent, child):
+    """Fast tail unlink for reverse teardown; preserve sibling order."""
+    children = parent._children
+    if children and children[-1] is child:
+        children.pop()
+    else:
+        children.remove(child)
+
+
 class QObject:
-    """UI-thread-owned object tree with explicit, idempotent disposal."""
+    """UI-thread-owned object tree with explicit, idempotent disposal.
+
+    M11 keeps a weak process-local registry for diagnostics. The registry never
+    owns objects and therefore cannot turn a leak detector into a leak source.
+    """
+
+    _registry_lock = threading.RLock()
+    _live_objects = weakref.WeakSet()
 
     def __init__(self, parent=None, *, after=None):
         self.parent = None
@@ -909,7 +1055,66 @@ class QObject:
         self._object_name = ""
         self.destroyed = Signal()
         self.objectNameChanged = Signal(self)
+        with QObject._registry_lock:
+            QObject._live_objects.add(self)
         self.setParent(parent)
+
+    @classmethod
+    def liveObjects(cls, *, thread_id=None, include_deleted=False):
+        """Return a weak-registry snapshot without retaining objects globally."""
+        with QObject._registry_lock:
+            objects = list(QObject._live_objects)
+        result = []
+        for obj in objects:
+            if not isinstance(obj, cls):
+                continue
+            if not include_deleted and getattr(obj, "_deleted", False):
+                continue
+            if thread_id is not None and obj.threadId() != thread_id:
+                continue
+            result.append(obj)
+        return result
+
+    @classmethod
+    def rootObjects(cls, *, thread_id=None, include_deleted=False):
+        """Return parentless QObject roots, useful when hunting orphan windows."""
+        return [obj for obj in cls.liveObjects(thread_id=thread_id, include_deleted=include_deleted)
+                if getattr(obj, "parent", None) is None]
+
+    def diagnosticsSnapshot(self):
+        """Return side-effect-free QObject ownership/lifecycle diagnostics."""
+        parent = getattr(self, "parent", None)
+        return {
+            "type": type(self).__name__,
+            "object_name": self.objectName(),
+            "deleted": bool(self._deleted),
+            "thread_id": self.threadId(),
+            "has_parent": parent is not None,
+            "parent_type": None if parent is None else type(parent).__name__,
+            "parent_name": None if parent is None else getattr(parent, "objectName", lambda: "")(),
+            "child_count": len(self._children),
+            "signals_blocked": bool(self._signals_blocked),
+            "connection_count": len(self._connections),
+            "event_filter_count": len(self._event_filters),
+            "filter_target_count": len(self._filter_targets),
+            "delete_later_pending": bool(self._delete_later_pending),
+        }
+
+    def objectTreeSnapshot(self, *, max_depth=None):
+        """Return a nested, read-only snapshot of this QObject ownership tree."""
+        limit = None if max_depth is None else max(0, int(max_depth))
+
+        def build(obj, depth):
+            node = obj.diagnosticsSnapshot()
+            if limit is not None and depth >= limit:
+                node["children"] = []
+                node["truncated"] = bool(obj._children)
+                return node
+            node["children"] = [build(child, depth + 1) for child in tuple(obj._children)]
+            node["truncated"] = False
+            return node
+
+        return build(self, 0)
 
     def installEventFilter(self, filter_object):
         if self._deleted:
@@ -984,8 +1189,8 @@ class QObject:
         if not isinstance(event, QEvent):
             raise TypeError("event must be QEvent")
         try:
-            from .application import QApplication
-            application = QApplication.instance()
+            from .application import QCoreApplication
+            application = QCoreApplication.instance()
             if (application is not None and application is not self
                     and application.threadId() == self.threadId()):
                 return application.notify(self, event)
@@ -1019,7 +1224,7 @@ class QObject:
             return
         previous = self.parent
         if previous is not None:
-            previous._children.remove(self)
+            _remove_owned_child(previous, self)
         # ChildRemoved observers should see the new ownership state rather than
         # a stale pointer to the previous parent. This also makes re-entrant
         # ownership inspection match Qt's already-applied object tree.
@@ -1038,6 +1243,53 @@ class QObject:
             worker_id = affinity.workerThreadId()
             return affinity.affinityId() if worker_id is None else worker_id
         return self._thread_id
+
+    def _queue_to_affinity(self, callback, *args):
+        """Schedule a guarded callback on this QObject's current affinity.
+
+        The wake token holds only a weak receiver reference. This preserves
+        QPointer/delete-before-delivery semantics while still allowing a stale
+        source-thread wake to forward itself after moveToThread().
+        """
+        if self._deleted:
+            return False
+        scheduler = self._after
+        if not callable(scheduler):
+            raise RuntimeError("queued delivery requires a receiver scheduler")
+        receiver_ref = weakref.ref(self)
+        weak_callback = None
+        if getattr(callback, "__self__", None) is self:
+            try:
+                weak_callback = weakref.WeakMethod(callback)
+            except TypeError:
+                pass
+            else:
+                callback = None
+
+        def deliver():
+            target = receiver_ref()
+            if target is None or target._deleted:
+                return
+            if threading.get_ident() != target.threadId():
+                latest = target._after
+                if not callable(latest):
+                    return
+                latest(0, deliver)
+                return
+            current = weak_callback() if weak_callback is not None else callback
+            if callable(current):
+                current(*args)
+
+        scheduler(0, deliver)
+        return True
+
+    def _thread_affinity_about_to_change(self, previous_thread, current_thread):
+        """Subclass hook while the source affinity/scheduler is still active."""
+        return None
+
+    def _thread_affinity_changed(self, previous_thread, current_thread):
+        """Subclass hook after moveToThread installs the target scheduler."""
+        return None
 
     def thread(self):
         """Return the QThread affinity object, or ``None`` for the creator thread."""
@@ -1067,9 +1319,12 @@ class QObject:
             raise RuntimeError("cannot move to a deleted QThread")
 
         def apply(obj):
+            previous_thread = obj._thread_affinity
+            obj._thread_affinity_about_to_change(previous_thread, thread)
             obj.sendEvent(QEvent(QEvent.ThreadChange, thread=thread))
             obj._thread_affinity = thread
             obj._after = thread.after
+            obj._thread_affinity_changed(previous_thread, thread)
             for child in tuple(obj._children):
                 apply(child)
 
@@ -1124,9 +1379,19 @@ class QObject:
         if self._after is None:
             raise RuntimeError("deferred deletion requires a UI scheduler")
         self._delete_later_pending = True
+        affinity = self._thread_affinity
+        if affinity is not None:
+            defer_delete = getattr(affinity, "deferDelete", None)
+            if callable(defer_delete):
+                try:
+                    if defer_delete(self._delete_later):
+                        return
+                except Exception:
+                    self._delete_later_pending = False
+                    raise
         try:
-            from .application import QApplication
-            application = QApplication.instance()
+            from .application import QCoreApplication
+            application = QCoreApplication.instance()
             if application is not None and application.threadId() == self.threadId():
                 if application.postEvent(self, QEvent(QEvent.DeferredDelete)):
                     return
@@ -1152,8 +1417,8 @@ class QObject:
         # tree dies. Let QApplication do that once for the recursive delete
         # transaction instead of rescanning its queues for every child object.
         try:
-            from .application import QApplication
-            application = QApplication.instance()
+            from .application import QCoreApplication
+            application = QCoreApplication.instance()
             if (application is not None and application is not self
                     and application.threadId() == self.threadId()):
                 owns_delete_transaction = application._begin_object_tree_delete(self)
@@ -1181,7 +1446,7 @@ class QObject:
             if self.parent is not None:
                 previous = self.parent
                 try:
-                    previous._children.remove(self)
+                    _remove_owned_child(previous, self)
                 except ValueError:
                     pass
                 self.parent = None
@@ -1221,20 +1486,35 @@ class QMetaObject:
         if direct:
             callback(*args, **kwargs)
             return True
-        scheduler = getattr(receiver, "_after", None)
-        if scheduler is None:
+        if getattr(receiver, "_after", None) is None:
             raise RuntimeError("queued invocation requires a receiver scheduler")
         guard = QPointer(receiver)
+        method_name = method if isinstance(method, str) else None
+        weak_callback = None
+        if method_name is not None:
+            # Validation above must not leave the bound method in the queued
+            # closure: that would defeat QPointer and retain a deleted target.
+            callback = None
+        elif getattr(callback, '__self__', None) is receiver:
+            try:
+                weak_callback = weakref.WeakMethod(callback)
+            except TypeError:
+                pass
+            else:
+                callback = None
 
         def deliver():
             target = guard.data()
             if target is None:
                 return
-            current = getattr(target, method, None) if isinstance(method, str) else callback
+            if method_name is not None:
+                current = getattr(target, method_name, None)
+            else:
+                current = weak_callback() if weak_callback is not None else callback
             if callable(current):
                 current(*args, **kwargs)
 
-        scheduler(0, deliver)
+        receiver._queue_to_affinity(deliver)
         return True
 
     @staticmethod
@@ -1338,4 +1618,5 @@ class QSignalBlocker:
         self._active = False
 
 
-__all__ = ["Qt", "QPoint", "QPointF", "QSize", "QRect", "QMargins", "QSizePolicy", "QEvent", "QCloseEvent", "QKeyEvent", "QMouseEvent", "QChildEvent", "QObject", "QMetaObject", "QPointer", "Signal", "SignalConnection", "QSignalBlocker"]
+
+__all__ = ["Qt", "QPoint", "QPointF", "QSize", "QRect", "QMargins", "QSizePolicy", "QEvent", "QCloseEvent", "QChildEvent", "QObject", "QMetaObject", "QPointer", "Signal", "SignalConnection", "QSignalBlocker"]

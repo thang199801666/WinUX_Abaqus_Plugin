@@ -6,7 +6,7 @@ from DearUIQt.backends import dpg
 from DearUIQt.widgets import QWidget, QToolBar
 from DearUIQt.layouts import QGridLayout
 from DearUIQt.themes import body_theme, surface_theme
-from ..dialogs.folder_browser_style import browser_toolbar_theme, browser_layout_theme
+from ..dialogs.selectors.folder_browser_style import browser_toolbar_theme, browser_layout_theme
 from DearUIQt.backends.dearpygui import dpg_window_rect
 from DearUIQt.gui import QtFusionPalette
 
@@ -33,10 +33,19 @@ class ToolPanel(QWidget):
             width=-1, height=-1, border=False, no_scrollbar=not scroll,
             no_scroll_with_mouse=not scroll, **options)
         super().__init__(tag, parent=parent, after=after, backend=backend)
-        if padding is None:
-            backend.bind_item_theme(tag, body_theme())
+        self._tool_padding = None if padding is None else tuple(padding)
+        self._tool_spacing = tuple(spacing)
+        self.refreshTheme()
+
+    def refreshTheme(self):
+        if self._deleted:
+            return False
+        if self._tool_padding is None:
+            self.backend.bind_item_theme(self.tag, body_theme())
         else:
-            style_tool_surface(tag, padding=padding, spacing=spacing, backend=backend)
+            style_tool_surface(
+                self.tag, padding=self._tool_padding, spacing=self._tool_spacing, backend=self.backend)
+        return True
 
 
 class ToolWorkspace(QGridLayout):
@@ -67,9 +76,15 @@ class ToolBar(QToolBar):
             "", parent=parent, after=after, backend=backend,
             movable=False, floatable=False)
         backend.configure_item(self.tag, height=36)
-        backend.bind_item_theme(self.tag, browser_toolbar_theme())
+        self.refreshTheme()
         self.box_layout = self.layout()
         self.content = self.box_layout.tag
+
+    def refreshTheme(self):
+        if self._deleted:
+            return False
+        self.backend.bind_item_theme(self.tag, browser_toolbar_theme())
+        return True
 
 
 class ToolCommandRow(QGridLayout):

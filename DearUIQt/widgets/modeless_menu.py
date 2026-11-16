@@ -53,6 +53,9 @@ class QModelessMenu(QObject):
         self._context = None
         self._last_open_time = 0.0
         self._last_open_position = None
+        self._owner_anchor = None
+        self._owner_offset = None
+        self._popup_global_position = False
         self._themes = []
 
         self._normal_theme = self._make_row_theme(
@@ -242,7 +245,88 @@ class QModelessMenu(QObject):
     def is_open(self):
         return bool(self._visible)
 
-    def popup(self, position=None, *, context=None):
+    def _screen_to_renderer_point(self, point):
+        """Map a desktop-screen point into the primary viewport client space.
+
+        Dear PyGui's top-level retained windows are positioned in viewport
+        client coordinates, while context-menu anchors are desktop screen
+        coordinates.  On Windows, use the actual primary HWND instead of
+        guessing from ``get_mouse_pos(local=False)`` because that value varies
+        between embedded/native Dear PyGui builds.
+        """
+        point = point if isinstance(point, QPoint) else QPoint(*point)
+        try:
+            import ctypes
+            from ctypes import wintypes
+            from ..backends.native_windows import NativeWindowBackend
+            native = NativeWindowBackend(self.backend)
+            hwnd = int(native.primaryWinId() or 0) if native.isEnabled() else 0
+            if hwnd:
+                value = wintypes.POINT(int(point.x()), int(point.y()))
+                user32 = ctypes.windll.user32
+                user32.ScreenToClient.argtypes = [
+                    wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+                user32.ScreenToClient.restype = wintypes.BOOL
+                if user32.ScreenToClient(
+                        wintypes.HWND(hwnd), ctypes.byref(value)):
+                    return QPoint(int(value.x), int(value.y))
+        except Exception:
+            pass
+        try:
+            getter = getattr(self.backend, "get_viewport_pos", None)
+            origin = getter() if callable(getter) else (0, 0)
+            return QPoint(
+                int(point.x() - float(origin[0] or 0)),
+                int(point.y() - float(origin[1] or 0)))
+        except Exception:
+            return QPoint(point.x(), point.y())
+
+    def popupGlobal(self, position=None, *, context=None, owner=None):
+        """Open at an unambiguous desktop-screen position.
+
+        This mirrors ``QMenu.popupGlobal`` while preserving QModelessMenu's
+        non-capturing modeless lifecycle.
+        """
+        if position is None:
+            from ..gui.system import QCursor
+            position = QCursor.screenPos(backend=self.backend)
+        point = position if isinstance(position, QPoint) else QPoint(*position)
+        point = self._panel.clampPosition(point)
+        normalized = point.toTuple()
+        now = time.monotonic()
+        duplicate = (
+            self._visible and self._popup_global_position
+            and self._last_open_position == normalized
+            and now - self._last_open_time < 0.12
+        )
+        self._last_open_time = now
+        self._last_open_position = normalized
+        self._context = context
+        if duplicate:
+            return True
+        self.aboutToShow.emit()
+        local_point = self._screen_to_renderer_point(point)
+        # A freshly shown top-level DearPyGui window can remain behind the
+        # primary window when it is displayed without focus.  Context menus
+        # are transient command surfaces and must be raised just like QMenu.
+        self._panel.showAt(local_point, clamp=False, focus=True)
+        self._visible = True
+        self._popup_global_position = True
+        tag = getattr(owner, 'tag', owner)
+        if tag is None:
+            tag = getattr(self.parent, 'tag', None)
+        if tag is not None and tag != self.tag:
+            from ..gui.placement import item_screen_rect
+            rect = item_screen_rect(self.backend, tag)
+            self._owner_anchor = tag
+            self._owner_offset = (point.x() - rect[0], point.y() - rect[1])
+            from ..gui.popup_tracking import track_popup
+            track_popup(self)
+        enabled = self._enabled_actions()
+        self._set_current(enabled[0] if enabled else None)
+        return True
+
+    def popup(self, position=None, *, context=None, owner=None):
         if position is None:
             from ..gui.system import QCursor
             position = QCursor.pos(backend=self.backend)
@@ -260,21 +344,61 @@ class QModelessMenu(QObject):
         if duplicate:
             return True
         self.aboutToShow.emit()
-        self._panel.showAt(point, clamp=False, focus=False)
+        self._panel.showAt(point, clamp=False, focus=True)
         self._visible = True
+        self._popup_global_position = False
+        tag = getattr(owner, 'tag', owner)
+        if tag is None:
+            tag = getattr(self.parent, 'tag', None)
+        if tag is not None and tag != self.tag:
+            from ..gui.placement import item_screen_rect
+            rect = item_screen_rect(self.backend, tag)
+            self._owner_anchor = tag
+            self._owner_offset = (point.x() - rect[0], point.y() - rect[1])
+            from ..gui.popup_tracking import track_popup
+            track_popup(self)
         enabled = self._enabled_actions()
         self._set_current(enabled[0] if enabled else None)
         return True
 
+    def exists(self):
+        return not self._deleted and self._panel.exists()
+
+    def isVisible(self):
+        return self._visible and self._panel.isVisible()
+
+    def _refresh_popup_position(self):
+        tag = self._owner_anchor
+        if tag is None or self._owner_offset is None:
+            return
+        from ..gui.placement import visible_item_screen_rect
+        rect = visible_item_screen_rect(self.backend, tag)
+        if rect is None:
+            self.hide()
+            return
+        point = self._panel.clampPosition((rect[0] + self._owner_offset[0],
+                                           rect[1] + self._owner_offset[1]))
+        if point.toTuple() != self._last_open_position:
+            self._last_open_position = point.toTuple()
+            target = (self._screen_to_renderer_point(point)
+                      if self._popup_global_position else point)
+            self._panel.move(target)
+
     def hide(self):
+        from ..gui.popup_tracking import untrack_popup
+        untrack_popup(self)
+        self._owner_anchor = self._owner_offset = None
         if self._visible:
             self.aboutToHide.emit()
         self._visible = False
+        self._popup_global_position = False
         self._set_current(None)
         self._panel.hide()
         return True
 
     def containsGlobalPoint(self, point):
+        if self._popup_global_position:
+            point = self._screen_to_renderer_point(point)
         return self._panel.containsGlobalPoint(point)
 
     def context(self):
@@ -283,6 +407,9 @@ class QModelessMenu(QObject):
     def delete(self):
         if self._deleted:
             return
+        from ..gui.popup_tracking import untrack_popup
+        untrack_popup(self)
+        self._owner_anchor = self._owner_offset = None
         self._visible = False
         self._current_action = None
         self._context = None

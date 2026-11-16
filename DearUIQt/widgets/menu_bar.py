@@ -10,8 +10,8 @@ from __future__ import annotations
 
 from ..core.object import QObject
 from .menu import QMenu
-from ..gui.palette import QtFusionMetrics, QtFusionPalette
-from ..gui.system import QCursor
+from ..gui.palette import QtFusionPalette
+from ..gui.style import metrics_for_backend
 
 
 _MENU_BAR_THEME_TAG = "dearuiqt.qt.menubar.buttons.rev1"
@@ -19,7 +19,14 @@ _MENU_BAR_ACTIVE_THEME_TAG = "dearuiqt.qt.menubar.buttons.active.rev1"
 
 
 def _theme(backend, *, active=False):
-    tag = _MENU_BAR_ACTIVE_THEME_TAG if active else _MENU_BAR_THEME_TAG
+    metrics = metrics_for_backend(backend)
+    base = _MENU_BAR_ACTIVE_THEME_TAG if active else _MENU_BAR_THEME_TAG
+    try:
+        from ..gui.palette import color_scheme
+        scheme = color_scheme().lower()
+    except Exception:
+        scheme = "light"
+    tag = '{}.{}.dpi{}'.format(base, scheme, metrics.control_height)
     try:
         if backend.does_item_exist(tag):
             return tag
@@ -33,8 +40,8 @@ def _theme(backend, *, active=False):
             backend.add_theme_color(backend.mvThemeCol_ButtonHovered, p.HIGHLIGHT_HOVER)
             backend.add_theme_color(backend.mvThemeCol_ButtonActive, p.HIGHLIGHT_SOFT)
             backend.add_theme_color(backend.mvThemeCol_Text, p.TEXT)
-            backend.add_theme_style(backend.mvStyleVar_FramePadding, 6, 2)
-            backend.add_theme_style(backend.mvStyleVar_FrameRounding, QtFusionMetrics.BUTTON_ROUNDING)
+            backend.add_theme_style(backend.mvStyleVar_FramePadding, metrics.menu_bar_pad_x, metrics.menu_bar_pad_y)
+            backend.add_theme_style(backend.mvStyleVar_FrameRounding, metrics.button_rounding)
             backend.add_theme_style(backend.mvStyleVar_FrameBorderSize, 0)
         with backend.theme_component(backend.mvAll):
             backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 0, 0)
@@ -50,13 +57,15 @@ class QMenuBar(QObject):
     until the popup closes.
     """
 
-    def __init__(self, parent=None, *, backend=None, after=None, height=20):
+    def __init__(self, parent=None, *, backend=None, after=None, height=None):
         super().__init__(parent, after=after)
         if backend is None:
             from ..backends import get_backend
             backend = get_backend()
         self.backend = backend
-        self.height = max(18, int(height))
+        metrics = metrics_for_backend(backend)
+        self._dpi_auto_height = height is None
+        self.height = max(metrics.menu_bar_height, int(height)) if height is not None else metrics.menu_bar_height
         self._menus = []
         self._buttons = {}
         self._handlers = []
@@ -67,6 +76,54 @@ class QMenuBar(QObject):
         if native_parent is not None:
             options["parent"] = native_parent
         self.tag = backend.add_group(horizontal=True, horizontal_spacing=0, **options)
+        if parent is None:
+            try:
+                from ..gui.dpi import register_dpi_root
+                register_dpi_root(self, self.backend)
+            except Exception:
+                pass
+
+    def _dpi_changed(self, old_dpi, new_dpi):
+        from ..core.object import QEvent
+        self.sendEvent(QEvent(QEvent.DevicePixelRatioChange, oldDpi=old_dpi, dpi=new_dpi,
+                              oldScale=float(old_dpi) / 96.0, scale=float(new_dpi) / 96.0))
+        metrics = metrics_for_backend(self.backend, item=self)
+        if self._dpi_auto_height:
+            self.height = metrics.menu_bar_height
+        for button in tuple(self._buttons.values()):
+            try:
+                if self.backend.does_item_exist(button):
+                    if self._dpi_auto_height:
+                        self.backend.configure_item(button, height=self.height)
+                    self.backend.bind_item_theme(
+                        button, _theme(self.backend, active=button == self._active_button))
+            except Exception:
+                pass
+        return True
+
+    def refreshTheme(self):
+        """Rebind the complete menu-bar stack after a palette change.
+
+        Root buttons and their retained :class:`QMenu` instances are created
+        at application start.  Rebinding only the buttons leaves every popup
+        on the palette that existed when the menu was constructed, producing
+        a Light popup below an otherwise Dark menu bar.  Refresh the owned
+        menus as part of the same operation so all top-level/submenu chrome is
+        rebuilt from the current Qt/Fusion palette.
+        """
+        for button in tuple(self._buttons.values()):
+            try:
+                if self.backend.does_item_exist(button):
+                    self.backend.bind_item_theme(
+                        button, _theme(self.backend, active=button == self._active_button))
+            except Exception:
+                pass
+        for menu in tuple(self._menus):
+            try:
+                menu.refreshTheme()
+            except Exception:
+                pass
+        return True
 
     def addMenu(self, title, menu_or_actions=()):
         if isinstance(menu_or_actions, QMenu):
@@ -174,37 +231,15 @@ class QMenuBar(QObject):
             return None
 
     def _button_anchor_screen_rect(self, rect):
-        """Convert a renderer-local menu-bar rect to desktop screen space.
-
-        Top-level DPG popup windows are positioned in desktop coordinates on
-        the Windows multi-viewport runtime, while menu-bar button geometry is
-        reported in viewport/client coordinates.  Calibrate with the physical
-        cursor and the renderer-local cursor at interaction time; their delta
-        is the exact client origin even with title bars, DPI scaling, move or
-        maximize.  If a backend already reports screen-space item rectangles,
-        detect that from the cursor hit before applying the offset.
-        """
+        """Map the anchor through its owner, including programmatic opens."""
         x, y, width, height = map(float, rect)
         try:
-            screen = QCursor.screenPos(backend=self.backend)
-            local = QCursor.localPos(backend=self.backend)
-            sx, sy = float(screen.x()), float(screen.y())
-            lx, ly = float(local.x()), float(local.y())
-            screen_hit = x <= sx <= x + width and y <= sy <= y + height
-            local_hit = x <= lx <= x + width and y <= ly <= y + height
-            if screen_hit and not local_hit:
-                return x, y, width, height
-            dx, dy = sx - lx, sy - ly
-            if local_hit or abs(dx) > 1.0 or abs(dy) > 1.0:
-                return x + dx, y + dy, width, height
-        except Exception:
-            pass
-        try:
-            getter = getattr(self.backend, "get_viewport_pos", None)
-            viewport = getter() if callable(getter) else None
-            if viewport is not None:
-                vx, vy = float(viewport[0]), float(viewport[1])
-                return x + vx, y + vy, width, height
+            from ..gui.placement import item_screen_rect
+            first = next(self._buttons[menu] for menu in self._menus
+                         if self._buttons.get(menu) is not None)
+            sx, sy, _right, _bottom = item_screen_rect(self.backend, first)
+            rx, ry = self.backend.get_item_rect_min(first)
+            return x + sx - rx, y + sy - ry, width, height
         except Exception:
             pass
         return x, y, width, height
@@ -222,6 +257,18 @@ class QMenuBar(QObject):
         menu = user_data
         if self._active_menu is None or menu is self._active_menu:
             return
+        # Item-hover callbacks are queued. A native popup/focus change can
+        # leave stale callbacks for a previously hovered sibling in the queue;
+        # only switch to the button physically under the cursor now.
+        button = self._buttons.get(menu)
+        rect = self._button_anchor_rect(button) if button is not None else None
+        if rect is None:
+            return
+        from ..gui.system import QCursor
+        x, y, width, height = self._button_anchor_screen_rect(rect)
+        point = QCursor.screenPos(backend=self.backend)
+        if not (x <= point.x() < x + width and y <= point.y() < y + height):
+            return
         if self._menu_is_shown(self._active_menu):
             self._open_menu(menu)
 
@@ -229,6 +276,8 @@ class QMenuBar(QObject):
         button = self._buttons.get(menu)
         if button is None:
             return False
+        if menu is self._active_menu and self._menu_is_shown(menu):
+            return True
         old_menu = self._active_menu
         old_button = self._active_button
         if old_menu is not None and old_menu is not menu:
@@ -245,8 +294,21 @@ class QMenuBar(QObject):
             # anchor once and keep the whole popup tree in global space.
             gx, gy, _gwidth, gheight = self._button_anchor_screen_rect(rect)
             global_popup_y = float(gy) + float(gheight)
+            popup_below = getattr(menu, "popupBelow", None)
             popup_global = getattr(menu, "popupGlobal", None)
-            if callable(popup_global):
+            if callable(popup_below):
+                def anchor():
+                    from ..gui.placement import visible_item_screen_rect
+                    if visible_item_screen_rect(self.backend, button) is None:
+                        return None
+                    current = self._button_anchor_rect(button)
+                    if current is None:
+                        return None
+                    ax, ay, aw, ah = self._button_anchor_screen_rect(current)
+                    return ax, ay, ax + aw, ay + ah
+                shown = bool(popup_below(
+                    (gx, gy, gx + _gwidth, global_popup_y), anchor_provider=anchor))
+            elif callable(popup_global):
                 shown = bool(popup_global((gx, global_popup_y)))
             else:
                 # Compatibility for lightweight/test menus without popupGlobal.
@@ -276,6 +338,11 @@ class QMenuBar(QObject):
     def delete(self):
         if self._deleted:
             return
+        try:
+            from ..gui.dpi import unregister_dpi_participant
+            unregister_dpi_participant(self, self.backend)
+        except Exception:
+            pass
         for menu in tuple(self._menus):
             try:
                 menu.delete()

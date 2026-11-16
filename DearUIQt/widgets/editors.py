@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import inspect
 
-from ..core.object import Signal
+from ..core.object import Signal, Qt
 from ..gui.style import (
     bind_theme, line_edit_theme, spin_editor_theme, spin_shell_theme,
-    spin_button_theme, spin_button_stack_theme, METRICS,
+    spin_button_theme, spin_button_stack_theme, METRICS, metrics_for_backend,
 )
+from ..gui.palette import QtFusionPalette
 from .widget import QWidget
 from ._utils import _bind_focus_state_handlers, _delete_aux_item
 
@@ -29,6 +30,12 @@ class ImGuiLineEdit(QWidget):
         self.textEdited = Signal()
         self.returnPressed = Signal()
         self.editingFinished = Signal()
+        self.editStarted = Signal()
+        self.editCommitted = Signal()
+        self.editCanceled = Signal()
+        self.escapePressed = Signal()
+        self.navigationRequested = Signal()
+        self._edit_controller = None
         self._modified = False
         self._editing_dirty = False
         self._key_handlers = None
@@ -51,6 +58,11 @@ class ImGuiLineEdit(QWidget):
         self.textEdited.owner = self
         self.returnPressed.owner = self
         self.editingFinished.owner = self
+        self.editStarted.owner = self
+        self.editCommitted.owner = self
+        self.editCanceled.owner = self
+        self.escapePressed.owner = self
+        self.navigationRequested.owner = self
         self._properties.update(value=str(options["default_value"]), enabled=bool(options.get("enabled", True)),
                                 readonly=bool(options["readonly"]),
                                 placeholder=str(options.get("hint", "")),
@@ -71,11 +83,95 @@ class ImGuiLineEdit(QWidget):
                 with self.backend.handler_registry() as self._key_handlers:
                     self.backend.add_key_press_handler(
                         key=self.backend.mvKey_Return, callback=self._return_pressed)
+                    escape = getattr(self.backend, "mvKey_Escape", None)
+                    if escape is not None:
+                        self.backend.add_key_press_handler(key=escape, callback=self._escape_pressed)
+                    tab = getattr(self.backend, "mvKey_Tab", None)
+                    if tab is not None:
+                        self.backend.add_key_press_handler(key=tab, callback=self._tab_pressed)
                     numpad = getattr(self.backend, "mvKey_NumPadEnter", None)
                     if numpad is not None:
                         self.backend.add_key_press_handler(key=numpad, callback=self._return_pressed)
         except (AttributeError, TypeError, RuntimeError):
             pass
+
+    def shortcutOverrideEvent(self, event):
+        # Native InputText owns standard editing shortcuts.  Accept them at
+        # ShortcutOverride time so window-level QAction shortcuts (notably
+        # QUndoStack Ctrl+Z/Ctrl+Shift+Z) do not steal editor undo/redo/copy.
+        modifiers = int(event.modifiers())
+        control = bool(modifiers & Qt.ControlModifier)
+        if control and event.key() in (
+                Qt.Key_Z, Qt.Key_Y, Qt.Key_A, Qt.Key_C, Qt.Key_X, Qt.Key_V):
+            event.accept()
+            return
+        super().shortcutOverrideEvent(event)
+
+    def setUndoStack(self, stack, *, label="Edit text", merge_key=None):
+        """Attach a QUndoStack-backed property edit controller to this editor."""
+        from ..gui.property_edit import QPropertyEditController
+        if self._edit_controller is None:
+            self._edit_controller = QPropertyEditController(
+                getter=self.text, setter=self._set_text, undo_stack=stack,
+                label=label, merge_key=merge_key, parent=self)
+            self._edit_controller.started.connect(
+                lambda *_: self.editStarted.emit(), receiver=self)
+            self._edit_controller.committed.connect(
+                lambda value, *_: self.editCommitted.emit(value), receiver=self)
+            self._edit_controller.canceled.connect(
+                lambda *_: self.editCanceled.emit(), receiver=self)
+        else:
+            self._edit_controller.setUndoStack(stack)
+            self._edit_controller.setLabel(label)
+            self._edit_controller.setMergeKey(merge_key)
+        return True
+
+    def undoStack(self):
+        return self._edit_controller.undoStack() if self._edit_controller is not None else None
+
+    def editController(self):
+        return self._edit_controller
+
+    def editTransaction(self):
+        return self._edit_controller.transaction() if self._edit_controller is not None else None
+
+    def _begin_user_edit(self, before):
+        controller = self._edit_controller
+        if controller is not None and not controller.isActive():
+            controller.begin(value=before)
+
+    def _commit_user_edit(self):
+        controller = self._edit_controller
+        if controller is not None and controller.isActive():
+            controller.commit(self.text())
+
+    def _escape_pressed(self, *_args):
+        if self._deleted or not self.hasFocus():
+            return
+        self.escapePressed.emit()
+        if self._deleted:
+            return
+        controller = self._edit_controller
+        if controller is not None and controller.isActive():
+            controller.cancel()
+            self._modified = self._editing_dirty = False
+            self.editingFinished.emit()
+
+
+    def _tab_pressed(self, *_args):
+        if self._deleted or not self.hasFocus() or not self.isEnabled():
+            return
+        backward = False
+        try:
+            left = getattr(self.backend, "mvKey_LShift", None)
+            right = getattr(self.backend, "mvKey_RShift", None)
+            checker = getattr(self.backend, "is_key_down", None)
+            if callable(checker):
+                backward = bool((left is not None and checker(left)) or
+                                (right is not None and checker(right)))
+        except Exception:
+            backward = False
+        self.navigationRequested.emit(-1 if backward else 1)
 
     def _return_pressed(self, *_args):
         if self._deleted or not self.hasFocus() or not self.isEnabled():
@@ -83,6 +179,7 @@ class ImGuiLineEdit(QWidget):
         value = self.text()
         if value != self._properties.get("value"):
             self._changed(self.tag, value)
+        self._commit_user_edit()
         self._editing_dirty = False
         self.returnPressed.emit()
         self.editingFinished.emit()
@@ -90,8 +187,22 @@ class ImGuiLineEdit(QWidget):
     def _finish_editing(self, *_args):
         if self._deleted or not self._editing_dirty:
             return
+        self._commit_user_edit()
         self._editing_dirty = False
         self.editingFinished.emit()
+
+    def _apply_typography_geometry(self):
+        # InputText height is theme-driven; rebuilding the theme with the new
+        # font-aware metrics re-centres the baseline without replacing editor.
+        self._refresh_style()
+        self.updateGeometry()
+
+    def baselineOffset(self, width=None):
+        del width
+        from ..gui.system import QFontMetrics
+        metrics = metrics_for_backend(self.backend)
+        return metrics.editor_frame_pad_y + QFontMetrics(
+            self.font(), backend=self.backend).ascent()
 
     def isModified(self):
         self._require_ui()
@@ -106,9 +217,14 @@ class ImGuiLineEdit(QWidget):
     def _changed(self, sender, value, *_args):
         if not self._deleted:
             value = str(value)
-            changed = self._properties.get("value") != value
+            old_value = self._properties.get("value")
+            changed = old_value != value
+            if changed:
+                self._begin_user_edit(old_value)
             self._user_value(value)
             if changed:
+                if self._edit_controller is not None and self._edit_controller.isActive():
+                    self._edit_controller.update(value, live=False)
                 if self._updates is not None:
                     self._updates.discard("modified")
                 self._modified = self._editing_dirty = True
@@ -142,6 +258,11 @@ class ImGuiLineEdit(QWidget):
 
     def _set_text(self, text):
         changed = self._properties.get("value") != text
+        if not changed and self.text() != text:
+            # An active native InputText can write its private buffer back
+            # after a programmatic set. A repeated setText must reconcile the
+            # displayed value, not be dropped solely by the retained cache.
+            self.backend.set_value(self.tag, text)
         self._set_value(text)
         self._modified = self._editing_dirty = False
         if changed:
@@ -266,7 +387,7 @@ class _ImGuiAbstractSpinBox(QWidget):
     """
 
     _kind = "int"
-    _button_width = METRICS.spin_arrow_width
+    _button_width = 14
 
     def _layout_tag(self):
         return self.container
@@ -276,16 +397,25 @@ class _ImGuiAbstractSpinBox(QWidget):
                  callback=None):
         backend, parent_options = self._construction(parent, backend)
         self.valueChanged = Signal()
+        self.editingFinished = Signal()
+        self.editStarted = Signal()
+        self.editCommitted = Signal()
+        self.editCanceled = Signal()
+        self._edit_controller = None
         self._external_callback = callback
         self._minimum = minimum
         self._maximum = maximum
         self._single_step = step
         self._decimals = int(decimals)
         self._handlers = None
+        self._key_handlers = None
         self._arrow_handlers = []
         self._arrow_triangles = []
+        self._arrow_surfaces = []
+        self._arrow_visual_states = {}
         self._drawn_arrows = False
 
+        metrics = metrics_for_backend(backend)
         shell_width = -1 if width is None else int(width)
         native_parent = parent_options.get("parent")
         # Keep the complete framed spin box at the same 26 px height as the
@@ -293,7 +423,7 @@ class _ImGuiAbstractSpinBox(QWidget):
         # lower/taller than neighbouring combos and line edits in table rows.
         shell_options = {
             "width": shell_width,
-            "height": METRICS.control_height,
+            "height": metrics.control_height,
             "border": True,
             "no_scrollbar": True,
             "no_scroll_with_mouse": True,
@@ -303,7 +433,7 @@ class _ImGuiAbstractSpinBox(QWidget):
             shell_options["parent"] = native_parent
         self.container = backend.add_child_window(**shell_options)
 
-        inner_height = max(20, METRICS.control_height - 2 * METRICS.border_size)
+        inner_height = max(20, metrics.control_height - 2 * metrics.border_size)
         with backend.table(
             parent=self.container,
             header_row=False,
@@ -346,6 +476,10 @@ class _ImGuiAbstractSpinBox(QWidget):
 
         super().__init__(input_tag, parent=parent, after=after, backend=backend)
         self.valueChanged.owner = self
+        self.editingFinished.owner = self
+        self.editStarted.owner = self
+        self.editCommitted.owner = self
+        self.editCanceled.owner = self
         self.separator = None
         self.buttons = buttons
         bind_theme(backend, self.buttons, spin_button_stack_theme)
@@ -357,46 +491,46 @@ class _ImGuiAbstractSpinBox(QWidget):
                 bind_theme(backend, button, spin_button_theme, disabled=False)
         self._render_spin_arrows(enabled=True)
         self._bind_focus_handlers()
+        self._install_spin_key_handlers()
 
     def _create_spin_arrow(self, backend, height, direction):
         """Create a font-independent spin sub-control.
 
-        Real Dear PyGui backends use draw-triangle geometry. Test/minimal
+        Real Dear PyGui backends use compact Qt-style filled triangles. Test/minimal
         backends that do not expose drawlists fall back to a blank button --
         never to ``^``/``v`` glyphs that depend on the active font atlas.
         """
         if hasattr(backend, "add_drawlist") and hasattr(backend, "draw_triangle"):
             item = backend.add_drawlist(width=self._button_width, height=height)
-            # Paint only inside the existing arrow strip; the numeric editor
-            # remains white and keeps its original native input hit region.
+            # Qt/Fusion uses a narrow pair of flat sub-buttons inside the
+            # editor frame, not a separate pair of rounded push buttons.
+            background = None
             if hasattr(backend, "draw_rectangle"):
-                backend.draw_rectangle(
+                background = backend.draw_rectangle(
                     (0, 0), (self._button_width, height),
-                    color=(0, 0, 0, 0), fill=(240, 240, 240, 255), parent=item)
+                    color=(0, 0, 0, 0), fill=QtFusionPalette.BUTTON,
+                    rounding=2, parent=item)
             cx = self._button_width * 0.5
             cy = height * 0.5
             if direction > 0:
-                points = ((cx - 3.5, cy + 1.7),
-                          (cx + 3.5, cy + 1.7),
-                          (cx, cy - 2.2))
+                points = ((cx - 2.5, cy + 1.5),
+                          (cx + 2.5, cy + 1.5),
+                          (cx, cy - 1.5))
             else:
-                points = ((cx - 3.5, cy - 1.7),
-                          (cx + 3.5, cy - 1.7),
-                          (cx, cy + 2.2))
-            # Draw the editor/button divider as a true single-pixel line in
-            # the arrow strip.  The old dedicated 1 px table column acquired
-            # extra table/child geometry on Windows and looked 2-3 px thick.
+                points = ((cx - 2.5, cy - 1.5),
+                          (cx + 2.5, cy - 1.5),
+                          (cx, cy + 1.5))
             if hasattr(backend, "draw_line"):
-                try:
-                    backend.draw_line((0.5, 0), (0.5, height),
-                                      color=(188, 188, 188, 255),
-                                      thickness=1.0, parent=item)
-                except Exception:
-                    pass
+                backend.draw_line((.5, 0), (.5, height),
+                                  color=QtFusionPalette.BORDER, thickness=1, parent=item)
+                if direction < 0:
+                    backend.draw_line((1, .5), (self._button_width, .5),
+                                      color=QtFusionPalette.BORDER_LIGHT, thickness=1, parent=item)
             triangle = backend.draw_triangle(
-                *points, color=(40, 40, 40, 255), fill=(40, 40, 40, 255),
-                parent=item)
+                *points, color=QtFusionPalette.TEXT_MUTED,
+                fill=QtFusionPalette.TEXT_MUTED, parent=item)
             self._arrow_triangles.append(triangle)
+            self._arrow_surfaces.append((item, background, triangle))
             try:
                 with backend.item_handler_registry() as registry:
                     backend.add_item_clicked_handler(
@@ -404,6 +538,9 @@ class _ImGuiAbstractSpinBox(QWidget):
                         callback=lambda *_args, _direction=direction:
                             self.stepBy(_direction),
                     )
+                    if hasattr(backend, 'add_item_visible_handler'):
+                        backend.add_item_visible_handler(
+                            callback=lambda *_args, _item=item: self._refresh_arrow_feedback(_item))
                 backend.bind_item_handler_registry(item, registry)
                 self._arrow_handlers.append(registry)
             except Exception:
@@ -416,15 +553,57 @@ class _ImGuiAbstractSpinBox(QWidget):
         )
 
     def _render_spin_arrows(self, enabled=True):
-        """Do not mutate draw-triangle items after creation.
+        for item, _background, _triangle in self._arrow_surfaces:
+            self._refresh_arrow_feedback(item, enabled=enabled)
 
-        Some Dear PyGui 2.3.1 Windows builds report a low-level
-        ``configure_item`` SystemError for draw commands.  Enabled state is
-        already enforced by ``stepBy``/``isEnabled`` and the numeric editor,
-        so keeping the geometric arrow static is both safe and behaviorally
-        correct.
-        """
-        return
+    def _refresh_arrow_feedback(self, item, enabled=None):
+        """Paint each sub-button's hover/press state without rebuilding it."""
+        if getattr(self, '_deleted', False):
+            return
+        b = self.backend
+        if enabled is None:
+            enabled = bool(self._properties.get('enabled', True))
+        try:
+            state = b.get_item_state(item) or {}
+            hovered = bool(enabled and state.get('hovered', False))
+            pressed = bool(hovered and b.is_mouse_button_down(b.mvMouseButton_Left))
+            signature = bool(enabled), hovered, pressed
+            if self._arrow_visual_states.get(item) == signature:
+                return
+            p = QtFusionPalette
+            face = (p.BUTTON_DISABLED if not enabled else
+                    p.BUTTON_ACTIVE if pressed else
+                    p.BUTTON_HOVER if hovered else p.BUTTON)
+            ink = p.TEXT_DISABLED if not enabled else p.TEXT_MUTED
+            for arrow, background, triangle in self._arrow_surfaces:
+                if arrow == item:
+                    if background is not None:
+                        b.configure_item(background, fill=face)
+                    b.configure_item(triangle, color=ink, fill=ink)
+                    break
+            self._arrow_visual_states[item] = signature
+        except Exception:
+            # Optional decoration must not break editing on older backends.
+            return
+
+    def refreshTheme(self):
+        """Rebind palette-derived spin chrome after a live scheme change."""
+        if getattr(self, "_deleted", False):
+            return False
+        try:
+            bind_theme(self.backend, self.tag, spin_editor_theme,
+                       kind=self._kind, disabled=not bool(self._properties.get("enabled", True)))
+            bind_theme(self.backend, self.container, spin_shell_theme,
+                       focused=self.hasFocus(), disabled=not bool(self._properties.get("enabled", True)))
+            if not self._drawn_arrows:
+                for button in (self.up_button, self.down_button):
+                    bind_theme(self.backend, button, spin_button_theme,
+                               disabled=not bool(self._properties.get("enabled", True)))
+            self._arrow_visual_states.clear()
+            self._render_spin_arrows(enabled=bool(self._properties.get("enabled", True)))
+            return True
+        except Exception:
+            return False
 
     def _format_string(self):
         return "%.{}f".format(max(0, self._decimals))
@@ -440,13 +619,82 @@ class _ImGuiAbstractSpinBox(QWidget):
             value = min(value, self._coerce(self._maximum))
         return value
 
+    def setUndoStack(self, stack, *, label="Edit value", merge_key=None):
+        from ..gui.property_edit import QPropertyEditController
+        if merge_key is None:
+            merge_key = ("spin", id(self))
+        if self._edit_controller is None:
+            self._edit_controller = QPropertyEditController(
+                getter=self.value, setter=self._set_spin_value, undo_stack=stack,
+                label=label, merge_key=merge_key, parent=self)
+            self._edit_controller.started.connect(
+                lambda *_: self.editStarted.emit(), receiver=self)
+            self._edit_controller.committed.connect(
+                lambda value, *_: self.editCommitted.emit(value), receiver=self)
+            self._edit_controller.canceled.connect(
+                lambda *_: self.editCanceled.emit(), receiver=self)
+        else:
+            self._edit_controller.setUndoStack(stack)
+            self._edit_controller.setLabel(label)
+            self._edit_controller.setMergeKey(merge_key)
+        return True
+
+    def undoStack(self):
+        return self._edit_controller.undoStack() if self._edit_controller is not None else None
+
+    def editController(self):
+        return self._edit_controller
+
+    def editTransaction(self):
+        return self._edit_controller.transaction() if self._edit_controller is not None else None
+
+    def _finish_spin_edit(self, *_args):
+        controller = self._edit_controller
+        if controller is not None and controller.isActive():
+            controller.commit(self.value())
+            self.editingFinished.emit()
+        self._refresh_style()
+
+    def _install_spin_key_handlers(self):
+        try:
+            with self.backend.handler_registry() as self._key_handlers:
+                escape = getattr(self.backend, "mvKey_Escape", None)
+                if escape is not None:
+                    self.backend.add_key_press_handler(key=escape, callback=self._spin_escape_pressed)
+                enter = getattr(self.backend, "mvKey_Return", None)
+                if enter is not None:
+                    self.backend.add_key_press_handler(key=enter, callback=self._spin_return_pressed)
+                numpad = getattr(self.backend, "mvKey_NumPadEnter", None)
+                if numpad is not None:
+                    self.backend.add_key_press_handler(key=numpad, callback=self._spin_return_pressed)
+        except (AttributeError, TypeError, RuntimeError):
+            self._key_handlers = None
+
+    def _spin_escape_pressed(self, *_args):
+        if self._deleted or not self.hasFocus():
+            return
+        controller = self._edit_controller
+        if controller is not None and controller.isActive():
+            controller.cancel()
+            self.editingFinished.emit()
+            self._refresh_style()
+
+    def _spin_return_pressed(self, *_args):
+        if self._deleted or not self.hasFocus():
+            return
+        self._finish_spin_edit()
+
     def _changed(self, sender, value, *_args):
         if self._deleted:
             return
         value = self._clamp(value)
         old = self._properties.get("value")
+        if old != value and self._edit_controller is not None and not self._edit_controller.isActive():
+            self._edit_controller.begin(value=old)
         self._user_value(value)
         if old != value:
+            if self._edit_controller is not None and self._edit_controller.isActive():
+                self._edit_controller.update(value, live=False)
             self.valueChanged.emit(value)
         if callable(self._external_callback):
             try:
@@ -509,7 +757,11 @@ class _ImGuiAbstractSpinBox(QWidget):
     def stepBy(self, steps):
         if not self.isEnabled():
             return
-        self.setValue(self.value() + self._single_step * int(steps))
+        value = self._clamp(self.value() + self._single_step * int(steps))
+        if self._edit_controller is not None:
+            self._edit_controller.edit(value)
+        else:
+            self.setValue(value)
 
     def stepUp(self):
         self.stepBy(1)
@@ -561,7 +813,7 @@ class _ImGuiAbstractSpinBox(QWidget):
                 if hasattr(self.backend, "add_item_activated_handler"):
                     self.backend.add_item_activated_handler(callback=self._refresh_style)
                 if hasattr(self.backend, "add_item_deactivated_handler"):
-                    self.backend.add_item_deactivated_handler(callback=self._refresh_style)
+                    self.backend.add_item_deactivated_handler(callback=self._finish_spin_edit)
             self.backend.bind_item_handler_registry(self.tag, registry)
             self._handlers = registry
         except Exception:
@@ -572,11 +824,12 @@ class _ImGuiAbstractSpinBox(QWidget):
         if self._deleted:
             return
         handlers = self._handlers
+        key_handlers = self._key_handlers
         arrow_handlers = tuple(self._arrow_handlers)
         container = self.container
         # QObject/widget bookkeeping is anchored to the numeric editor tag.
         super().delete()
-        for item in (handlers, *arrow_handlers, container):
+        for item in (handlers, key_handlers, *arrow_handlers, container):
             try:
                 if item and self.backend.does_item_exist(item):
                     self.backend.delete_item(item)

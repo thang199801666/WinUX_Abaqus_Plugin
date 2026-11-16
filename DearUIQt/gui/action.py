@@ -2,7 +2,7 @@
 import itertools
 import threading
 
-from ..core.object import QObject, Signal
+from ..core.object import QObject, Signal, Qt
 
 _keys = itertools.count(1)
 
@@ -23,6 +23,8 @@ class QAction(QObject):
         self._icon = None
         self._data = None
         self._action_group = None
+        self._shortcuts = []
+        self._shortcut_context = Qt.WindowShortcut
 
     def _require_thread(self):
         if threading.get_ident() != self.threadId():
@@ -133,6 +135,34 @@ class QAction(QObject):
             self.toggle()
         self.triggered.emit(self._checked)
         return True
+
+
+    def shortcut(self):
+        from .shortcut import QKeySequence
+        return QKeySequence(self._shortcuts[0]) if self._shortcuts else QKeySequence()
+
+    def shortcuts(self):
+        from .shortcut import QKeySequence
+        return [QKeySequence(item) for item in self._shortcuts]
+
+    def setShortcut(self, shortcut):
+        self.setShortcuts([shortcut])
+
+    def setShortcuts(self, shortcuts):
+        from .shortcut import QKeySequence
+        self._require_thread()
+        if self._deleted:
+            raise RuntimeError("cannot configure a deleted action")
+        values = [QKeySequence(item) for item in shortcuts if QKeySequence(item)]
+        if values != self._shortcuts:
+            self._shortcuts = values
+            self.changed.emit()
+
+    def shortcutContext(self):
+        return self._shortcut_context
+
+    def setShortcutContext(self, context):
+        self._set("_shortcut_context", int(context))
 
     def actionGroup(self):
         return self._action_group

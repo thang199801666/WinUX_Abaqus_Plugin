@@ -208,10 +208,17 @@ def create_theme(spec: ThemeSpec, *, backend=None):
     if not isinstance(spec, ThemeSpec):
         raise TypeError("spec must be a ThemeSpec")
     backend = backend or get_backend()
-    if spec.cache and spec.tag and _theme_exists(backend, spec.tag):
-        return spec.tag
+    tag = spec.tag
+    if spec.cache and tag:
+        try:
+            from ..gui.palette import color_scheme
+            tag = "{}.{}".format(tag, color_scheme().lower())
+        except Exception:
+            pass
+    if spec.cache and tag and _theme_exists(backend, tag):
+        return tag
 
-    theme_kwargs = {"tag": spec.tag} if spec.tag is not None else {}
+    theme_kwargs = {"tag": tag} if tag is not None else {}
     with backend.theme(**theme_kwargs) as theme_id:
         for item in spec.components:
             target = _symbol(backend, item.target, optional=item.optional)

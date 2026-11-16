@@ -11,8 +11,9 @@ import tkinter as tk
 import tkinter.font as tkfont
 from tkinter import ttk
 
-from ..resources import apply_tk_app_icon
+from ..platform.resources import apply_tk_app_icon
 from DearUIQt.gui import QtFusionPalette, QtFusionMetrics, color_hex
+from DearUIQt.gui.palette import color_scheme, set_color_scheme
 from DearUIQt.interop import (
     QNativeScrollerMetrics, configure_ttk_scroller_styles, make_ttk_scroller,
 )
@@ -20,34 +21,54 @@ from ..platform.native_dialog_host import apply_native_qt_chrome
 
 
 class ModernDialogPalette:
-    """Qt/Fusion palette exposed as Tk colour strings."""
+    """Qt/Fusion palette exposed as Tk colour strings.
 
-    WINDOW = color_hex(QtFusionPalette.WINDOW)
-    SURFACE = color_hex(QtFusionPalette.BASE)
-    ALT_SURFACE = color_hex(QtFusionPalette.WINDOW_ALT)
-    FOOTER = color_hex(QtFusionPalette.WINDOW)
-    BORDER = color_hex(QtFusionPalette.BORDER)
-    BORDER_LIGHT = color_hex(QtFusionPalette.BORDER_LIGHT)
-    TEXT = color_hex(QtFusionPalette.TEXT)
-    MUTED = color_hex(QtFusionPalette.TEXT_MUTED)
-    PRIMARY = color_hex(QtFusionPalette.PRIMARY)
-    PRIMARY_HOVER = color_hex(QtFusionPalette.PRIMARY_HOVER)
-    PRIMARY_ACTIVE = color_hex(QtFusionPalette.PRIMARY_ACTIVE)
-    DANGER = color_hex(QtFusionPalette.DANGER)
-    DANGER_HOVER = color_hex(QtFusionPalette.DANGER_HOVER)
-    DANGER_ACTIVE = color_hex(QtFusionPalette.DANGER_ACTIVE)
-    SECONDARY = color_hex(QtFusionPalette.BUTTON)
-    SECONDARY_HOVER = color_hex(QtFusionPalette.BUTTON_HOVER)
-    SECONDARY_ACTIVE = color_hex(QtFusionPalette.BUTTON_ACTIVE)
-    HOVER = color_hex(QtFusionPalette.HIGHLIGHT_HOVER)
-    ACCENT = color_hex(QtFusionPalette.HIGHLIGHT)
-    SELECT = color_hex(QtFusionPalette.HIGHLIGHT_SOFT)
-    SELECT_INACTIVE = color_hex(QtFusionPalette.SELECTION_INACTIVE)
-    FOCUS = color_hex(QtFusionPalette.FOCUS)
-    INFO = "#e7f2fb"
-    WARNING = "#fff4ce"
-    ERROR = "#fde7e9"
-    SUCCESS = "#e7f4ea"
+    Values are refreshed in place whenever a native/Tk dialog is prepared so
+    helper-process dialogs follow the same saved Light/Dark preference as the
+    DearUIQt application.
+    """
+
+    @classmethod
+    def refresh_application_palette(cls):
+        p = QtFusionPalette
+        values = {
+            "WINDOW": p.WINDOW, "SURFACE": p.BASE, "ALT_SURFACE": p.WINDOW_ALT,
+            "FOOTER": p.WINDOW, "BORDER": p.BORDER, "BORDER_LIGHT": p.BORDER_LIGHT,
+            "TEXT": p.TEXT, "MUTED": p.TEXT_MUTED, "PRIMARY": p.PRIMARY,
+            "PRIMARY_HOVER": p.PRIMARY_HOVER, "PRIMARY_ACTIVE": p.PRIMARY_ACTIVE,
+            "DANGER": p.DANGER, "DANGER_HOVER": p.DANGER_HOVER,
+            "DANGER_ACTIVE": p.DANGER_ACTIVE, "SECONDARY": p.BUTTON,
+            "SECONDARY_HOVER": p.BUTTON_HOVER, "SECONDARY_ACTIVE": p.BUTTON_ACTIVE,
+            "HOVER": p.HIGHLIGHT_HOVER, "ACCENT": p.HIGHLIGHT,
+            "SELECT": p.HIGHLIGHT_SOFT, "SELECT_INACTIVE": p.SELECTION_INACTIVE,
+            "FOCUS": p.FOCUS,
+        }
+        for name, value in values.items():
+            setattr(cls, name, color_hex(value))
+        dark = color_scheme() == "Dark"
+        cls.INFO = color_hex(p.HIGHLIGHT_SOFT)
+        cls.WARNING = "#5a4a16" if dark else "#fff4ce"
+        cls.ERROR = "#5a2828" if dark else "#fde7e9"
+        cls.SUCCESS = "#244a30" if dark else "#e7f4ea"
+        return cls
+
+
+# Populate compatibility class attributes at import time; every style setup
+# refreshes them again from the active/saved scheme.
+ModernDialogPalette.refresh_application_palette()
+
+
+def sync_modern_theme_from_preferences(theme=None):
+    """Select the saved application theme inside Tk/native helper processes."""
+    if theme is None:
+        try:
+            from ..preferences.general import GeneralPreferences
+            theme = GeneralPreferences().load().get("ui_theme")
+        except Exception:
+            theme = color_scheme()
+    set_color_scheme(theme)
+    ModernDialogPalette.refresh_application_palette()
+    return color_scheme()
 
 
 class ModernDialogMetrics:
@@ -86,6 +107,7 @@ class ModernDialogMetrics:
 
 def configure_modern_ttk_styles(widget):
     """Install compact Qt/Fusion-like ttk styles into one Tk interpreter."""
+    ModernDialogPalette.refresh_application_palette()
     style = ttk.Style(widget)
     p = ModernDialogPalette
     try:

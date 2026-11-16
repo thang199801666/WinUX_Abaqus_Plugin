@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, Iterable, Optional
 
-from .explorer_list_view import ExplorerListView, ListViewItem
-from .explorer_themes import ListViewTheme
+from .explorer.list_view import ExplorerListView, ListViewItem
+from .explorer.themes import ListViewTheme
 from DearUIQt.widgets import QScrollerMetrics
 from DearUIQt.widgets import QFrame, QRetainedItem
 from DearUIQt.core import Qt, QItemInputBinding
 from DearUIQt.runtime import QGuiRuntime
+from DearUIQt.gui.palette import QtFusionPalette
 from .toolbar import ResourceTextures
 
 
@@ -38,6 +39,57 @@ class JobsView:
         ("---", None, None, True),
         ("Refresh", "refresh", "Refresh", True),
     )
+
+    @staticmethod
+    def _dark_palette_active():
+        """Detect the active palette from the live color roles, not stale state.
+
+        Job rows can be populated before/while Settings is rebinding retained
+        resources.  Deriving the mode from the palette that actually paints the
+        table prevents a Light semantic fill from surviving under Dark text.
+        """
+        base = tuple(QtFusionPalette.BASE[:3])
+        text = tuple(QtFusionPalette.TEXT[:3])
+        return sum(base) < sum(text)
+
+    @classmethod
+    def status_row_fill(cls, status):
+        """Return the semantic scheduler-status background for the live palette."""
+        normalized = str(status or "").strip().casefold()
+        dark = cls._dark_palette_active()
+        if normalized in ("r", "running"):
+            return (31, 78, 47, 255) if dark else (205, 244, 213, 255)
+        if normalized in ("q", "queued"):
+            return (92, 65, 27, 255) if dark else (255, 237, 213, 255)
+        return None
+
+    @classmethod
+    def status_row_text_color(cls, status):
+        """Return a foreground guaranteed to contrast with the semantic fill."""
+        fill = cls.status_row_fill(status)
+        if fill is None:
+            return None
+        # Relative-luminance approximation is enough for the two opaque semantic
+        # surfaces and deliberately ties foreground to the *actual fill* rather
+        # than to a separately cached application theme flag.
+        r, g, b = fill[:3]
+        luminance = (299 * r + 587 * g + 114 * b) / 1000.0
+        return (245, 248, 246, 255) if luminance < 145 else (31, 41, 34, 255)
+
+    @classmethod
+    def apply_status_visuals(cls, item):
+        status = item.data.get("status")
+        item.data["row_fill"] = cls.status_row_fill(status)
+        item.data["row_text_color"] = cls.status_row_text_color(status)
+        return item
+
+    def refreshTheme(self):
+        """Rebind Job Viewer chrome and recompute semantic row colors live."""
+        for item in self.listview.items:
+            self.apply_status_visuals(item)
+        self.listview.set_theme(self.listview.get_theme())
+        self.listview.refresh_row_visuals()
+        return self
 
     def __init__(self, parent: str | int, callbacks: Optional[Dict[str, Any]] = None):
         self.callbacks = callbacks or {}
@@ -142,19 +194,20 @@ class JobsView:
         apply_layout()
         self._gui_runtime.invokeNextFrame(apply_layout)
 
-    def _create_listview(self):
+    @classmethod
+    def job_context_menu(cls):
         menu = [
             {"id": action or label, "label": label, "action": action,
              "icon": ResourceTextures.get(icon) if icon else None,
              "enabled": enabled, "separator": action is None}
-            for label, action, icon, enabled in self.MENU
+            for label, action, icon, enabled in cls.MENU
         ]
         # ODB actions in Job Viewer resolve the job's output file from the
         # scheduler/job metadata first. They never depend on the Server file
         # pane selection or its current directory.
         menu.insert(1, {
             "id": "job_check_odb_group",
-            "label": "Check ODB",
+            "label": "Odb Tools",
             "icon": ResourceTextures.get("Check_File"),
             "children": [
                 {
@@ -177,11 +230,15 @@ class JobsView:
             "id": "job_plots",
             "label": "Plots",
             "action": "job_plots",
-            "icon": ResourceTextures.get("JobViewer"),
+            "icon": ResourceTextures.get("ReferenceChart"),
             "enabled": False,
             "checkable": True,
             "checked": False,
         })
+        return menu
+
+    def _create_listview(self):
+        menu = self.job_context_menu()
         listview = ExplorerListView(
             parent=self.body, items=[], columns=self.COLUMNS,
             width=-1, height=-1, show_status_bar=False,
@@ -321,16 +378,15 @@ class JobsView:
                 getattr(job, "user", ""), getattr(job, "tokens", ""),
                 getattr(job, "status", ""), getattr(job, "elapsed", ""),
             )
-            status = str(values[4]).strip().casefold()
-            fill = ((205, 244, 213, 255) if status in ("r", "running") else
-                    (255, 237, 213, 255) if status in ("q", "queued") else None)
+            fill = self.status_row_fill(values[4])
+            text_color = self.status_row_text_color(values[4])
             items.append(ListViewItem(
                 name=str(values[0]), path=str(values[0]), is_dir=False,
                 item_type="Job", data={
                     "job_id": str(values[0]), "job_name": str(values[1]),
                     "user": str(values[2]), "tokens": str(values[3]),
                     "status": str(values[4]), "elapsed": str(values[5]),
-                    "row_fill": fill,
+                    "row_fill": fill, "row_text_color": text_color,
                 },
             ))
         self.listview.set_items(items)

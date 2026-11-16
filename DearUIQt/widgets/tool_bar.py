@@ -97,6 +97,7 @@ class QToolBar(QWidget):
         self._layout.addWidget(button)
         self._actions.append(action)
         self._action_buttons[action] = button
+        QWidget.addAction(self, action)
         return action
 
     def insertAction(self, before, action):
@@ -114,6 +115,7 @@ class QToolBar(QWidget):
         if action not in self._actions:
             return False
         self._actions.remove(action)
+        QWidget.removeAction(self, action)
         button = self._action_buttons.pop(action, None)
         if button is not None:
             index = self._layout.indexOf(button)

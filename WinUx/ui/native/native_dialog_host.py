@@ -11,7 +11,7 @@ Center) is still alive.
 This module owns exactly one hidden Tk root on one daemon UI thread.  Dialogs
 are real ``Toplevel`` windows created on that shared thread.  Application
 callbacks are marshalled back to the Dear PyGui thread by the dialog classes
-through ``view.after(...)``.
+through the canonical QApplication dispatcher.
 """
 
 from __future__ import annotations
@@ -21,10 +21,13 @@ import gc
 import os
 import queue
 import threading
+from collections import deque
 from ctypes import wintypes
 
+from DearUIQt.core import QObject, QThread, Signal, Qt
+
 from ...preferences.dialog_geometry import DialogGeometryPreferences
-from ...resources import apply_tk_app_icon
+from ...platform.resources import apply_tk_app_icon
 
 
 GWLP_HWNDPARENT = -8
@@ -45,6 +48,7 @@ DIALOG_GEOMETRY_SAVE_DELAY_MS = 350
 # Windows 11 / Qt-like top-level chrome.  The values are documented DWM
 # attributes and degrade harmlessly on Windows 10 or older builds.
 DWMWA_WINDOW_CORNER_PREFERENCE = 33
+DWMWA_USE_IMMERSIVE_DARK_MODE = 20
 DWMWA_BORDER_COLOR = 34
 DWMWA_CAPTION_COLOR = 35
 DWMWA_TEXT_COLOR = 36
@@ -211,6 +215,62 @@ def _colorref(rgb):
     return r | (g << 8) | (b << 16)
 
 
+def apply_native_theme_chrome(hwnd):
+    """Apply the current DearUIQt Light/Dark palette to one top-level HWND.
+
+    This function changes only DWM non-client colours/dark-mode preference, so
+    it is safe to call live when Settings changes theme without disturbing
+    ownership, sizing, focus, or the native caption-button contract.
+    """
+    if os.name != "nt" or not hwnd:
+        return False
+    try:
+        from DearUIQt.gui.palette import QtFusionPalette, color_scheme
+        dwmapi = ctypes.windll.dwmapi
+        native = wintypes.HWND(int(hwnd))
+
+        def set_dwm(attr, value):
+            value_obj = ctypes.c_int(int(value))
+            return int(dwmapi.DwmSetWindowAttribute(
+                native, int(attr), ctypes.byref(value_obj),
+                ctypes.sizeof(value_obj))) == 0
+
+        p = QtFusionPalette
+        dark = color_scheme() == "Dark"
+        # Attribute 20 is supported by modern Windows 10/11; unsupported builds
+        # simply return a non-zero HRESULT and still accept explicit colours.
+        # Windows 10 1809/1903 used the pre-public attribute id 19; modern
+        # Windows uses 20.  Calling the fallback is harmless when unsupported
+        # and keeps embedded/enterprise images from leaving a light caption.
+        dark_result = set_dwm(DWMWA_USE_IMMERSIVE_DARK_MODE, 1 if dark else 0)
+        if not dark_result:
+            set_dwm(19, 1 if dark else 0)
+        set_dwm(DWMWA_BORDER_COLOR, _colorref(p.TITLE_BORDER))
+        set_dwm(DWMWA_CAPTION_COLOR, _colorref(p.TITLE))
+        set_dwm(DWMWA_TEXT_COLOR, _colorref(p.TEXT))
+        try:
+            user32 = ctypes.windll.user32
+            # Recompute/repaint only the non-client frame.  Do not move, size,
+            # activate or reorder the dialog during a live Settings update.
+            user32.SetWindowPos(
+                native, None, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
+                SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            RDW_INVALIDATE = 0x0001
+            RDW_UPDATENOW = 0x0100
+            RDW_FRAME = 0x0400
+            user32.RedrawWindow(
+                native, None, None,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_FRAME,
+            )
+        except Exception:
+            pass
+        return True
+    except Exception:
+        return False
+
+
 def apply_native_qt_chrome(
         window, window_role="dialog", allow_minimize=None, allow_maximize=None):
     """Give one Tk ``Toplevel`` Qt/QWidget-like native Windows chrome.
@@ -331,9 +391,7 @@ def apply_native_qt_chrome(
                 return False
 
         set_dwm(DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND)
-        set_dwm(DWMWA_BORDER_COLOR, _colorref((171, 171, 171)))
-        set_dwm(DWMWA_CAPTION_COLOR, _colorref((240, 240, 240)))
-        set_dwm(DWMWA_TEXT_COLOR, _colorref((32, 32, 32)))
+        apply_native_theme_chrome(dialog_hwnd)
         return dialog_hwnd
     except Exception:
         return None
@@ -1008,9 +1066,8 @@ def prepare_owned_dialog_stack(owner_hwnd, dialog_hwnd):
     viewport.  Windows honours the GWLP_HWNDPARENT relationship, but on some
     desktops activating the cross-process owned HWND can leave its owner below
     an unrelated Explorer/browser/Abaqus window.  Qt keeps the owner/popup
-    stack together.  Reproduce that behaviour without TOPMOST: only when the
-    owner or dialog already owns the foreground slot, raise the owner once and
-    then the dialog, both with SWP_NOACTIVATE.
+    stack together. Repair only an actually obscured owner, without TOPMOST,
+    activation or redundant reordering of an already correct window stack.
 
     This helper never steals focus from another application and never changes
     size, position, show state or the TOPMOST band.
@@ -1022,40 +1079,18 @@ def prepare_owned_dialog_stack(owner_hwnd, dialog_hwnd):
         if owner_hwnd == dialog_hwnd:
             return False
         user32 = ctypes.windll.user32
-        user32.IsWindow.argtypes = [wintypes.HWND]
-        user32.IsWindow.restype = wintypes.BOOL
         user32.IsWindowVisible.argtypes = [wintypes.HWND]
         user32.IsWindowVisible.restype = wintypes.BOOL
-        user32.GetForegroundWindow.argtypes = []
-        user32.GetForegroundWindow.restype = wintypes.HWND
-        user32.SetWindowPos.argtypes = [
-            wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
-            ctypes.c_int, ctypes.c_int, wintypes.UINT]
-        user32.SetWindowPos.restype = wintypes.BOOL
         owner = wintypes.HWND(owner_hwnd)
-        dialog = wintypes.HWND(dialog_hwnd)
-        if not user32.IsWindow(owner) or not user32.IsWindow(dialog):
-            return False
-        if not user32.IsWindowVisible(owner):
-            return False
-        current = int(user32.GetForegroundWindow() or 0)
-        if current not in (0, owner_hwnd, dialog_hwnd):
-            return False
-        if current == owner_hwnd:
-            # The owner is already at the foreground slot. Raising it again
-            # sends synchronous WM_WINDOWPOS* traffic to its GUI thread and
-            # can stall the child for hundreds of ms while WinUx is rendering.
-            # Activating the owned dialog naturally keeps it above this owner.
-            return True
-        flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
-        # HWND_TOP is a transient normal-band reorder, never HWND_TOPMOST.
-        # Post cross-thread owner work rather than waiting for its message
-        # pump. The dialog's own-thread placement still follows immediately.
-        if not user32.SetWindowPos(owner, wintypes.HWND(0), 0, 0, 0, 0,
-                                   flags | SWP_ASYNCWINDOWPOS):
-            return False
-        user32.SetWindowPos(dialog, wintypes.HWND(0), 0, 0, 0, 0, flags)
-        return True
+        # Do nothing when already correctly stacked. Unconditionally raising
+        # owner then child caused extra WM_WINDOWPOS/non-client repaint traffic
+        # on every activation, even though no desktop window obscured WinUx.
+        # Keep cross-thread repair asynchronous so the child never waits for
+        # the parent's render loop; neither window is activated by the repair.
+        from DearUIQt.backends.native_windows import NativeWindowBackend
+        return NativeWindowBackend().preserveOwnerPresentation(
+            owner_hwnd, dialog_hwnd,
+            was_visible=bool(user32.IsWindowVisible(owner)), asynchronous=True)
     except Exception:
         return False
 
@@ -1161,6 +1196,21 @@ def _release_modal_owner(owner_hwnd, restore_focus=True):
         restore_owner_focus(owner_hwnd)
 
 
+class _NativeTkHostWorker(QObject):
+    """QObject worker that owns the single Tk interpreter on a QThread."""
+
+    def __init__(self, host):
+        super().__init__()
+        self.finished = Signal(self)
+        self._host = host
+
+    def run(self):
+        try:
+            self._host._thread_main()
+        finally:
+            self.finished.emit()
+
+
 class _NativeTkHost:
     """One hidden Tk interpreter shared by every WinUX native dialog."""
 
@@ -1178,12 +1228,23 @@ class _NativeTkHost:
         # embedded SMAPython process (Tcl_AsyncDelete).  Keep retired windows
         # reachable until the Tk thread explicitly reaps them.
         self._retired_windows = []
-        self._thread = threading.Thread(
-            target=self._thread_main,
-            name="winux-native-ui",
-            daemon=True,
-        )
-        self._thread.start()
+        # M30: retain only bounded primitive diagnostics for this compatibility
+        # island. Native/Tk failures no longer disappear completely, but they
+        # also do not generate a log line for every callback.
+        self._error_count = 0
+        self._recent_errors = deque(maxlen=16)
+        self._submitted_count = 0
+        self._executed_count = 0
+        thread = QThread(name="winux-native-ui", daemon=True)
+        worker = _NativeTkHostWorker(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run, receiver=worker)
+        worker.finished.connect(thread.quit, connection_type=Qt.DirectConnection)
+        thread.finished.connect(worker.deleteLater, receiver=worker)
+        thread.finished.connect(thread.deleteLater)
+        self._thread = thread
+        self._worker = worker
+        thread.start()
         self._ready.wait(timeout=3.0)
 
     @property
@@ -1193,6 +1254,25 @@ class _NativeTkHost:
             and not self._stopped.is_set()
             and self.root is not None
         )
+
+    def _record_error(self, exc, operation="callback"):
+        self._error_count += 1
+        self._recent_errors.append({
+            "operation": str(operation or "callback")[:96],
+            "type": type(exc).__name__[:96],
+            "message": str(exc)[:240],
+        })
+
+    def diagnosticsSnapshot(self):
+        return {
+            "alive": bool(self.alive),
+            "thread_id": int(self._thread_ident or 0),
+            "queue_depth": int(self._queue.qsize()),
+            "submitted_count": int(self._submitted_count),
+            "executed_count": int(self._executed_count),
+            "error_count": int(self._error_count),
+            "recent_errors": [dict(item) for item in self._recent_errors],
+        }
 
     def _thread_main(self):
         root = None
@@ -1219,11 +1299,12 @@ class _NativeTkHost:
                         break
                     try:
                         callback(*args)
-                    except Exception:
+                        self._executed_count += 1
+                    except Exception as exc:
                         # Native UI errors must never terminate the embedded
-                        # Abaqus/WinUX process. Controllers surface their own
-                        # error state where appropriate.
-                        pass
+                        # Abaqus/WinUX process. Retain bounded diagnostics so
+                        # crash/watchdog snapshots can identify the failure.
+                        self._record_error(exc)
                 try:
                     root.after(self.POLL_MS, drain)
                 except Exception:
@@ -1282,11 +1363,13 @@ class _NativeTkHost:
     def submit(self, callback, *args):
         if not callable(callback) or self._stopped.is_set():
             return False
+        self._submitted_count += 1
         if threading.get_ident() == self._thread_ident:
             try:
                 callback(*args)
-            except Exception:
-                pass
+                self._executed_count += 1
+            except Exception as exc:
+                self._record_error(exc)
             return True
         self._queue.put((callback, args))
         return True
@@ -1298,6 +1381,39 @@ def _native_tk_host():
         if _NATIVE_TK_HOST is None or not _NATIVE_TK_HOST.alive:
             _NATIVE_TK_HOST = _NativeTkHost()
         return _NATIVE_TK_HOST
+
+
+def native_dialog_compatibility_snapshot():
+    """Return diagnostics without creating the Tk compatibility host."""
+    with _NATIVE_TK_HOST_LOCK:
+        host = _NATIVE_TK_HOST
+        if host is None:
+            return {
+                "created": False, "alive": False, "thread_id": 0,
+                "queue_depth": 0, "submitted_count": 0,
+                "executed_count": 0, "error_count": 0,
+                "recent_errors": [],
+            }
+        snapshot = host.diagnosticsSnapshot()
+        snapshot["created"] = True
+        return snapshot
+
+def native_dialog_compatibility_acceptance_snapshot():
+    """Return strict normal-runtime acceptance for the legacy Tk island.
+
+    M31 treats a main-process Tk host as legacy fallback. Normal WinUx runtime
+    should not instantiate it; helper-process Tk users are outside this host.
+    """
+    snapshot = native_dialog_compatibility_snapshot()
+    created = bool(snapshot.get("created", False))
+    errors = int(snapshot.get("error_count", 0))
+    return {
+        "accepted": (not created) and errors == 0,
+        "host_created": created,
+        "host_alive": bool(snapshot.get("alive", False)),
+        "error_count": errors,
+        "recent_errors": list(snapshot.get("recent_errors", [])),
+    }
 
 
 class NativeDialogController:
@@ -2002,9 +2118,30 @@ class NativeDialogController:
             callback(owner_hwnd)
 
         try:
-            self.view.after(max(0, int(delay or 0)), deliver)
+            delay_ms = max(0, int(delay or 0))
+            # Native Tk is a compatibility island, not a second WinUx UI owner.
+            # Both immediate and delayed application-state callbacks return
+            # through the canonical QApplication dispatcher.
+            from DearUIQt.core.application import QCoreApplication
+            application = QCoreApplication.instance()
+            if application is not None:
+                key = ("native-dialog-owner-restore", id(self))
+                if delay_ms == 0:
+                    token = application.postCallLatest(key, deliver)
+                else:
+                    token = application.postCallAfter(
+                        delay_ms, deliver, key=key)
+                if token is not None and token is not False:
+                    return True
+            # Standalone/legacy host fallback only. WinUx normal runtime should
+            # always have a QCoreApplication at this point.
+            self.view.after(delay_ms, deliver)
             return True
-        except Exception:
+        except Exception as exc:
+            try:
+                self._host._record_error(exc, operation="owner-restore-route")
+            except Exception:
+                pass
             return False
 
     def restore_owner_focus_async(self, delay=0):

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import os
 import subprocess
+import threading
 
 from .object import QObject, Signal
+from .timer import QTimer
 
 
 class QProcess(QObject):
@@ -23,11 +25,14 @@ class QProcess(QObject):
         self.started = Signal(self)
         self.finished = Signal(self)
         self.errorOccurred = Signal(self)
+        self.stateChanged = Signal(self)
         self._process = None
         self._state = self.NotRunning
         self._child_label = str(childLabel or "helper")
         self._finished_emitted = False
         self._exit_code = None
+        self._poll_interval = 50
+        self._monitor_timer = None
 
     @classmethod
     def launch(cls, program, arguments=(), *, cwd=None, env=None,
@@ -43,7 +48,7 @@ class QProcess(QObject):
               creationflags=0):
         if self.poll() is None and self._process is not None:
             raise RuntimeError("process is already running")
-        self._state = self.Starting
+        self._set_state(self.Starting)
         self._finished_emitted = False
         self._exit_code = None
         try:
@@ -51,11 +56,12 @@ class QProcess(QObject):
                 [program] + list(arguments), stdin=stdin, stdout=stdout,
                 stderr=stderr, cwd=cwd, env=env, creationflags=creationflags,
             )
-            self._state = self.Running
+            self._set_state(self.Running)
             self.started.emit()
+            self._start_monitoring()
             return self
         except Exception as exc:
-            self._state = self.NotRunning
+            self._set_state(self.NotRunning)
             self.errorOccurred.emit(exc)
             raise
 
@@ -88,15 +94,101 @@ class QProcess(QObject):
         return self.pid
 
     def state(self):
-        self.poll()
         return self._state
+
+    def isRunning(self):
+        """Return cached Qt-style running state without polling the OS process."""
+        return self._state == self.Running
+
+    def isFinished(self):
+        return self._state == self.NotRunning and self._process is not None
+
+    def pollingInterval(self):
+        return self._poll_interval
+
+    def setPollingInterval(self, milliseconds):
+        if type(milliseconds) is not int or milliseconds <= 0:
+            raise ValueError("process polling interval must be a positive integer")
+        self._poll_interval = milliseconds
+        timer = self._monitor_timer
+        if timer is not None and timer.isActive():
+            timer.setInterval(milliseconds)
+
+    def isMonitoring(self):
+        timer = self._monitor_timer
+        return bool(timer is not None and timer.isActive())
+
+    def startMonitoring(self):
+        """Enable QApplication/QTimer-driven exit detection when available.
+
+        Processes launched before the UI scheduler exists can opt in later.
+        The method never creates a watcher thread; it returns ``False`` when
+        called outside the owning UI thread or without a usable scheduler.
+        """
+        if threading.get_ident() != self.threadId():
+            return False
+        return self._start_monitoring()
+
+    def stopMonitoring(self):
+        if threading.get_ident() != self.threadId():
+            return False
+        was_active = self.isMonitoring()
+        self._stop_monitoring()
+        return was_active
+
+    def _set_state(self, state):
+        state = int(state)
+        if self._state == state:
+            return False
+        self._state = state
+        self.stateChanged.emit(state)
+        return True
+
+    def _monitor_scheduler(self):
+        if callable(self._after):
+            return self._after
+        try:
+            from .application import QCoreApplication
+            application = QCoreApplication.instance()
+        except Exception:
+            application = None
+        if application is None or application.threadId() != self.threadId():
+            return None
+        return application._after if callable(getattr(application, "_after", None)) else None
+
+    def _start_monitoring(self):
+        scheduler = self._monitor_scheduler()
+        if scheduler is None or self._process is None or self._state != self.Running:
+            return False
+        timer = self._monitor_timer
+        if timer is None or timer._deleted:
+            timer = QTimer(self, after=scheduler)
+            timer.timeout.connect(self._monitor_tick)
+            self._monitor_timer = timer
+        if not timer.isActive():
+            timer.start(self._poll_interval)
+        return True
+
+    def _stop_monitoring(self):
+        timer = self._monitor_timer
+        if timer is not None and not timer._deleted:
+            timer.stop()
+
+    def _monitor_tick(self):
+        process = self._process
+        if process is None or self._state != self.Running:
+            self._stop_monitoring()
+            return
+        result = process.poll()
+        if result is not None:
+            self._mark_finished(result)
 
     def nativeProcess(self):
         return self._process
 
     def poll(self):
         if self._process is None:
-            self._state = self.NotRunning
+            self._set_state(self.NotRunning)
             return 0
         result = self._process.poll()
         if result is not None:
@@ -130,7 +222,8 @@ class QProcess(QObject):
         return self._exit_code
 
     def _mark_finished(self, code):
-        self._state = self.NotRunning
+        self._stop_monitoring()
+        self._set_state(self.NotRunning)
         self._exit_code = int(code)
         if not self._finished_emitted:
             self._finished_emitted = True
@@ -191,6 +284,7 @@ class QProcess(QObject):
     def delete(self):
         # QObject deletion must not unexpectedly kill a running helper. Host
         # services own termination policy explicitly through ``close``.
+        self._stop_monitoring()
         super().delete()
 
 

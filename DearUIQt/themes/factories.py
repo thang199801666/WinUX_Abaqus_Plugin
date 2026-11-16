@@ -44,7 +44,7 @@ def fusion_desktop_theme(backend=None, *, background=None,
             ThemeColor.POPUP_BACKGROUND: p.MENU,
             ThemeColor.TEXT: p.TEXT,
             ThemeColor.TEXT_DISABLED: p.TEXT_DISABLED,
-            ThemeColor.TEXT_SELECTED_BACKGROUND: (0, 120, 215, 105),
+            ThemeColor.TEXT_SELECTED_BACKGROUND: p.HIGHLIGHT[:3] + (105,),
             ThemeColor.BORDER: p.BORDER_LIGHT,
             ThemeColor.BORDER_SHADOW: clear,
             ThemeColor.FRAME_BACKGROUND: base,
@@ -60,7 +60,7 @@ def fusion_desktop_theme(backend=None, *, background=None,
             ThemeColor.TITLE_BACKGROUND: p.TITLE,
             ThemeColor.TITLE_BACKGROUND_ACTIVE: p.TITLE_ACTIVE,
             ThemeColor.TITLE_BACKGROUND_COLLAPSED: p.TITLE,
-            ThemeColor.SEPARATOR: p.BORDER_LIGHT,
+            ThemeColor.SEPARATOR: p.BORDER,
             ThemeColor.SEPARATOR_HOVERED: p.HIGHLIGHT,
             ThemeColor.SEPARATOR_ACTIVE: p.HIGHLIGHT,
         },
@@ -155,8 +155,10 @@ def fusion_desktop_theme(backend=None, *, background=None,
         backend=_backend(backend), tag=tag, cache=cache)
 
 
-def button_theme(backend=None, *, role="secondary", disabled=False, focused=False, default=False, checked=False):
-    return _style.button_theme(_backend(backend), role=role, disabled=disabled, focused=focused, default=default, checked=checked)
+def button_theme(backend=None, *, role="secondary", disabled=False, focused=False, default=False, checked=False, hovered=False,
+                 frame_padding=(8, 3)):
+    return _style.button_theme(_backend(backend), role=role, disabled=disabled, focused=focused,
+                               default=default, checked=checked, hovered=hovered, frame_padding=frame_padding)
 
 
 def splitter_theme(backend=None, *, active=False):
@@ -256,7 +258,7 @@ def transfer_status_text_theme(backend=None, *, state="normal"):
     return _style.transfer_status_text_theme(_backend(backend), state=state)
 
 
-def menu_surface_theme(backend=None, *, padding=(4, 3), spacing=(0, 0),
+def menu_surface_theme(backend=None, *, padding=(6, 4), spacing=(0, 0),
                        tag="dearuiqt.theme.menu.surface", cache=True):
     """Return the shared Qt/Fusion popup-menu surface theme.
 
@@ -266,16 +268,23 @@ def menu_surface_theme(backend=None, *, padding=(4, 3), spacing=(0, 0),
     """
     p = QtFusionPalette
     m = QtFusionMetrics
+    popup_surface = p.WINDOW
+    # QMenu can be hosted either as a top-level window or as an embedded
+    # child-window inside a QtDialog.  Style both paths explicitly; otherwise
+    # CHILD windows ignore WINDOW_BORDER_SIZE and appear visually merged into
+    # the table/view behind them.
+    popup_border = p.BORDER
     return make_theme(theme_component(
         ThemeTarget.ALL,
         colors={
-            ThemeColor.WINDOW_BACKGROUND: p.MENU,
-            ThemeColor.CHILD_BACKGROUND: p.MENU,
-            ThemeColor.POPUP_BACKGROUND: p.MENU,
+            ThemeColor.WINDOW_BACKGROUND: popup_surface,
+            ThemeColor.CHILD_BACKGROUND: popup_surface,
+            ThemeColor.POPUP_BACKGROUND: popup_surface,
             ThemeColor.TEXT: p.TEXT,
             ThemeColor.TEXT_DISABLED: p.TEXT_DISABLED,
             ThemeColor.SEPARATOR: p.BORDER_LIGHT,
-            ThemeColor.BORDER: p.BORDER,
+            ThemeColor.BORDER: popup_border,
+            ThemeColor.BORDER_SHADOW: (0, 0, 0, 48),
         },
         styles={
             ThemeStyle.WINDOW_PADDING: padding,
@@ -283,6 +292,8 @@ def menu_surface_theme(backend=None, *, padding=(4, 3), spacing=(0, 0),
             ThemeStyle.WINDOW_ROUNDING: m.POPUP_ROUNDING,
             ThemeStyle.POPUP_ROUNDING: m.POPUP_ROUNDING,
             ThemeStyle.WINDOW_BORDER_SIZE: 1,
+            ThemeStyle.CHILD_BORDER_SIZE: 1,
+            ThemeStyle.CHILD_ROUNDING: m.POPUP_ROUNDING,
         },
     ), backend=_backend(backend), tag=tag, cache=cache)
 
@@ -316,7 +327,7 @@ def menu_button_theme(backend=None, *, disabled=False, keyboard=False,
         colors=colors,
         styles={
             ThemeStyle.FRAME_PADDING: frame_padding,
-            ThemeStyle.FRAME_ROUNDING: 0,
+            ThemeStyle.FRAME_ROUNDING: 3,
             ThemeStyle.FRAME_BORDER_SIZE: 1 if keyboard else 0,
             ThemeStyle.BUTTON_TEXT_ALIGN: align,
         },
@@ -360,16 +371,16 @@ def inline_editor_theme_spec(*, text_color=None, selection_color=None, border=No
     p = QtFusionPalette
     text_color = p.TEXT if text_color is None else text_color
     selection_color = p.HIGHLIGHT if selection_color is None else selection_color
-    border = (72, 72, 72, 255) if border is None else border
-    white = (255, 255, 255, 255)
+    border = p.BORDER_DARK if border is None else border
+    surface = p.BASE
     all_component = theme_component(
         ThemeTarget.ALL,
         colors={
-            ThemeColor.WINDOW_BACKGROUND: white,
-            ThemeColor.CHILD_BACKGROUND: white,
-            ThemeColor.FRAME_BACKGROUND: white,
-            ThemeColor.FRAME_BACKGROUND_HOVERED: white,
-            ThemeColor.FRAME_BACKGROUND_ACTIVE: white,
+            ThemeColor.WINDOW_BACKGROUND: surface,
+            ThemeColor.CHILD_BACKGROUND: surface,
+            ThemeColor.FRAME_BACKGROUND: surface,
+            ThemeColor.FRAME_BACKGROUND_HOVERED: surface,
+            ThemeColor.FRAME_BACKGROUND_ACTIVE: surface,
             ThemeColor.TEXT: text_color,
             ThemeColor.TEXT_SELECTED_BACKGROUND: selection_color,
             ThemeColor.BORDER: border,
@@ -387,9 +398,9 @@ def inline_editor_theme_spec(*, text_color=None, selection_color=None, border=No
     input_component = theme_component(
         ThemeTarget.LINE_EDIT,
         colors={
-            ThemeColor.FRAME_BACKGROUND: white,
-            ThemeColor.FRAME_BACKGROUND_HOVERED: white,
-            ThemeColor.FRAME_BACKGROUND_ACTIVE: white,
+            ThemeColor.FRAME_BACKGROUND: surface,
+            ThemeColor.FRAME_BACKGROUND_HOVERED: surface,
+            ThemeColor.FRAME_BACKGROUND_ACTIVE: surface,
             ThemeColor.TEXT: text_color,
             ThemeColor.TEXT_SELECTED_BACKGROUND: selection_color,
         },
@@ -410,17 +421,24 @@ def worksheet_theme_spec(*, header_background=None, transparent_editor=True):
     """
     from .spec import theme
     p = QtFusionPalette
-    header = p.TOOLBAR if header_background is None else header_background
+    header = p.TABLE_HEADER if header_background is None else header_background
     clear = (255, 255, 255, 0) if transparent_editor else p.BASE
     table_component = theme_component(
         ThemeTarget.TABLE,
         colors={
             ThemeColor.TABLE_HEADER_BACKGROUND: header,
-            ThemeColor.TABLE_BORDER_LIGHT: p.BORDER_LIGHT,
-            ThemeColor.TABLE_BORDER_STRONG: p.BORDER,
+            ThemeColor.TABLE_BORDER_LIGHT: p.TABLE_GRID,
+            ThemeColor.TABLE_BORDER_STRONG: p.TABLE_BORDER,
+            ThemeColor.TABLE_ROW_BACKGROUND: p.TABLE_ROW,
+            ThemeColor.TABLE_ROW_BACKGROUND_ALT: p.TABLE_ROW_ALT,
         },
-        styles={ThemeStyle.CELL_PADDING: (3, 1)},
+        styles={ThemeStyle.CELL_PADDING: QtFusionMetrics.TABLE_CELL_PADDING},
     )
+    # QTableWidget installs the shared item-view scrollbar theme at creation,
+    # but worksheet callers replace that item theme with this richer table/edit
+    # theme.  Carry the shared scroller palette/metrics forward so editable
+    # worksheets never fall back to Dear ImGui's stock scrollbar.
+    table_component = with_scrollbar(table_component, track=p.WINDOW_ALT)
     editor_component = theme_component(
         ThemeTarget.LINE_EDIT,
         colors={

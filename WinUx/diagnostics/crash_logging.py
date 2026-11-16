@@ -14,13 +14,17 @@ import traceback
 from datetime import datetime
 from pathlib import Path
 
+from winux_runtime.logging_policy import (
+    log_backup_count, log_max_bytes, normal_log_level_name, prune_old_logs,
+)
+
 
 APP_LOG_NAME = "winux.log"
 CRASH_LOG_NAME = "winux_crash.log"
 LOG_DIR_ENV = "WINUX_LOG_DIR"
-MAX_LOG_BYTES = 2 * 1024 * 1024
-LOG_BACKUP_COUNT = 5
-NATIVE_LOG_RETENTION = 10
+MAX_LOG_BYTES = log_max_bytes(512)
+LOG_BACKUP_COUNT = log_backup_count(2)
+NATIVE_LOG_RETENTION = 3
 
 _LOCK = threading.RLock()
 _INSTALLED = False
@@ -335,10 +339,11 @@ def install_crash_logging():
             _LOG_DIRECTORY = _resolve_log_directory()
             _truncate_oversized_log(_LOG_DIRECTORY / APP_LOG_NAME)
             _truncate_oversized_log(_LOG_DIRECTORY / CRASH_LOG_NAME)
+            app_level = getattr(logging, normal_log_level_name(), logging.WARNING)
             _APP_LOGGER = _new_rotating_logger(
                 "WinUx.application",
                 _LOG_DIRECTORY / APP_LOG_NAME,
-                logging.INFO,
+                app_level,
             )
             _CRASH_LOGGER = _new_rotating_logger(
                 "WinUx.crash",
@@ -368,6 +373,7 @@ def install_crash_logging():
             _ATEXIT_REGISTERED = True
 
         _APP_LOGGER.info("WinUX crash logging installed\n%s", _runtime_details())
+        prune_old_logs(_LOG_DIRECTORY, exclude=(APP_LOG_NAME, CRASH_LOG_NAME, "winux_hang.log"))
         _install_faulthandler(_LOG_DIRECTORY)
         # Prune here as well: when the host already owns faulthandler, the
         # installer above skips pruning and old native logs would accumulate.

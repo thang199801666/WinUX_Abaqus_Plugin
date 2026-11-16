@@ -17,6 +17,7 @@ import itertools
 import os
 import queue
 import threading
+import weakref
 
 from .object import QObject, Signal
 
@@ -69,6 +70,10 @@ class QFuture(QObject):
         self._result = None
         self._exception = None
         self._done_callbacks = []
+        # QFuture is an asynchronous result handle rather than a user-owned UI
+        # root.  It may legitimately remain alive while a worker publishes its
+        # terminal state, so exclude it from QObject orphan-window diagnostics.
+        self._diagnostic_infrastructure_root = True
 
     def cancel(self):
         """Request cancellation.
@@ -261,19 +266,64 @@ class QThreadPool:
 
     _global_instance = None
     _global_lock = threading.Lock()
+    _registry_lock = threading.Lock()
+    _registry = weakref.WeakSet()
 
-    def __init__(self, maxThreadCount=None, *, maxPending=256, name="qt-worker"):
+    def __init__(self, maxThreadCount=None, *, maxPending=256, name="qt-worker", category="general", owner=None):
         if maxThreadCount is None:
             maxThreadCount = min(32, max(4, (os.cpu_count() or 4)))
         self._max_threads = max(1, int(maxThreadCount))
         self._max_pending = max(self._max_threads, int(maxPending))
         self._name = str(name or "qt-worker")
+        self._category = str(category or "general")
+        self._owner_label = self._safe_owner_label(owner)
         self._queue = queue.PriorityQueue(maxsize=self._max_pending)
         self._lock = threading.RLock()
         self._workers = []
         self._active = 0
         self._closed = False
+        self._futures = weakref.WeakSet()
         self._sequence = itertools.count()
+        with self.__class__._registry_lock:
+            self.__class__._registry.add(self)
+
+    @staticmethod
+    def _safe_owner_label(owner):
+        if owner is None:
+            return None
+        if isinstance(owner, str):
+            return owner[:160]
+        cls = type(owner)
+        label = ('%s.%s' % (getattr(cls, '__module__', ''), getattr(cls, '__qualname__', cls.__name__))).strip('.')
+        return label[:160]
+
+    @classmethod
+    def taskLane(cls, name, *, category="general", owner=None,
+                 maxThreadCount=None, maxPending=256):
+        """Create a named bounded task lane with normalized diagnostics metadata.
+
+        This is a construction helper only: it does not register global ownership
+        and preserves the weak registry/lifetime semantics of ordinary pools.
+        """
+        return cls(maxThreadCount=maxThreadCount, maxPending=maxPending,
+                   name=name, category=category, owner=owner)
+
+    def setDiagnosticMetadata(self, *, category=None, owner=None):
+        """Update diagnostic labels without retaining the owner object."""
+        with self._lock:
+            if category is not None:
+                self._category = str(category or "general")[:160]
+            if owner is not None:
+                self._owner_label = self._safe_owner_label(owner)
+        return self
+
+    def diagnosticMetadata(self):
+        with self._lock:
+            return {
+                'name': self._name,
+                'category': self._category,
+                'owner': self._owner_label,
+            }
 
     @classmethod
     def globalInstance(cls):
@@ -298,8 +348,120 @@ class QThreadPool:
         with self._lock:
             return self._active
 
+    def threadCount(self):
+        """Return the number of native worker threads currently owned.
+
+        Qt exposes the configured maximum and active count, while WinUx also
+        needs a lightweight diagnostic for lazily-created workers. Keeping the
+        observation on QThreadPool avoids application code reaching into the
+        pool's private worker list.
+        """
+        with self._lock:
+            return len(self._workers)
+
     def queuedTaskCount(self):
         return self._queue.qsize()
+
+    def futureDiagnosticsSnapshot(self):
+        """Return live QFuture state counts without retaining result handles."""
+        with self._lock:
+            futures = tuple(self._futures)
+        running = finished = cancelled = failed = pending = 0
+        for future in futures:
+            if future.isRunning():
+                running += 1
+            elif future.isFinished():
+                finished += 1
+                if future.isCancelled():
+                    cancelled += 1
+                else:
+                    with future._lock:
+                        if future._exception is not None:
+                            failed += 1
+            else:
+                pending += 1
+        return {
+            'live': len(futures),
+            'pending': pending,
+            'running': running,
+            'finished': finished,
+            'cancelled': cancelled,
+            'failed': failed,
+        }
+
+    def diagnosticsSnapshot(self):
+        """Return side-effect-free pool/worker/future counts."""
+        with self._lock:
+            closed = bool(self._closed)
+            workers = len(self._workers)
+            active = int(self._active)
+            maximum = int(self._max_threads)
+            name = self._name
+        with self._queue.all_tasks_done:
+            unfinished = int(self._queue.unfinished_tasks)
+        return {
+            'name': name,
+            'category': self._category,
+            'owner': self._owner_label,
+            'closed': closed,
+            'max_thread_count': maximum,
+            'thread_count': workers,
+            'active_thread_count': active,
+            'queued_task_count': self._queue.qsize(),
+            'unfinished_task_count': unfinished,
+            'futures': self.futureDiagnosticsSnapshot(),
+        }
+
+    @classmethod
+    def globalInstanceIfCreated(cls):
+        """Return the global pool only when already created; never allocate it."""
+        with cls._global_lock:
+            return cls._global_instance
+
+    @classmethod
+    def globalDiagnosticsSnapshot(cls):
+        """Observe the global pool without creating workers or a pool instance."""
+        pool = cls.globalInstanceIfCreated()
+        return None if pool is None else pool.diagnosticsSnapshot()
+
+    @classmethod
+    def registeredPools(cls):
+        """Return currently live pools without extending their lifetime beyond the call."""
+        with cls._registry_lock:
+            return tuple(cls._registry)
+
+    @classmethod
+    def namedDiagnosticsSnapshot(cls):
+        """Return side-effect-free diagnostics for every currently live named pool."""
+        pools = cls.registeredPools()
+        rows = []
+        for pool in pools:
+            try:
+                rows.append(pool.diagnosticsSnapshot())
+            except Exception:
+                continue
+        rows.sort(key=lambda row: (str(row.get('name', '')), id(row)))
+        categories = {}
+        for row in rows:
+            category = str(row.get('category') or 'general')
+            bucket = categories.setdefault(category, {
+                'pool_count': 0, 'thread_count': 0, 'active_thread_count': 0,
+                'queued_task_count': 0, 'unfinished_task_count': 0,
+            })
+            bucket['pool_count'] += 1
+            bucket['thread_count'] += int(row.get('thread_count', 0) or 0)
+            bucket['active_thread_count'] += int(row.get('active_thread_count', 0) or 0)
+            bucket['queued_task_count'] += int(row.get('queued_task_count', 0) or 0)
+            bucket['unfinished_task_count'] += int(row.get('unfinished_task_count', 0) or 0)
+        return {
+            'pool_count': len(rows),
+            'pools': rows,
+            'categories': categories,
+            'total_threads': sum(int(row.get('thread_count', 0) or 0) for row in rows),
+            'total_active_threads': sum(int(row.get('active_thread_count', 0) or 0) for row in rows),
+            'total_queued_tasks': sum(int(row.get('queued_task_count', 0) or 0) for row in rows),
+            'total_unfinished_tasks': sum(int(row.get('unfinished_task_count', 0) or 0) for row in rows),
+        }
 
     def _ensure_workers(self):
         error = None
@@ -373,6 +535,7 @@ class QThreadPool:
         with self._lock:
             if self._closed:
                 raise RuntimeError("thread pool is closed")
+            self._futures.add(future)
         item = (-int(priority), next(self._sequence), work, future)
         try:
             self._queue.put_nowait(item)
@@ -393,6 +556,7 @@ class QThreadPool:
         with self._lock:
             if self._closed:
                 return None
+            self._futures.add(future)
         item = (-int(priority), next(self._sequence), work, future)
         try:
             self._queue.put_nowait(item)
@@ -437,6 +601,13 @@ class QThreadPool:
                     self._queue.task_done()
                 except Exception:
                     pass
+                # Do not retain a completed QFuture/QRunnable in the worker
+                # frame while the thread blocks on the next queue.get().  The
+                # QObject live registry is weak, so dropping these final strong
+                # locals makes async lifecycle diagnostics deterministic and
+                # prevents completed futures from appearing as orphan roots.
+                runnable = None
+                future = None
 
     def clear(self):
         """Cancel pending work without interrupting already-running callbacks."""

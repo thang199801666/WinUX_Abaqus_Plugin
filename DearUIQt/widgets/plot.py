@@ -48,6 +48,10 @@ class QPlotAxis(QWidget):
         self._label = str(text or "")
         self._on_ui("label", self._configure, "label", self._label)
 
+    def setHoverHighlightEnabled(self, enabled):
+        """Control the axis hover/drag fill without hiding its ticks or label."""
+        self._on_ui("axis-hover-highlight", self._configure, "no_highlight", not bool(enabled))
+
     def fitData(self):
         self._require_ui()
         if not self.exists():

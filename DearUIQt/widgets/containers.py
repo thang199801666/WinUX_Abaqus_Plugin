@@ -54,6 +54,9 @@ class QFrame(QWidget):
         native_options.update(options)
         native = backend.add_child_window(**native_options)
         super().__init__(native, parent=parent, after=after, backend=backend)
+        if not no_scrollbar or horizontal_scrollbar:
+            from ..backends.shared_scrollers import register_scroll_surface
+            register_scroll_surface(backend, native)
         if not show:
             self._explicit_visible = False
             self._effective_visible = False
@@ -121,7 +124,13 @@ class ImGuiGroupBox(QWidget):
         self._title = str(title or "")
         self.title_label = backend.add_text(self._title, parent=self.tag)
         self.content = backend.add_group(parent=self.tag)
-        bind_theme(backend, self.tag, group_box_theme)
+        self._refresh_style()
+
+    def _refresh_style(self, *_args):
+        return bind_theme(self.backend, self.tag, group_box_theme)
+
+    def refreshTheme(self):
+        return self._refresh_style()
 
     def title(self):
         return self._title

@@ -1,7 +1,6 @@
 """Qt-style asynchronous result lifecycle for native dialog controllers."""
-import time
 from .floating_dialog import FloatingDialogController
-from DearUIQt.core import Signal
+from DearUIQt.core import Signal, QEventLoop, QTimer
 
 
 class ResultDialog(FloatingDialogController):
@@ -16,6 +15,7 @@ class ResultDialog(FloatingDialogController):
         self._notify_cancel = notify_cancel
         self._result_notified = False
         self._explicit_result_code = None
+        self._wait_loop = None
         self.accepted = Signal()
         self.rejected = Signal()
         self.finished = Signal()
@@ -44,6 +44,9 @@ class ResultDialog(FloatingDialogController):
         if self.result["done"]:
             return False
         self.result.update(done=True, value=value)
+        wait_loop = self._wait_loop
+        if wait_loop is not None and wait_loop.isRunning():
+            wait_loop.quit()
         return True
 
     def finish(self, value, *, result_code=None):
@@ -56,6 +59,9 @@ class ResultDialog(FloatingDialogController):
                 raise ValueError("dialog result code must be Accepted (1) or Rejected (0)")
             self._explicit_result_code = result_code
         self.result.update(done=True, value=value)
+        wait_loop = self._wait_loop
+        if wait_loop is not None and wait_loop.isRunning():
+            wait_loop.quit()
         self.destroy()
         if getattr(self, "_reuse_host", False) and not getattr(self, "_host_returned", False):
             return
@@ -89,12 +95,26 @@ class ResultDialog(FloatingDialogController):
     def _finish(self):
         if not self.result["done"]:
             self.result.update(done=True, value=self._cancel_value)
+        wait_loop = self._wait_loop
+        if wait_loop is not None and wait_loop.isRunning():
+            wait_loop.quit()
         super()._finish()
 
     def wait(self, timeout=None):
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while not self.result["done"] and getattr(self.view, "winfo_exists", lambda: True)():
-            if deadline is not None and time.monotonic() >= deadline:
-                break
-            self.view.update()
+        if self.result["done"]:
+            return self.result["value"]
+        loop = QEventLoop()
+        self._wait_loop = loop
+        timeout_timer = None
+        if timeout is not None:
+            milliseconds = max(0, int(float(timeout) * 1000.0))
+            timeout_timer = QTimer.singleShot(milliseconds, loop.quit, context=loop)
+        try:
+            loop.exec()
+        finally:
+            if timeout_timer is not None and not timeout_timer._deleted:
+                timeout_timer.delete()
+            if self._wait_loop is loop:
+                self._wait_loop = None
+            loop.delete()
         return self.result["value"]

@@ -44,6 +44,50 @@ def quick_access_places():
             for label, identifier, suffix in KNOWN_PLACES]
 
 
+
+def drive_display_name(path, *, query_volume=True):
+    """Return an Explorer-style drive caption without probing file contents.
+
+    Examples: ``System (C:)`` or ``Local Disk (C:)``.  Network/removable
+    volumes are allowed to fail quickly and fall back to the bare drive root.
+    """
+    text = str(path or "")
+    if os.name != "nt":
+        return text
+    root = text[:3] if len(text) >= 3 and text[1:3] == ":\\" else text
+    drive = root[:2] if len(root) >= 2 and root[1] == ":" else root.rstrip("\\/")
+    try:
+        kernel32 = ctypes.windll.kernel32
+        get_volume = kernel32.GetVolumeInformationW
+        get_volume.argtypes = [
+            ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32), ctypes.c_wchar_p, ctypes.c_uint32,
+        ]
+        get_volume.restype = ctypes.c_int
+        if query_volume:
+            volume = ctypes.create_unicode_buffer(261)
+            fsname = ctypes.create_unicode_buffer(261)
+            serial = ctypes.c_uint32()
+            max_component = ctypes.c_uint32()
+            flags = ctypes.c_uint32()
+            ok = get_volume(
+                root, volume, len(volume), ctypes.byref(serial),
+                ctypes.byref(max_component), ctypes.byref(flags), fsname, len(fsname),
+            )
+            label = volume.value.strip() if ok else ""
+            if label:
+                return "%s (%s)" % (label, drive)
+        get_type = kernel32.GetDriveTypeW
+        get_type.argtypes = [ctypes.c_wchar_p]
+        get_type.restype = ctypes.c_uint
+        drive_type = int(get_type(root))
+        fallback = {2: "Removable Disk", 3: "Local Disk", 4: "Network Drive",
+                    5: "CD Drive", 6: "RAM Disk"}.get(drive_type, "")
+        return "%s (%s)" % (fallback, drive) if fallback else text
+    except (OSError, ValueError, TypeError, ctypes.ArgumentError, AttributeError):
+        return text
+
 def drive_stock_id(path):
     if os.name != "nt":
         return 8

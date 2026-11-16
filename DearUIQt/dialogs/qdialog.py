@@ -9,6 +9,7 @@ from __future__ import annotations
 from enum import IntEnum
 
 from ..core.object import Qt, Signal, QCloseEvent
+from ..core.event_loop import QEventLoop
 from .qt_dialog import QtDialog
 
 
@@ -90,21 +91,43 @@ class QDialog(QtDialog):
         return self.show()
 
     def exec(self):
-        """Run a nested UI pump until the dialog is completed/hidden.
+        """Run a Qt-style nested :class:`QEventLoop` until completion.
 
-        DearUIQt does not create a second renderer loop; it pumps the owning
-        view just as native WinUx selector waits do.  This keeps event ordering
-        deterministic and avoids a renderer-specific nested event loop.
+        The native host still pumps one platform turn at a time, but logical
+        posted events, queued signals, deferred deletes and native-update
+        batching remain owned by QApplication.  No renderer-specific worker or
+        second application dispatcher is created.
         """
         self._dialog_done = False
-        self.show()
-        update = getattr(self.view, "update", None)
         exists = getattr(self.view, "winfo_exists", lambda: True)
-        while self.isVisible() and not self._dialog_done and exists():
-            if not callable(update):
-                break
-            update()
-        return self.result()
+        loop = QEventLoop()
+
+        def stop_if_host_closed():
+            if self._dialog_done or not self.isVisible() or not exists():
+                loop.exit(self.result())
+
+        # Normal completion exits through ``finished``. The host-close guard is
+        # scheduled through QApplication rather than a dialog-owned render pump.
+        from ..core.timer import QTimer
+        guard = QTimer(self)
+        # ``finished`` exits the nested loop synchronously for every normal
+        # accept/reject/native-close path.  This timer is only a defensive
+        # orphan-host fallback, so polling every render frame wastes wake-ups
+        # while an otherwise idle modal dialog is open.  A 100 ms cadence keeps
+        # the fallback responsive without turning QDialog.exec() into a hidden
+        # 60 Hz timer source.
+        guard.setInterval(100)
+        guard.timeout.connect(stop_if_host_closed)
+        guard.start()
+        finished_connection = self.finished.connect(loop.exit)
+        self.show()
+        try:
+            return loop.exec()
+        finally:
+            finished_connection.disconnect()
+            guard.stop()
+            guard.delete()
+            loop.delete()
 
     exec_ = exec
 

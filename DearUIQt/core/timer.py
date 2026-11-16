@@ -1,7 +1,30 @@
-"""QObject-owned timers driven by the host UI scheduler, not worker threads."""
+"""Qt-style clock/timer primitives driven by the host UI scheduler."""
 import threading
+import time
 
 from .object import QObject, Signal
+
+
+class _TimerTick:
+    """One consumable scheduler callback whose timer reference is detachable."""
+
+    __slots__ = ('_timer', '_generation')
+
+    def __init__(self, timer, generation):
+        self._timer = timer
+        self._generation = generation
+
+    def cancel(self):
+        self._timer = None
+
+    def __call__(self):
+        timer = self._timer
+        if timer is None:
+            return
+        # Reject a broken scheduler before consuming the live delivery.
+        timer._require_thread()
+        self._timer = None
+        timer._tick(self._generation)
 
 
 class QTimer(QObject):
@@ -13,10 +36,32 @@ class QTimer(QObject):
         self._active = False
         self._generation = 0
         self._scheduled_handle = None
+        self._scheduled_tick = None
+        self._deadline = None
 
     def _require_thread(self):
         if threading.get_ident() != self.threadId():
             raise RuntimeError("timer operations require the owning thread")
+
+    def _thread_affinity_about_to_change(self, previous_thread, current_thread):
+        # Qt restarts active timers when their QObject affinity changes. Cancel
+        # the old scheduler handle while it is still cancellable from the source
+        # thread; the target restart is posted after QObject installs its new
+        # scheduler.
+        self._restart_after_affinity_move = bool(self.isActive())
+        if self._restart_after_affinity_move:
+            self.stop()
+
+    def _thread_affinity_changed(self, previous_thread, current_thread):
+        if not getattr(self, "_restart_after_affinity_move", False):
+            return
+        self._restart_after_affinity_move = False
+
+        def restart():
+            if not self._deleted and not self.isActive():
+                self.start()
+
+        self._queue_to_affinity(restart)
 
     @staticmethod
     def _milliseconds(value):
@@ -48,14 +93,70 @@ class QTimer(QObject):
     def isActive(self):
         return self._active and not self._deleted
 
+    def remainingTime(self):
+        """Milliseconds until the next timeout, or -1 while inactive."""
+        if not self.isActive() or self._deadline is None:
+            return -1
+        return max(0, int(round((self._deadline - time.monotonic()) * 1000.0)))
+
+    @staticmethod
+    def singleShot(milliseconds, callback, *, context=None, after=None):
+        """Queue a one-off callback and return its cancellable timer handle.
+
+        An explicit QObject context (or an inferred bound-method receiver) owns
+        the timer: deleting it cancels delivery and releases callback references.
+        With no supplied scheduler, use the context or current QApplication.
+        The helper deletes itself after delivery, including when the slot raises.
+        Call ``delete()`` on the returned handle to cancel and release it early.
+        """
+        milliseconds = QTimer._milliseconds(milliseconds)
+        if not callable(callback):
+            raise TypeError('singleShot callback must be callable')
+        receiver = getattr(callback, '__self__', None)
+        if isinstance(receiver, QObject) and receiver.threadId() != threading.get_ident():
+            raise RuntimeError('singleShot requires the callback receiver thread')
+        if context is None and isinstance(receiver, QObject):
+            context = receiver
+        if context is not None:
+            if not isinstance(context, QObject):
+                raise TypeError('singleShot context must be a QObject')
+            if context._deleted:
+                raise RuntimeError('cannot schedule for a deleted context')
+            if context.threadId() != threading.get_ident():
+                raise RuntimeError('singleShot requires the context thread')
+        scheduler = after if after is not None else getattr(context, '_after', None)
+        if scheduler is None:
+            from .application import QCoreApplication
+            application = QCoreApplication.instance()
+            if application is not None:
+                if application.threadId() != threading.get_ident():
+                    raise RuntimeError('singleShot requires the application thread')
+                scheduler = application._after
+        if not callable(scheduler):
+            raise RuntimeError('singleShot requires a UI scheduler')
+        timer = QTimer(context, after=scheduler)
+        timer._dispose_after_timeout = True
+        try:
+            timer.setSingleShot(True)
+            timer.timeout.connect(callback)
+            timer.start(milliseconds)
+        except Exception:
+            timer.delete()
+            raise
+        return timer
+
     def _cancel_scheduled_tick(self):
         """Cancel the host callback when its scheduler exposes ``after_cancel``.
 
-        Generation checks remain the correctness fallback for simple schedulers,
-        but cancel-capable UI hosts can release the bound callback immediately.
-        This mirrors Qt's timer lifecycle and prevents stopped long-interval
-        timers from retaining a dialog until their obsolete due time arrives.
+        Detach the timer even when host cancellation is unavailable or fails;
+        the pending callback then owns only an inert tick shell. Generation
+        checks remain the stale-delivery fallback, while cancel-capable hosts
+        can also remove that shell from their queues immediately.
         """
+        tick = self._scheduled_tick
+        self._scheduled_tick = None
+        if tick is not None:
+            tick.cancel()
         handle = self._scheduled_handle
         self._scheduled_handle = None
         if handle is None or self._after is None:
@@ -83,44 +184,61 @@ class QTimer(QObject):
         self._interval = value
         self._generation += 1
         self._active = True
+        self._deadline = time.monotonic() + (value / 1000.0)
         try:
             self._schedule(self._generation)
         except Exception:
             self._active = False
             self._generation += 1
             self._scheduled_handle = None
+            self._deadline = None
             raise
 
     def stop(self):
         self._require_thread()
         self._active = False
+        self._deadline = None
         self._generation += 1
         self._cancel_scheduled_tick()
 
     def _schedule(self, generation):
-        # Host schedulers drain multiple due callbacks per pass. A 1 ms lower
-        # bound prevents a zero timer from spinning within that same pass.
-        self._scheduled_handle = self._after(
-            max(1, self._interval), self._tick, generation)
+        # A repeating zero timer needs a lower bound on legacy drain-all hosts.
+        # One-off zero timers are safe to queue immediately, never inline.
+        tick = _TimerTick(self, generation)
+        self._scheduled_tick = tick
+        try:
+            self._scheduled_handle = self._after(
+                max(0 if self._single_shot else 1, self._interval), tick)
+        except Exception:
+            # A host may retain the callback even when scheduling raises.
+            tick.cancel()
+            if self._scheduled_tick is tick:
+                self._scheduled_tick = None
+            raise
 
     def _tick(self, generation):
         self._require_thread()
         if generation == self._generation:
             self._scheduled_handle = None
+            self._scheduled_tick = None
         if not self.isActive() or generation != self._generation:
             return
         if self._single_shot:
             self._active = False
+            self._deadline = None
         try:
             self.timeout.emit()
         finally:
             if self.isActive() and generation == self._generation:
                 try:
+                    self._deadline = time.monotonic() + (self._interval / 1000.0)
                     self._schedule(generation)
                 except Exception:
                     self._active = False
                     self._generation += 1
                     raise
+            if getattr(self, '_dispose_after_timeout', False) and not self.isActive():
+                self.delete()
 
     def delete(self):
         if self._deleted:
@@ -129,4 +247,73 @@ class QTimer(QObject):
         super().delete()
 
 
-__all__ = ["QTimer"]
+class QElapsedTimer:
+    """Monotonic elapsed-time helper compatible with QtCore.QElapsedTimer."""
+
+    __slots__ = ("_clock", "_started")
+
+    def __init__(self, *, clock=None):
+        self._clock = time.monotonic if clock is None else clock
+        self._started = None
+
+    def start(self):
+        self._started = self._clock()
+
+    def restart(self):
+        elapsed = self.elapsed() if self.isValid() else 0
+        self._started = self._clock()
+        return elapsed
+
+    def invalidate(self):
+        self._started = None
+
+    def isValid(self):
+        return self._started is not None
+
+    def elapsed(self):
+        if self._started is None:
+            return 0
+        return max(0, int((self._clock() - self._started) * 1000.0))
+
+    def nsecsElapsed(self):
+        if self._started is None:
+            return 0
+        return max(0, int((self._clock() - self._started) * 1_000_000_000.0))
+
+    def hasExpired(self, timeout_ms):
+        return self.isValid() and self.elapsed() >= max(0, int(timeout_ms))
+
+
+class QDeadlineTimer:
+    """Monotonic deadline value for bounded event-loop and I/O work."""
+
+    Forever = -1
+    __slots__ = ("_clock", "_deadline")
+
+    def __init__(self, milliseconds=Forever, *, clock=None):
+        self._clock = time.monotonic if clock is None else clock
+        self._deadline = None
+        self.setRemainingTime(milliseconds)
+
+    def setRemainingTime(self, milliseconds):
+        value = int(milliseconds)
+        self._deadline = None if value < 0 else self._clock() + (value / 1000.0)
+
+    def isForever(self):
+        return self._deadline is None
+
+    def hasExpired(self):
+        return False if self._deadline is None else self._clock() >= self._deadline
+
+    def remainingTime(self):
+        if self._deadline is None:
+            return self.Forever
+        return max(0, int(round((self._deadline - self._clock()) * 1000.0)))
+
+    def deadline(self):
+        if self._deadline is None:
+            return self.Forever
+        return int(round(self._deadline * 1000.0))
+
+
+__all__ = ["QTimer", "QElapsedTimer", "QDeadlineTimer"]

@@ -17,6 +17,7 @@ _LAZY = {
     "ODBXYResultDialog": (".transient", "ODBXYResultDialog"),
     "SettingsDialog": (".settings", "SettingsDialog"),
     "DiagnosticsDialog": (".diagnostics", "DiagnosticsDialog"),
+    "SessionManagerDialog": (".session_manager", "SessionManagerDialog"),
     "BookmarksDialog": (".bookmarks", "BookmarksDialog"),
     "SiteManagerDialog": (".site_manager", "SiteManagerDialog"),
     "SyncPreviewDialog": (".sync_preview", "SyncPreviewDialog"),

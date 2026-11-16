@@ -1,7 +1,7 @@
 """Native button-backed combo field with a separate Qt-style arrow subcontrol."""
 from ..core import QItemInputBinding, Qt
 from ..gui.palette import QtFusionPalette
-from ..gui.style import METRICS
+from ..gui.style import METRICS, metrics_for_backend
 
 
 class ComboField:
@@ -20,7 +20,8 @@ class ComboField:
         self._refresh_signature = None
         self._themes = {}
         self._bindings = []
-        self.height = METRICS.control_height
+        self._metrics = metrics_for_backend(backend)
+        self.height = self._metrics.control_height
         self.tag = b.add_child_window(parent=parent or 0, width=width, height=self.height,
                                       border=True, no_scrollbar=True, no_scroll_with_mouse=True)
         self.button = b.add_button(parent=self.tag, label=text, pos=(1, 1), width=-2,
@@ -28,18 +29,19 @@ class ComboField:
         # An editable preview must never share its mouse hit area with a
         # full-field drawlist. Give the arrow its own narrow child viewport.
         self._arrow_host = (b.add_child_window(
-            parent=self.tag, width=METRICS.arrow_width, height=self.height - 2,
+            parent=self.tag, width=self._metrics.arrow_width, height=self.height - 2,
             pos=(1, 1), border=False, no_scrollbar=True, no_scroll_with_mouse=True)
             if self.editable else None)
         self.arrow = b.add_drawlist(parent=self._arrow_host or self.tag, width=1,
                                     height=self.height - 2,
                                     pos=(0, 0) if self.editable else (1, 1))
-        self._arrow_bg = b.draw_rectangle((0, 0), (METRICS.arrow_width, self.height - 2),
+        self._arrow_bg = b.draw_rectangle((0, 0), (self._metrics.arrow_width, self.height - 2),
                                           parent=self.arrow, fill=QtFusionPalette.BASE,
-                                          color=(0, 0, 0, 0))
+                                          color=(0, 0, 0, 0),
+                                          rounding=max(0, self._metrics.frame_rounding - self._metrics.border_size))
         self._separator = b.draw_line((0, 0), (0, self.height - 2), parent=self.arrow,
                                       color=QtFusionPalette.BORDER_LIGHT)
-        cx, cy = METRICS.arrow_width / 2, (self.height - 2) / 2
+        cx, cy = self._metrics.arrow_width / 2, ((self.height - 2) / 2) - 1.0
         self._chevron = b.draw_triangle(
             (cx - 3.5, cy - 1.5), (cx + 3.5, cy - 1.5), (cx, cy + 2.5),
             parent=self.arrow, color=QtFusionPalette.TEXT, fill=QtFusionPalette.TEXT)
@@ -64,6 +66,10 @@ class ComboField:
         if key in self._themes:
             return self._themes[key]
         b, p = self.backend, QtFusionPalette
+        # Theme construction can be reached during retained-widget rebuilds
+        # before a legacy instance has refreshed its live DPI metrics. Fall
+        # back to the backend metrics instead of letting the combo lose style.
+        metrics = getattr(self, "_metrics", None) or metrics_for_backend(b)
         base = self._surface(disabled, focused, hovered)
         with b.theme() as theme:
             with b.theme_component(b.mvAll):
@@ -76,12 +82,12 @@ class ComboField:
                 b.add_theme_color(b.mvThemeCol_BorderShadow, (0, 0, 0, 0))
                 b.add_theme_style(b.mvStyleVar_WindowPadding, 0, 0)
                 b.add_theme_style(b.mvStyleVar_ItemSpacing, 0, 0)
-                b.add_theme_style(b.mvStyleVar_ChildRounding, 0)
+                b.add_theme_style(b.mvStyleVar_ChildRounding, metrics.frame_rounding)
                 b.add_theme_style(b.mvStyleVar_ChildBorderSize, 1)
             with b.theme_component(b.mvButton, enabled_state=not disabled):
-                b.add_theme_color(b.mvThemeCol_Button, base)
-                b.add_theme_color(b.mvThemeCol_ButtonHovered, base)
-                b.add_theme_color(b.mvThemeCol_ButtonActive, base)
+                b.add_theme_color(b.mvThemeCol_Button, (0, 0, 0, 0))
+                b.add_theme_color(b.mvThemeCol_ButtonHovered, (0, 0, 0, 0))
+                b.add_theme_color(b.mvThemeCol_ButtonActive, (0, 0, 0, 0))
                 b.add_theme_color(b.mvThemeCol_Text, p.TEXT_DISABLED if disabled else p.TEXT)
                 b.add_theme_style(b.mvStyleVar_ButtonTextAlign, 0, 0.5)
                 b.add_theme_style(b.mvStyleVar_FramePadding, 7, 0)
@@ -90,14 +96,14 @@ class ComboField:
             if self.editable:
                 with b.theme_component(b.mvInputText, enabled_state=not disabled):
                     for role in (b.mvThemeCol_FrameBg, b.mvThemeCol_FrameBgHovered, b.mvThemeCol_FrameBgActive):
-                        b.add_theme_color(role, base)
+                        b.add_theme_color(role, (0, 0, 0, 0))
                     b.add_theme_color(b.mvThemeCol_Text, p.TEXT_DISABLED if disabled else p.TEXT)
                     b.add_theme_color(b.mvThemeCol_TextDisabled, p.TEXT_DISABLED)
                     b.add_theme_color(b.mvThemeCol_TextSelectedBg, p.SELECTION_ACTIVE)
                     cursor_role = getattr(b, "mvThemeCol_InputTextCursor", None)
                     if cursor_role is not None:
                         b.add_theme_color(cursor_role, p.TEXT_DISABLED if disabled else p.TEXT)
-                    b.add_theme_style(b.mvStyleVar_FramePadding, 7, METRICS.combo_editor_frame_pad_y)
+                    b.add_theme_style(b.mvStyleVar_FramePadding, 7, metrics.combo_editor_frame_pad_y)
                     b.add_theme_style(b.mvStyleVar_FrameBorderSize, 0)
                     b.add_theme_style(b.mvStyleVar_FrameRounding, 0)
         self._themes[key] = theme
@@ -111,8 +117,8 @@ class ComboField:
             return p.BASE
         # Fusion's fixed-choice combo is a button, not a white line editor.
         # Focus changes the outline only; hover/press use quiet neutral fills.
-        return ((225, 225, 225, 255) if self._popup_visible else
-                (248, 248, 248, 255) if hovered else p.BUTTON)
+        return (p.BUTTON_ACTIVE if self._popup_visible else
+                p.BUTTON_HOVER if hovered else p.BUTTON)
 
     def _clicked(self, *_args):
         if self._enabled and not self._deleted:
@@ -167,13 +173,26 @@ class ComboField:
         self._refresh_signature = signature
         try:
             theme = self._theme(not self._enabled, focused, hovered)
-            for item in (self.tag, self.button, self._arrow_host):
+            for item in (self.tag, self.button):
                 if self._item_exists(item):
                     b.bind_item_theme(item, theme)
+            if self._item_exists(self._arrow_host):
+                # The arrow viewport must not paint a square child background
+                # over the shell's rounded right corners.
+                host_theme = self._themes.get('arrow_host')
+                if host_theme is None:
+                    with b.theme() as host_theme:
+                        with b.theme_component(b.mvChildWindow):
+                            b.add_theme_color(b.mvThemeCol_ChildBg, (0, 0, 0, 0))
+                            b.add_theme_style(b.mvStyleVar_WindowPadding, 0, 0)
+                            b.add_theme_style(b.mvStyleVar_ChildBorderSize, 0)
+                            b.add_theme_style(b.mvStyleVar_ChildRounding, 0)
+                    self._themes['arrow_host'] = host_theme
+                b.bind_item_theme(self._arrow_host, host_theme)
             arrow_fill = (self._surface(not self._enabled, focused, hovered)
                           if not self.editable else
-                          (225, 225, 225, 255) if self._popup_visible else
-                          (248, 248, 248, 255) if arrow_hovered else p.BUTTON)
+                          p.BUTTON_ACTIVE if self._popup_visible else
+                          p.BUTTON_HOVER if arrow_hovered else p.BUTTON)
             if self._item_exists(self._arrow_bg):
                 b.configure_item(self._arrow_bg, fill=arrow_fill if self._enabled else p.BUTTON_DISABLED)
             if self._item_exists(self._separator):
@@ -185,6 +204,17 @@ class ComboField:
             # A late visible/focus callback must be a no-op once any native
             # subcontrol disappears; never let it escape into WinUx's error UI.
             return
+
+    def refreshTheme(self):
+        """Re-materialize palette-dependent field resources in place."""
+        if self._deleted:
+            return False
+        # Keep old retained theme objects alive while native items may still
+        # reference them; simply stop reusing them for the new color scheme.
+        self._themes = {}
+        self._refresh_signature = None
+        self._refresh()
+        return True
 
     def setPopupVisible(self, visible):
         self._popup_visible = bool(visible)
@@ -217,7 +247,7 @@ class ComboField:
                 except Exception:
                     pass
             return
-        available = max(1, self._width - METRICS.arrow_width - 14)
+        available = max(1, self._width - self._metrics.arrow_width - 14)
         label = self._text
         try:
             measure = self.backend.get_text_size
@@ -251,26 +281,50 @@ class ComboField:
         if self.editable:
             b.configure_item(
                 self.button,
-                width=max(1, width - METRICS.arrow_width - 2),
+                width=max(1, width - self._metrics.arrow_width - 2),
                 height=max(1, height - 2),
             )
-            b.configure_item(self._arrow_host, pos=(width - METRICS.arrow_width - 1, 1),
-                             width=METRICS.arrow_width, height=height - 2)
+            b.configure_item(self._arrow_host, pos=(width - self._metrics.arrow_width - 1, 1),
+                             width=self._metrics.arrow_width, height=height - 2)
         else:
             b.configure_item(self.button, height=height - 2)
         # Keep one field-sized overlay at a stable origin. Some renderer builds
         # retain a drawlist's original draw origin after configure_item(pos=...).
         # Position the arrow primitives themselves, not the drawlist viewport.
-        overlay_width = METRICS.arrow_width if self.editable else max(1, width - 2)
+        overlay_width = self._metrics.arrow_width if self.editable else max(1, width - 2)
         b.configure_item(self.arrow, width=overlay_width, height=height - 2)
-        arrow_x = max(0, overlay_width - METRICS.arrow_width)
+        arrow_x = max(0, overlay_width - self._metrics.arrow_width)
         b.configure_item(self._arrow_bg, pmin=(arrow_x, 0), pmax=(overlay_width, height - 2))
         b.configure_item(self._separator, p1=(arrow_x, 0), p2=(arrow_x, height - 2))
-        cx, cy = arrow_x + METRICS.arrow_width / 2, (height - 2) / 2
+        cx, cy = arrow_x + self._metrics.arrow_width / 2, ((height - 2) / 2) - 1.0
         b.configure_item(self._chevron, p1=(cx - 3.5, cy - 1.5),
                          p2=(cx + 3.5, cy - 1.5), p3=(cx, cy + 2.5))
         if not self.editable:
             self.setText(self._text)
+
+    def applyMetrics(self, metrics):
+        """Apply a live DPI metric set without recreating the combo field."""
+        if self._deleted or metrics == self._metrics:
+            return False
+        self._metrics = metrics
+        self.height = metrics.control_height
+        # Theme objects capture pixel padding/rounding. Delete and lazily
+        # rebuild them so a monitor move cannot reuse the previous DPI chrome.
+        for theme in tuple(self._themes.values()):
+            try:
+                if self.backend.does_item_exist(theme):
+                    self.backend.delete_item(theme)
+            except Exception:
+                pass
+        self._themes.clear()
+        self._refresh_signature = None
+        try:
+            self.backend.configure_item(self.tag, height=self.height)
+        except Exception:
+            pass
+        self.syncGeometry()
+        self._refresh()
+        return True
 
     def delete(self):
         if self._deleted:

@@ -1,43 +1,50 @@
-"""Controller composition helpers.
+"""Controller composition helpers with dependency-safe lazy imports.
 
-The public ``WinUXController`` facade remains in :mod:`WinUx.controller`.
-Modules in this package describe the contracts used to compose that facade.
+The main application only needs a subset of controllers to paint its first
+frame.  Keeping this package lazy preserves the historical public imports while
+preventing optional feature controllers from extending cold-start time.
 """
+from __future__ import annotations
 
-from .connection import ConnectionController
-from .job_polling import JobPollingController
-from .job_plot import JobPlotController
-from .job_schedule import JobScheduleController
-from .schedule_manifest import ScheduleManifestController
-from .transfer import TransferController
-from .sync_preview import SyncPreviewController
-from .local_watch import LocalWatchController
-from .navigation import NavigationController
-from .server_notepad import ServerNotepadController
-from .file_clipboard import FileClipboardController
-from .clipboard_transfer import ClipboardTransferController
-from .file_commands import FileCommandController
-from .job_actions import JobActionsController
-from .job_submission import JobSubmissionController
-from .inp_analysis import InpAnalysisController
-from .odb_analysis import OdbAnalysisController
-from .explorer_transfer_interaction import ExplorerTransferInteractionMixin
-from .callbacks import (
-    REQUIRED_CALLBACK_KEYS,
-    build_controller_callbacks,
-    validate_callbacks,
-)
+from importlib import import_module
 
-__all__ = [
-    "ConnectionController", "JobPollingController",
-    "JobPlotController", "JobScheduleController",
-    "ScheduleManifestController", "TransferController", "SyncPreviewController",
-    "LocalWatchController", "NavigationController",
-    "ServerNotepadController",
-    "FileClipboardController", "ClipboardTransferController",
-    "FileCommandController", "JobActionsController", "JobSubmissionController", "InpAnalysisController", "OdbAnalysisController",
-    "ExplorerTransferInteractionMixin",
-    "REQUIRED_CALLBACK_KEYS",
-    "build_controller_callbacks",
-    "validate_callbacks",
-]
+_LAZY_CONTROLLERS = {
+    "ConnectionController": (".connection", "ConnectionController"),
+    "JobPollingController": (".jobs.polling", "JobPollingController"),
+    "JobPlotController": (".jobs.plot", "JobPlotController"),
+    "JobScheduleController": (".jobs.schedule", "JobScheduleController"),
+    "ScheduleManifestController": (".jobs.manifest", "ScheduleManifestController"),
+    "TransferController": (".transfer.controller", "TransferController"),
+    "SyncPreviewController": (".transfer.sync_preview", "SyncPreviewController"),
+    "LocalWatchController": (".explorer.local_watch", "LocalWatchController"),
+    "NavigationController": (".explorer.navigation", "NavigationController"),
+    "ServerNotepadController": (".server_notepad", "ServerNotepadController"),
+    "FileClipboardController": (".explorer.clipboard", "FileClipboardController"),
+    "ClipboardTransferController": (".transfer.clipboard", "ClipboardTransferController"),
+    "FileCommandController": (".explorer.commands", "FileCommandController"),
+    "JobActionsController": (".jobs.actions", "JobActionsController"),
+    "JobSubmissionController": (".jobs.submission", "JobSubmissionController"),
+    "InpAnalysisController": (".inp.analysis", "InpAnalysisController"),
+    "OdbAnalysisController": (".odb.analysis", "OdbAnalysisController"),
+    "ExplorerTransferInteractionMixin": (".explorer.transfer_interaction", "ExplorerTransferInteractionMixin"),
+    "SavedNavigationMixin": (".explorer.saved_navigation", "SavedNavigationMixin"),
+    "ConsoleFacadeMixin": (".console", "ConsoleFacadeMixin"),
+    "REQUIRED_CALLBACK_KEYS": (".callbacks", "REQUIRED_CALLBACK_KEYS"),
+    "build_controller_callbacks": (".callbacks", "build_controller_callbacks"),
+    "validate_callbacks": (".callbacks", "validate_callbacks"),
+}
+
+__all__ = list(_LAZY_CONTROLLERS)
+
+def __getattr__(name):
+    target = _LAZY_CONTROLLERS.get(name)
+    if target is None:
+        raise AttributeError(
+            "module {!r} has no attribute {!r}".format(__name__, name))
+    module_name, attribute_name = target
+    value = getattr(import_module(module_name, __name__), attribute_name)
+    globals()[name] = value
+    return value
+
+def __dir__():
+    return sorted(set(globals()) | set(__all__))

@@ -9,7 +9,8 @@ geometry/lifecycle.
 """
 from __future__ import annotations
 
-from .object import Qt, QObject, QEvent, QKeyEvent, QMouseEvent, Signal
+from .object import Qt, QObject, QEvent, Signal
+from ..gui.events import QKeyEvent, QMouseEvent, QWheelEvent
 
 
 class QInputTarget(QObject):
@@ -111,6 +112,9 @@ class QInputTarget(QObject):
                 return bool(self._key_handler(event))
         elif event_type in (QEvent.MouseButtonPress, QEvent.MouseButtonRelease, QEvent.MouseMove):
             if self._pointer_handler is not None and isinstance(event, QMouseEvent):
+                return bool(self._pointer_handler(event))
+        elif event_type == QEvent.Wheel:
+            if self._pointer_handler is not None and isinstance(event, QWheelEvent):
                 return bool(self._pointer_handler(event))
         elif event_type in (QEvent.Enter, QEvent.Leave):
             if self._pointer_handler is not None:

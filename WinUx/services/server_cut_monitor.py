@@ -6,6 +6,8 @@ from dataclasses import dataclass
 import threading
 import time
 
+from DearUIQt.core import QObject, QThread, Signal, Qt
+
 
 @dataclass
 class _CutBatch:
@@ -14,6 +16,24 @@ class _CutBatch:
     deadline: float
     retry_at: float = 0.0
     failures: int = 0
+
+
+
+
+class _ServerCutWorker(QObject):
+    """QObject worker owning the staged remote-Cut supervisor loop."""
+
+    def __init__(self, monitor, thread):
+        super().__init__()
+        self.finished = Signal(self)
+        self._monitor = monitor
+        self._thread = thread
+
+    def run(self):
+        try:
+            self._monitor._run(self._thread)
+        finally:
+            self.finished.emit()
 
 
 class ServerCutMonitor:
@@ -32,6 +52,7 @@ class ServerCutMonitor:
         self._sequence = 0
         self._closed = False
         self._thread = None
+        self._worker = None
 
     def register(self, remote_paths, staged_paths):
         remote_paths, staged_paths = list(remote_paths), list(staged_paths)
@@ -49,9 +70,17 @@ class ServerCutMonitor:
                 getattr(self.app, "_connection_generation", None),
                 self._clock() + 24 * 60 * 60)
             if self._thread is None:
-                self._thread = threading.Thread(target=self._run, daemon=True,
-                                                name="winux-server-cut-monitor")
-                self._thread.start()
+                thread = QThread(name="winux-server-cut-monitor", daemon=True)
+                worker = _ServerCutWorker(self, thread)
+                worker.moveToThread(thread)
+                thread.started.connect(worker.run, receiver=worker)
+                worker.finished.connect(
+                    thread.quit, connection_type=Qt.DirectConnection)
+                thread.finished.connect(worker.deleteLater, receiver=worker)
+                thread.finished.connect(thread.deleteLater)
+                self._thread = thread
+                self._worker = worker
+                thread.start()
             self._condition.notify_all()
         return token
 
@@ -116,21 +145,26 @@ class ServerCutMonitor:
                 connection == getattr(self.app, "_connection_generation", None)):
             self.app._server_cut_committed_to_explorer(count)
 
-    def _run(self):
+    def _run(self, thread):
         while True:
             with self._condition:
-                while not self._closed and not self._batches:
+                while (not self._closed and not self._batches and
+                       not thread.isInterruptionRequested()):
                     self._condition.wait()
-                if self._closed:
+                if self._closed or thread.isInterruptionRequested():
                     return
             self._poll_once()
             with self._condition:
-                if self._closed:
+                if self._closed or thread.isInterruptionRequested():
                     return
                 self._condition.wait(0.5)
 
     def close(self):
+        thread = None
         with self._condition:
             self._closed = True
             self._batches.clear()
+            thread = self._thread
             self._condition.notify_all()
+        if thread is not None:
+            thread.requestInterruption()

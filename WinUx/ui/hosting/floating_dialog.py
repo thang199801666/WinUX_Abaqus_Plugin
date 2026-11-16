@@ -10,6 +10,8 @@ from __future__ import annotations
 import queue
 import socket
 from pathlib import Path
+
+from winux_runtime.logging_policy import trim_log_tail
 import threading
 import time
 from datetime import datetime
@@ -35,7 +37,9 @@ from .process import floating_dialog_command, floating_dialog_log_path
 from .host import dialog_host_manager
 
 
-_DIALOG_IPC_POOL = QThreadPool(maxThreadCount=32, maxPending=256, name="dialog-ipc")
+_DIALOG_IPC_POOL = QThreadPool.taskLane(
+    "dialog-ipc", maxThreadCount=32, maxPending=256,
+    category="ui.floating.ipc", owner="floating_dialog")
 
 
 def close_floating_dialogs(view):
@@ -70,7 +74,7 @@ class FloatingDialogController:
     def __init__(self, view, kind, title, payload=None, width=560, height=360,
                   modal=False, resizable=True, visible=True, owner_hwnd=None,
                   allow_minimize=False, allow_maximize=False, fast_startup=True,
-                  retain_on_close=False, fresh_host=False):
+                  retain_on_close=False, fresh_host=False, fast_publish=False):
         self.view, self.modal = view, bool(modal)
         self._kind = str(kind)
         self._ipc_retry_count = 0
@@ -80,6 +84,7 @@ class FloatingDialogController:
         # the controller/widget object remains alive.  This is opt-in because
         # result/progress dialogs rely on destruction to complete their result.
         self._retain_on_close = bool(retain_on_close)
+        self._fast_publish = bool(fast_publish and not modal)
         self._resident_generation = 0
         self._requested_at = time.perf_counter()
         self.title = title
@@ -153,13 +158,15 @@ class FloatingDialogController:
             Path(self.log_path).parent.mkdir(parents=True, exist_ok=True)
             Path(self.log_path).touch(exist_ok=True)
             self.post("init", kind=kind, title=title, payload=payload or {},
+                      ui_theme=getattr(view, "ui_theme", "Light"),
                       lease=self._lease, reuse_host=self._reuse_host,
                       fast_startup=bool(fast_startup),
                       authorized_hwnd=(lease.hwnd if self._from_prewarm and fast_startup else None),
                       width=width, height=height, resizable=resizable,
                       allow_minimize=bool(allow_minimize), allow_maximize=bool(allow_maximize),
                       owner_hwnd=self._owner_hwnd, visible=self._visible, modal=self.modal,
-                      retain_on_close=self._retain_on_close)
+                      retain_on_close=self._retain_on_close,
+                      fast_publish=self._fast_publish)
         except Exception:
             lease.retire()
             self._finish()
@@ -424,13 +431,16 @@ class FloatingDialogController:
                 self.post("publish")
         elif event == "staged":
             # The child is now mapped/rendered/activated but still DWM-cloaked.
-            # Native owner modality can be armed without an activation bounce,
-            # then the child is allowed to remove its cloak atomically.
+            # Native owner modality can be armed without an activation bounce.
+            # Modeless dock tear-offs use a single-phase native publish and do
+            # not need a parent round-trip before DWM reveal.
             self._accept_native_hwnd(message)
             if bool(message.get("visible", self._visible)) and self.modal:
-                if self._owner_hwnd and not self._owner_acquired:
+                if (self._owner_hwnd and self._hwnd and not self._owner_acquired
+                        and int(_foreground_hwnd() or 0) == int(self._hwnd or 0)):
                     self._owner_acquired = _acquire_modal_owner(self._owner_hwnd)
-            self.post("publish_commit")
+            if bool(message.get("publish_commit_required", True)):
+                self.post("publish_commit")
         elif event == "ready":
             if self._ready:
                 return
@@ -571,6 +581,7 @@ class FloatingDialogController:
         try:
             path = Path(self.log_path)
             path.parent.mkdir(parents=True, exist_ok=True)
+            trim_log_tail(str(path), max_bytes=256 * 1024, keep_bytes=64 * 1024)
             with path.open("a", encoding="utf-8", errors="replace") as log:
                 log.write("\n=== {} ===\n".format(datetime.now().isoformat(timespec="seconds")))
                 if stage:
@@ -763,6 +774,42 @@ class FloatingDialogController:
         for callback in callbacks:
             self.view.after(0, callback)
 
+    def show_immediate(self, drag_anchor=None):
+        """Reveal a ready modeless HWND before the child consumes IPC.
+
+        Detached docks keep a fully rendered hidden native mirror.  Waiting for
+        ``activate`` to cross the socket, wake the child loop and call ShowWindow
+        adds visible latency despite there being no render work left.  Reveal
+        that settled HWND synchronously and let the normal activate command
+        reconcile child-side visibility immediately afterward.
+        """
+        if self._closed:
+            return False
+        if (not self.modal and self._ready and self._hwnd
+                and not getattr(self, "_native_visible", False)):
+            from ..native.native_dock_gesture import reveal_prepared_dock
+            # The hidden resident HWND is deliberately disabled/non-activatable
+            # during warm-up. Reveal its pixels now, but let its GUI thread
+            # enable/activate it before starting the original caption gesture.
+            # A parent-side WM_NCLBUTTONDOWN sent before the activate command
+            # is consumed gets discarded by USER32 while the HWND is disabled.
+            if reveal_prepared_dock(self._hwnd, drag_anchor, begin_move=False):
+                if self._retain_on_close:
+                    self._resident_generation += 1
+                    self._host_manager.retained_visible(self)
+                self._set_visible(True)
+                self._native_visible = True
+                self._schedule_owner_presentation_guard()
+                register_native_pointer_surface(self._hwnd)
+                self._flush_first_present_callbacks()
+                # Child state/render-loop reconciliation remains asynchronous;
+                # the user already sees the last fully settled frame.
+                self.post("activate")
+                if drag_anchor is not None:
+                    self.post("begin_dock_move", drag_anchor)
+                return True
+        return self.show()
+
     def show(self):
         if self._closed:
             return False
@@ -775,6 +822,20 @@ class FloatingDialogController:
     def hide(self):
         if self._closed:
             return False
+        # Process-hosted dialogs can own selectors/secondary dialogs too.
+        # Retaining the parent must not leave those native children orphaned.
+        for child in tuple(getattr(self, "_owned_dialogs", ())):
+            try:
+                if not getattr(child, "_closed", False):
+                    child.destroy(return_focus=False)
+            except TypeError:
+                try:
+                    child.destroy()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        getattr(self, "_owned_dialogs", []).clear()
         try:
             return_focus = bool(
                 self._hwnd and int(_foreground_hwnd() or 0) == int(self._hwnd))
@@ -815,7 +876,9 @@ class FloatingDialogController:
                 pass
             if self.modal:
                 acquire_native_modal_input(self)
-                if self._hwnd and self._owner_hwnd and not self._owner_acquired:
+                if (self._hwnd and self._owner_hwnd and not self._owner_acquired
+                        and self._native_visible
+                        and int(_foreground_hwnd() or 0) == int(self._hwnd)):
                     self._owner_acquired = _acquire_modal_owner(self._owner_hwnd)
         else:
             # If no child HWND has ever become visible there is nothing to wait
@@ -837,6 +900,7 @@ class FloatingDialogController:
             else:
                 unregister_native_pointer_surface(self._hwnd)
         if visible:
+            self._schedule_owner_presentation_guard()
             if self._retain_on_close:
                 self._host_manager.retained_visible(self)
             if self._visible:
@@ -862,6 +926,33 @@ class FloatingDialogController:
         if self._retain_on_close:
             self._resident_generation += 1
             self._host_manager.retained_hidden(self)
+
+    def _schedule_owner_presentation_guard(self):
+        if (getattr(self, "_owner_guard_scheduled", False) or self._closed
+                or not self._visible or not self._native_visible
+                or not self._owner_was_visible):
+            return
+        self._owner_guard_scheduled = True
+        schedule = getattr(self.view, "after_render", None)
+        if callable(schedule):
+            schedule(self._guard_owner_presentation)
+        else:
+            self.view.after(16, self._guard_owner_presentation)
+
+    def _guard_owner_presentation(self):
+        self._owner_guard_scheduled = False
+        if (self._closed or not self._visible or not self._native_visible
+                or not self._owner_was_visible):
+            return
+        try:
+            from DearUIQt.backends.native_windows import NativeWindowBackend
+            NativeWindowBackend().preserveOwnerPresentation(
+                self._owner_hwnd, self._hwnd, was_visible=self._owner_was_visible)
+            if (self.modal and not self._owner_acquired and self._owner_hwnd and self._hwnd
+                    and int(_foreground_hwnd() or 0) == int(self._hwnd or 0)):
+                self._owner_acquired = _acquire_modal_owner(self._owner_hwnd)
+        finally:
+            self._schedule_owner_presentation_guard()
 
     def _release_visibility_guards(self, queue_focus=False, force_focus=False):
         getattr(self, "_first_present_callbacks", []).clear()

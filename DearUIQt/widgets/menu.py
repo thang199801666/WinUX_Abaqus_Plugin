@@ -6,9 +6,12 @@ without falling back to a second UI toolkit.
 """
 from __future__ import annotations
 
-from ..core.object import QEvent, QKeyEvent, QObject, Signal, QPoint, QRect
+from ..core.object import Qt, QEvent, QObject, Signal, QPoint, QRect
+from ..gui.events import QKeyEvent
 from ..gui.action import QAction
+from ..gui.popup_surface import QPopupSurface
 from ..gui.palette import QtFusionMetrics, QtFusionPalette
+from ..gui.style import METRICS, metrics_for_backend
 from ..themes import (
     ThemeTarget, ThemeColor, ThemeStyle, theme_component, make_theme,
     menu_surface_theme,
@@ -27,7 +30,8 @@ def _normalize_action(spec):
         return {"id": spec._action_key, "label": spec.text(), "action": spec._action_key,
                 "_qaction": spec, "enabled": spec.isEnabled(), "visible": spec.isVisible(),
                 "checkable": spec.isCheckable(), "checked": spec.isChecked(),
-                "children": [], "separator": False, "icon": spec.icon()}
+                "children": [], "separator": False, "icon": spec.icon(),
+                "shortcut": spec.shortcut().toString()}
     if isinstance(spec, dict):
         item = dict(spec)
         if isinstance(item.get("_qaction"), QAction):
@@ -70,6 +74,12 @@ _MENU_ROW_THEME_TAGS = {}
 _MENU_TEXT_THEME_TAGS = {}
 
 
+def invalidate_menu_theme_cache():
+    """Drop QMenu row/text lookup caches after a palette scheme change."""
+    _MENU_ROW_THEME_TAGS.clear()
+    _MENU_TEXT_THEME_TAGS.clear()
+
+
 def _exists(backend, item):
     try:
         return bool(item is not None and backend.does_item_exist(item))
@@ -93,11 +103,12 @@ def _row_theme(backend, *, hovered=False, disabled=False):
         "hover" if hovered else "normal",
         "disabled" if disabled else "enabled",
     )
+    normal_surface = p.WINDOW_ALT
     value = make_theme(theme_component(
         ThemeTarget.CHILD_WINDOW,
         colors={
             ThemeColor.CHILD_BACKGROUND:
-                p.MENU_HOVER if hovered and not disabled else p.MENU,
+                p.MENU_HOVER if hovered and not disabled else normal_surface,
             ThemeColor.BORDER: (0, 0, 0, 0),
         },
         styles={
@@ -161,6 +172,8 @@ class ImGuiMenu(QObject):
     WINDOW_PAD_Y = 3
     SEPARATOR_PAD_Y = 2
     SEPARATOR_HEIGHT = 1
+    SUBMENU_MIN_WIDTH = 168
+    SUBMENU_GAP = 1
 
     def __init__(self, actions=(), *, backend=None, after=None,
                  min_width=150, max_width=420, _parent_menu=None, parent_window=None,
@@ -177,6 +190,27 @@ class ImGuiMenu(QObject):
             from ..backends import get_backend
             backend = get_backend()
         self.backend = backend
+        metrics = metrics_for_backend(backend)
+        scale = metrics.control_height / max(1.0, float(METRICS.control_height))
+        scaled = lambda value: max(1, int(round(float(value) * scale)))
+        # Per-instance menu geometry avoids global metric mutation and lets one
+        # process host backends at different logical DPI values.  The 96-DPI
+        # values remain byte-for-byte compatible with the historical layout.
+        self.ROW_HEIGHT = metrics.menu_row_height
+        self.ICON_SIZE = scaled(type(self).ICON_SIZE)
+        self.ICON_SLOT = scaled(type(self).ICON_SLOT)
+        self.ARROW_SLOT = scaled(type(self).ARROW_SLOT)
+        self.SHORTCUT_GAP = scaled(type(self).SHORTCUT_GAP)
+        self.ROW_PAD_X = scaled(type(self).ROW_PAD_X)
+        self.LABEL_PAD = scaled(type(self).LABEL_PAD)
+        self.ICON_Y_NUDGE = scaled(type(self).ICON_Y_NUDGE)
+        self.TEXT_Y_NUDGE = -scaled(abs(type(self).TEXT_Y_NUDGE))
+        self.WINDOW_PAD_X = scaled(type(self).WINDOW_PAD_X)
+        self.WINDOW_PAD_Y = scaled(type(self).WINDOW_PAD_Y)
+        self.SEPARATOR_PAD_Y = scaled(type(self).SEPARATOR_PAD_Y)
+        self.SEPARATOR_HEIGHT = scaled(type(self).SEPARATOR_HEIGHT)
+        self.SUBMENU_MIN_WIDTH = scaled(type(self).SUBMENU_MIN_WIDTH)
+        self.SUBMENU_GAP = scaled(type(self).SUBMENU_GAP)
         self.triggered = Signal(self)
         self.aboutToShow = Signal(self)
         self.aboutToHide = Signal(self)
@@ -187,6 +221,9 @@ class ImGuiMenu(QObject):
         self._items = {}
         self._rows = {}
         self._row_specs = {}
+        self._row_hover_state = {}
+        self._row_hover_layers = {}
+        self._row_dirty_rects = {}
         self._handlers = []
         self._submenus = {}
         self._open_submenu = None
@@ -213,11 +250,29 @@ class ImGuiMenu(QObject):
         self._input_shield_top = 0.0
         self.tag = backend.generate_uuid()
         self._popup_input_owned = False
+        # Logical popup state is authoritative. Renderer visibility can be
+        # transient for one frame during native viewport activation/teardown,
+        # so lifecycle signals and input release must not be driven from
+        # is_item_shown(). This also makes hide() idempotent like QMenu.
+        self._popup_surface = QPopupSurface(parent=self)
+        self._popup_open = False
         self._opened_frame = -1
+        self._opening_pointer_buttons = set()
+        self._opening_release_frame = -1
+        self._native_popup_pending = None
+        self._native_popup_geometry = None
+        self._popup_position_resolver = None
+        self._last_popup_geometry = None
+        self._native_popup_registry = None
         # Coordinate contract of the most recent popup. Root context menus use
         # desktop screen coordinates; menu-bar/tool-button menus remain
         # renderer/viewport-local. Nested submenus inherit the root contract.
         self._popup_global_position = False
+        try:
+            from ..gui.palette import color_scheme
+            self._palette_scheme = color_scheme()
+        except Exception:
+            self._palette_scheme = None
         if parent_window is None:
             # Dear ImGui popup windows are auto-dismissed by the engine the
             # moment any nested popup is opened (the parent popup is dropped
@@ -238,6 +293,10 @@ class ImGuiMenu(QObject):
                     min_size=(self._min_width, 1),
                     max_size=(self._max_width, 30000),
                     no_title_bar=True, no_resize=True, no_move=True,
+                    # QMenu owns keyboard routing logically. Do not let ImGui
+                    # activate/raise its native viewport when it appears or a
+                    # row takes focus: that deactivates/repaints the owner.
+                    no_focus_on_appearing=True, no_bring_to_front_on_focus=True,
                     no_saved_settings=True, no_scrollbar=True,
                     no_scroll_with_mouse=True):
                 pass
@@ -249,6 +308,14 @@ class ImGuiMenu(QObject):
                 width=self._min_width, height=40, border=True,
                 no_scrollbar=True, no_scroll_with_mouse=True)
         register_pointer_protected_item(self.tag)
+        if parent_window is None:
+            try:
+                with backend.item_handler_registry() as registry:
+                    backend.add_item_visible_handler(callback=self._sync_native_popup)
+                backend.bind_item_handler_registry(self.tag, registry)
+                self._native_popup_registry = registry
+            except (AttributeError, RuntimeError, SystemError):
+                pass
         try:
             backend.bind_item_theme(self.tag, _menu_theme(backend))
         except Exception:
@@ -287,6 +354,10 @@ class ImGuiMenu(QObject):
                     button=b.mvMouseButton_Left, callback=self._pointer_clicked)
                 b.add_mouse_click_handler(
                     button=b.mvMouseButton_Right, callback=self._pointer_clicked)
+                for button in (b.mvMouseButton_Left, b.mvMouseButton_Right):
+                    b.add_mouse_release_handler(
+                        button=button, callback=self._opening_pointer_released,
+                        user_data=button)
             self._keyboard_registry = registry
         except Exception:
             self._keyboard_registry = None
@@ -309,7 +380,19 @@ class ImGuiMenu(QObject):
     def _opening_pointer_frame(self):
         root = self._root_menu()
         frame = self._pointer_frame()
-        return frame is not None and frame == getattr(root, "_opened_frame", -1)
+        # Manual callback queues and the item-bound fallback can deliver the
+        # opening click on the next render turn. Guard the whole press/release
+        # gesture, not just the frame in which popup() happened to run.
+        return bool(root._opening_pointer_buttons) or (
+            frame is not None and (
+                0 <= frame - getattr(root, "_opened_frame", -1) <= 1
+                or frame == root._opening_release_frame))
+
+    def _opening_pointer_released(self, sender=None, app_data=None, user_data=None):
+        root = self._root_menu()
+        if user_data in root._opening_pointer_buttons:
+            root._opening_pointer_buttons.discard(user_data)
+            root._opening_release_frame = self._pointer_frame()
 
     def _row_click_already_dispatched(self):
         """Deduplicate the global click callback and the drawn-row callback."""
@@ -357,7 +440,8 @@ class ImGuiMenu(QObject):
             bottom = min(bottom, pbottom)
         if right <= left or bottom <= top:
             return None
-        return left, top, right, bottom
+        rect = (left, top, right, bottom)
+        return self._popup_screen_rect(rect) if self._popup_global_position else rect
 
     def _drawlist_hovered(self, sender=None, app_data=None, user_data=None):
         # A row-wide drawlist anchors the filled triangle at the right edge.
@@ -392,7 +476,11 @@ class ImGuiMenu(QObject):
         if frame is not None and root._last_row_click_frame == frame:
             return
 
-        x, y = root.backend.get_mouse_pos(local=False)
+        if root._popup_global_position:
+            from ..gui.system import QCursor
+            x, y = QCursor.screenPos(backend=root.backend).toTuple()
+        else:
+            x, y = root.backend.get_mouse_pos(local=False)
 
         # Hit-test each open submenu first, then its ancestors. Clicking
         # another group in the parent must still switch submenus.
@@ -421,20 +509,59 @@ class ImGuiMenu(QObject):
                     continue
             except Exception:
                 continue
-            bounds = dpg_window_rect(candidate.backend, candidate.tag, clip=False)
-            if bounds is None:
-                continue
-            left, top, right, bottom = bounds
-            if left <= x < right and top <= y < bottom:
+            if candidate.containsGlobalPoint((x, y)):
                 return
 
         root.hide(consume_pointer=True)
 
+
+    def _request_popup_update(self, region=None):
+        surface = getattr(self, "_popup_surface", None)
+        if surface is None or not surface.isVisible():
+            return False
+        return bool(surface.invalidate(region))
+
+    def _row_dirty_region(self, action_id):
+        rect = self._row_dirty_rects.get(str(action_id))
+        if rect is None:
+            return None
+        popup = self._popup_surface.geometry() if getattr(self, "_popup_surface", None) is not None else QRect()
+        # QWindowHost damage is expressed in host coordinates. Row rectangles
+        # are retained popup-local geometry and are translated exactly once.
+        return QRect(popup.x() + rect.x(), popup.y() + rect.y(), rect.width(), rect.height())
+
+    def popupDiagnostics(self):
+        surface = getattr(self, "_popup_surface", None)
+        snapshot = surface.diagnosticsSnapshot() if surface is not None else {}
+        snapshot.update({
+            "tag": self.tag,
+            "popup_open": bool(getattr(self, "_popup_open", False)),
+            "active_action": self._active_action,
+            "input_gate_owned": bool(getattr(self, "_popup_input_owned", False)),
+            "row_count": len(self._rows),
+        })
+        return snapshot
+
     def _set_active_action(self, action_id):
+        """Change the highlighted row without repainting the whole menu.
+
+        Dear PyGui hover handlers fire every rendered frame (and the row-wide
+        arrow drawlist can report the same hover a second time). Rebinding every
+        row theme on each callback forces retained/native menu surfaces to dirty
+        continuously and can make the owner HWND title/non-client area flash on
+        Windows. Treat highlight as retained state: identical hover is a no-op,
+        and a real transition touches only the old and new rows.
+        """
         action_id = None if action_id is None else str(action_id)
+        previous = self._active_action
+        if previous == action_id:
+            return False
         self._active_action = action_id
-        for key in tuple(self._rows):
-            self._set_row_hover(key, key == action_id)
+        if previous is not None:
+            self._set_row_hover(previous, False)
+        if action_id is not None:
+            self._set_row_hover(action_id, True)
+        return True
 
     def _deepest_open_menu(self):
         menu = self
@@ -451,6 +578,8 @@ class ImGuiMenu(QObject):
         return self._handle_key(user_data)
 
     def _handle_key(self, key):
+        from ..core.input import QGlobalInputBinding
+        key = QGlobalInputBinding.qtKeyForNative(key, self.backend)
         root = self._root_menu()
         try:
             if not root.backend.is_item_shown(root.tag):
@@ -459,10 +588,10 @@ class ImGuiMenu(QObject):
             return False
         menu = root._deepest_open_menu()
         ids = menu._visible_action_ids()
-        if key == menu.backend.mvKey_Escape:
+        if key == Qt.Key_Escape:
             root.hide()
             return True
-        if key == menu.backend.mvKey_Left and menu._parent_menu is not None:
+        if key == Qt.Key_Left and menu._parent_menu is not None:
             parent = menu._parent_menu
             parent._hide_open_submenu()
             return True
@@ -471,23 +600,23 @@ class ImGuiMenu(QObject):
         if menu._active_action not in ids:
             menu._set_active_action(ids[0])
         index = ids.index(menu._active_action)
-        if key == menu.backend.mvKey_Up:
+        if key == Qt.Key_Up:
             menu._set_active_action(ids[(index - 1) % len(ids)])
             return True
-        if key == menu.backend.mvKey_Down:
+        if key == Qt.Key_Down:
             menu._set_active_action(ids[(index + 1) % len(ids)])
             return True
         spec = menu._row_specs.get(menu._active_action)
         if spec is None:
             return False
-        if key == menu.backend.mvKey_Right and spec.get("children"):
+        if key == Qt.Key_Right and spec.get("children"):
             menu._show_submenu(menu._active_action, spec)
             child = menu._submenus.get(menu._active_action)
             if child is not None:
                 child_ids = child._visible_action_ids()
                 child._set_active_action(child_ids[0] if child_ids else None)
             return True
-        if key == menu.backend.mvKey_Return or key == getattr(menu.backend, "mvKey_Enter", None):
+        if key in (Qt.Key_Return, Qt.Key_Enter):
             menu._row_clicked(user_data=menu._active_action)
             return True
         return False
@@ -543,6 +672,25 @@ class ImGuiMenu(QObject):
             ids = self._visible_action_ids()
             self._set_active_action(current if current in ids else (ids[0] if ids else None))
 
+    def refreshTheme(self):
+        """Rebind and rebuild visible QMenu chrome for the active palette."""
+        if self._deleted:
+            return False
+        try:
+            from ..gui.palette import color_scheme
+            self._palette_scheme = color_scheme()
+        except Exception:
+            pass
+        current = self._active_action
+        try:
+            self.backend.bind_item_theme(self.tag, _menu_theme(self.backend))
+        except Exception:
+            pass
+        self._rebuild_action_rows()
+        ids = self._visible_action_ids()
+        self._set_active_action(current if current in ids else None)
+        return True
+
     def addAction(self, action):
         if isinstance(action, str):
             action = QAction(action, self)
@@ -568,12 +716,27 @@ class ImGuiMenu(QObject):
             bool(spec.get("checkable")) for spec in visible
             if not spec.get("separator")
         )
+        self._has_icons = any(
+            spec.get("icon") is not None for spec in visible
+            if not spec.get("separator")
+        )
         width = self._estimate_width(visible)
         height = self.WINDOW_PAD_Y * 2
         separator_height = self.SEPARATOR_PAD_Y * 2 + self.SEPARATOR_HEIGHT
+        row_y = self.WINDOW_PAD_Y
         for spec in visible:
-            height += separator_height if spec.get("separator") else self.ROW_HEIGHT
+            if spec.get("separator"):
+                height += separator_height
+                self._build_row(spec, width)
+                row_y += separator_height
+                continue
+            action_id = str(spec.get("action") or spec.get("id") or "")
+            row_width = max(1, int(width) - self.WINDOW_PAD_X * 2)
+            self._row_dirty_rects[action_id] = QRect(
+                self.WINDOW_PAD_X, int(row_y), row_width, self.ROW_HEIGHT)
+            height += self.ROW_HEIGHT
             self._build_row(spec, width)
+            row_y += self.ROW_HEIGHT
         try:
             self.backend.configure_item(
                 self.tag,
@@ -616,6 +779,7 @@ class ImGuiMenu(QObject):
             default=0.0,
         )
         check_slot = 0
+        icon_slot = self.ICON_SLOT if (self._has_checkables or getattr(self, "_has_icons", False)) else 0
         shortcut_slot = shortcut_width + self.SHORTCUT_GAP if shortcut_width else 0.0
         # Width is expressed in the popup coordinate system, including the
         # outer QMenu padding.  The fixed gutters guarantee that every label
@@ -623,7 +787,7 @@ class ImGuiMenu(QObject):
         # accelerators occupy a dedicated, right-aligned column like QMenu.
         fixed = (
             self.WINDOW_PAD_X * 2 + self.ROW_PAD_X * 2 + check_slot +
-            self.ICON_SLOT + self.LABEL_PAD * 2 + self.ARROW_SLOT + shortcut_slot
+            icon_slot + self.LABEL_PAD * 2 + self.ARROW_SLOT + shortcut_slot
         )
         return max(
             self._min_width,
@@ -653,6 +817,8 @@ class ImGuiMenu(QObject):
         self._items.clear()
         self._rows.clear()
         self._row_specs.clear()
+        self._row_hover_state.clear()
+        self._row_dirty_rects.clear()
         self._arrow_offsets.clear()
 
     def _glyph_color(self, enabled=True):
@@ -729,21 +895,43 @@ class ImGuiMenu(QObject):
         except Exception:
             pass
 
+        # Paint hover as a retained draw primitive instead of rebinding the
+        # child-window theme on every row transition. On Win32 multi-viewport
+        # builds, bind_item_theme() dirties the popup viewport and can provoke
+        # a native owner/non-client repaint each time the pointer crosses an
+        # item. A hidden background layer changes only one draw command and
+        # therefore keeps the main window activation/chrome completely stable.
+        hover_layer = None
+        try:
+            hover_layer = b.add_drawlist(
+                parent=row, width=row_width, height=self.ROW_HEIGHT,
+                pos=(0, 0), show=False,
+            )
+            b.draw_rectangle(
+                (0, 0), (row_width, self.ROW_HEIGHT),
+                color=(0, 0, 0, 0), fill=QtFusionPalette.MENU_HOVER,
+                thickness=0.0, parent=hover_layer,
+            )
+        except Exception:
+            hover_layer = None
+        self._row_hover_layers[action_id] = hover_layer
+
         # Do not use a Dear ImGui table for menu rows. Tables apply different
         # vertical metrics to images, text and drawlists, which produces the
         # visibly staggered icons/baselines seen in popup menus. Position all
         # four QMenu columns in one coordinate system instead.
         check_slot = 0
+        icon_slot = self.ICON_SLOT if (self._has_checkables or getattr(self, "_has_icons", False)) else 0
         check_x = self.ROW_PAD_X
         icon_x = (
             self.ROW_PAD_X + check_slot +
-            max(0, (self.ICON_SLOT - self.ICON_SIZE) // 2)
+            max(0, (icon_slot - self.ICON_SIZE) // 2)
         )
         icon_y = max(
             0,
             (self.ROW_HEIGHT - self.ICON_SIZE) // 2 + self.ICON_Y_NUDGE,
         )
-        label_x = self.ROW_PAD_X + check_slot + self.ICON_SLOT + self.LABEL_PAD
+        label_x = self.ROW_PAD_X + check_slot + icon_slot + self.LABEL_PAD
         _text_width, text_height = self._measure_text(spec.get("label", ""))
         label_y = max(0, int(round((self.ROW_HEIGHT - text_height) / 2.0)) +
                       self.TEXT_Y_NUDGE)
@@ -846,24 +1034,82 @@ class ImGuiMenu(QObject):
         spec = self._row_specs.get(action_id)
         row = self._rows.get(action_id)
         if spec is None or row is None:
-            return
+            return False
+        state = (bool(hovered), not bool(spec.get("enabled", True)))
+        if self._row_hover_state.get(action_id) == state:
+            return False
+        self._row_hover_state[action_id] = state
+        hover_layer = getattr(self, "_row_hover_layers", {}).get(action_id)
+        def request_update():
+            request = getattr(self, "_request_popup_update", None)
+            if not callable(request):
+                return False
+            dirty = getattr(self, "_row_dirty_region", None)
+            region = dirty(action_id) if callable(dirty) else None
+            return bool(request(region))
+        if hover_layer is not None:
+            try:
+                # Disabled rows never paint a hover selection. Toggling one
+                # retained drawlist is substantially cheaper and, critically,
+                # does not mutate the popup window/theme state on Win32.
+                self.backend.configure_item(
+                    hover_layer, show=bool(state[0] and not state[1]))
+                request_update()
+                return True
+            except Exception:
+                # Fall back to the historical theme path for minimal/test
+                # backends which do not implement draw-item visibility.
+                pass
         try:
             self.backend.bind_item_theme(row, _row_theme(
-                self.backend, hovered=bool(hovered),
-                disabled=not bool(spec.get("enabled", True))))
+                self.backend, hovered=state[0], disabled=state[1]))
         except Exception:
+            # Semantic hover state is retained even if a renderer theme bind
+            # fails for one frame. A real state transition will retry.
             pass
+        request_update()
+        return True
 
     def _row_hovered(self, sender=None, app_data=None, user_data=None):
         action_id = str(user_data or "")
         spec = self._row_specs.get(action_id)
         if spec is None:
             return
-        self._set_active_action(action_id)
+        changed = self._set_active_action(action_id)
+        # Hover callbacks are level-triggered, not edge-triggered. Once the
+        # active row and submenu topology already match the pointer, do no
+        # renderer/native work at all. This also collapses duplicate callbacks
+        # from the row child-window and its full-row arrow drawlist.
+        if not changed:
+            if spec.get("children") and spec.get("enabled", True):
+                submenu = self._submenus.get(action_id)
+                if self._open_submenu == action_id and submenu is not None and submenu.isVisible():
+                    return
+            elif self._open_submenu is None:
+                return
         if spec.get("children") and spec.get("enabled", True):
             self._show_submenu(action_id, spec)
-        else:
+        elif self._open_submenu is not None:
             self._hide_open_submenu()
+
+    def _deliver_after_hide(self, callback, *args):
+        """Deliver one menu command only after the popup hide transaction.
+
+        QMenu rows are native/retained popup input callbacks.  Emitting QAction
+        or application command signals inline after ``hide()`` still executes
+        in the same renderer callback while the popup surface, mouse grab and
+        native viewport are retiring.  Qt commits the popup close before the
+        command opens another modal/tool.  Use the menu scheduler when one is
+        available; WinUx wires this scheduler to ``after_render``.
+        """
+        if not callable(callback):
+            return False
+        schedule = getattr(self, "_after", None)
+        if callable(schedule):
+            schedule(0, callback, *args)
+            return True
+        callback(*args)
+        return True
 
     def _row_clicked(self, sender=None, app_data=None, user_data=None):
         action_id = str(user_data or "")
@@ -880,8 +1126,14 @@ class ImGuiMenu(QObject):
             root = self._root_menu()
             context = root._context
             root.hide(consume_pointer=True)
-            if shared_action.trigger():
-                root.triggered.emit(shared_action, context)
+
+            def deliver_action(action=shared_action, menu=root, ctx=context):
+                if action._deleted or not action.isEnabled() or not action.isVisible():
+                    return
+                if action.trigger():
+                    menu.triggered.emit(action, ctx)
+
+            QMenu._deliver_after_hide(root, deliver_action)
             return
         action = str(spec.get("action") or spec.get("id") or "")
         if spec.get("checkable"):
@@ -889,8 +1141,9 @@ class ImGuiMenu(QObject):
             item = self._items.get(action_id, {})
             self._sync_leading_indicator(spec, item)
         root = self._root_menu()
-        root.triggered.emit(action, root._context)
+        context = root._context
         root.hide(consume_pointer=True)
+        QMenu._deliver_after_hide(root, root.triggered.emit, action, context)
 
     def _root_menu(self):
         menu = self
@@ -902,7 +1155,7 @@ class ImGuiMenu(QObject):
         if self._open_submenu == action_id:
             submenu = self._submenus.get(action_id)
             if submenu is not None and submenu.isVisible():
-                return
+                return True
             # DPG may dismiss a nested popup itself (outside click/focus).
             # Do not leave the old id latched and ignore the next click.
             self._open_submenu = None
@@ -911,57 +1164,53 @@ class ImGuiMenu(QObject):
         if submenu is None:
             submenu = ImGuiMenu(
                 spec.get("children") or (), backend=self.backend, after=self._after,
-                min_width=self._min_width, max_width=self._max_width,
+                min_width=min(self._min_width, self.SUBMENU_MIN_WIDTH),
+                max_width=self._max_width,
                 _parent_menu=self,
                 parent_window=self._parent_window,
             )
             # Leaf triggers are emitted by the root menu directly, but keep the
             # signal forwarding useful for programmatic callers/tests.
             self._submenus[action_id] = submenu
-        row = self._rows.get(action_id)
-        if row is None:
-            return False
-        # DPG 2.x child windows do not consistently expose rect_min. Use the
-        # shared parent-relative window-geometry adapter for global placement.
-        rect = dpg_window_rect(self.backend, row, clip=False)
-        if rect is None:
-            try:
-                left, top = self.backend.get_item_rect_min(row)
-                width, height = self.backend.get_item_rect_size(row)
-                rect = (left, top, left + width, top + height)
-            except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
-                return False
-        left, top, right, _bottom = rect
-        # Submenus must stay in the same coordinate space as the root menu.
-        # Context menus are opened with desktop/screen coordinates while
-        # menu-bar/tool-button menus use renderer-local coordinates. Mixing
-        # those spaces is what made a submenu jump to the desktop's left edge
-        # when WinUx was moved away from (0, 0).
         root = self._root_menu()
         global_space = bool(getattr(root, "_popup_global_position", False))
-        try:
-            child_width = float((self.backend.get_item_configuration(submenu.tag) or {}).get('width')
-                                or submenu._min_width)
-            viewport_width = float(self.backend.get_viewport_client_width())
-            if global_space:
-                getter = getattr(self.backend, "get_viewport_pos", None)
-                viewport = getter() if callable(getter) else (0.0, 0.0)
-                viewport_left = float(viewport[0])
-                viewport_right = viewport_left + viewport_width
-                popup_x = (left - child_width + 2
-                           if right - 2 + child_width > viewport_right
-                           else right - 2)
-                popup_x = max(viewport_left, popup_x)
+        def placement():
+            if not self.isVisible():
+                return None
+            row = self._rows.get(action_id)
+            rect = self._pointer_row_rect(row) if row is not None else None
+            layout = dpg_window_rect(self.backend, self.tag)
+            if layout is not None and self._popup_global_position:
+                layout = self._popup_screen_rect(layout)
+            if rect is None or layout is None:
+                return None
+            parent = self.globalGeometry()
+            if parent.isEmpty():
+                return None
+            left, right = parent.x(), parent.x() + parent.width()
+            # The parent may have moved before ImGui publishes a new row pos.
+            top = parent.y() + rect[1] - layout[1]
+            size = submenu._popup_size()
+            if self._parent_window is not None:
+                bounds = dpg_window_rect(self.backend, self._parent_window)
+                if bounds is None:
+                    return None
+            elif global_space:
+                bounds = self._global_popup_bounds((left, top))
             else:
-                popup_x = (left - child_width + 2
-                           if right - 2 + child_width > viewport_width
-                           else right - 2)
-                popup_x = max(0.0, popup_x)
-        except (AttributeError, KeyError, TypeError, ValueError, RuntimeError):
-            popup_x = right - 2
+                bounds = (0, 0, self.backend.get_viewport_client_width(),
+                          self.backend.get_viewport_client_height())
+            x = right + self.SUBMENU_GAP
+            if x + size[0] > bounds[2]:
+                x = left - size[0] - self.SUBMENU_GAP
+            from ..gui.placement import fit_popup
+            position = fit_popup((x, top - submenu.WINDOW_PAD_Y), size, bounds)
+            if self._parent_window is not None:
+                position = (position[0] - bounds[0], position[1] - bounds[1])
+            return position, size
+
         try:
-            opener = submenu.popupGlobal if global_space else submenu.popup
-            if opener((popup_x, top), context=root._context):
+            if submenu.popup(context=root._context, _global_position=global_space, _placement=placement):
                 self._open_submenu = action_id
                 return True
         except Exception:
@@ -1018,10 +1267,28 @@ class ImGuiMenu(QObject):
     def globalGeometry(self, *, clipped=True):
         if not self.exists():
             return QRect()
+        if self._popup_global_position and self._parent_window is None:
+            try:
+                import ctypes
+                from ctypes import wintypes
+                from ..backends.native_windows import NativeWindowBackend
+                native = NativeWindowBackend(self.backend)
+                hwnd = native.winId(self.tag) if native.isEnabled() else 0
+                if hwnd:
+                    rect = wintypes.RECT()
+                    origin = wintypes.POINT()
+                    user32 = ctypes.windll.user32
+                    if (user32.GetClientRect(wintypes.HWND(hwnd), ctypes.byref(rect))
+                            and user32.ClientToScreen(wintypes.HWND(hwnd), ctypes.byref(origin))):
+                        return QRect(origin.x, origin.y, rect.right, rect.bottom)
+            except (AttributeError, OSError, RuntimeError):
+                pass
         if clipped:
             try:
                 rect = dpg_window_rect(self.backend, self.tag, clip=True)
                 if rect is not None:
+                    if self._popup_global_position:
+                        rect = self._popup_screen_rect(rect)
                     left, top, right, bottom = rect
                     return QRect(int(round(left)), int(round(top)),
                                  max(0, int(round(right-left))),
@@ -1031,6 +1298,9 @@ class ImGuiMenu(QObject):
         try:
             left, top = self.backend.get_item_rect_min(self.tag)
             width, height = self.backend.get_item_rect_size(self.tag)
+            if self._popup_global_position:
+                left, top, _right, _bottom = self._popup_screen_rect(
+                    (left, top, left + width, top + height))
             return QRect(int(round(left)), int(round(top)),
                          max(0, int(round(width))), max(0, int(round(height))))
         except Exception:
@@ -1097,29 +1367,221 @@ class ImGuiMenu(QObject):
             return False
         return False
 
-    def popupGlobal(self, position=None, *, context=None):
+    def _single_viewport_origin(self):
+        """Client-to-screen offset for menus embedded in a detached dock host.
+
+        Native multi-window menus already render in desktop coordinates. A
+        single-viewport host renders in client coordinates, even though its
+        right-click and popupGlobal API still use desktop coordinates.
+        """
+        from ..backends.native_windows import NativeWindowBackend
+        native = NativeWindowBackend(self.backend)
+        if self._parent_window is not None or native.isEnabled():
+            return 0, 0
+        try:
+            import ctypes
+            from ctypes import wintypes
+            hwnd = native.primaryWinId()
+            origin = wintypes.POINT()
+            if hwnd and ctypes.windll.user32.ClientToScreen(
+                    wintypes.HWND(hwnd), ctypes.byref(origin)):
+                return int(origin.x), int(origin.y)
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            pass
+        getter = getattr(self.backend, 'get_viewport_pos', None)
+        return tuple(getter()) if callable(getter) else (0, 0)
+
+    def _popup_screen_rect(self, rect):
+        x, y = self._single_viewport_origin()
+        return rect[0] + x, rect[1] + y, rect[2] + x, rect[3] + y
+
+    def _renderer_popup_position(self, position):
+        if not self._popup_global_position:
+            return tuple(position)
+        x, y = self._single_viewport_origin()
+        return position[0] - x, position[1] - y
+
+    def _global_popup_bounds(self, position):
+        """Native popups use the monitor, not the (possibly tiny) host viewport."""
+        from ..backends.native_windows import NativeWindowBackend
+        if NativeWindowBackend(self.backend).isEnabled():
+            from ..notifications.placement import monitor_work_area
+            area = monitor_work_area(point=position)
+            return (float(area.left), float(area.top),
+                    float(area.right), float(area.bottom))
+        left, top = map(float, self._single_viewport_origin())
+        return (left, top, left + float(self.backend.get_viewport_client_width()),
+                top + float(self.backend.get_viewport_client_height()))
+
+    def popupGlobal(self, position=None, *, context=None, owner=None):
         """Open this menu at an unambiguous desktop-screen position.
 
         Dear PyGui native/embedded Windows builds disagree about whether
         ``get_mouse_pos(local=False)`` is viewport- or desktop-relative. A
         context menu therefore uses Win32's screen cursor and keeps that screen
-        coordinate all the way to the top-level popup. The point is clamped to
-        the WinUx viewport's *screen* rectangle, so a menu cannot jump to the
-        desktop origin when the main window is moved away from (0, 0).
+        coordinate all the way to the top-level popup. Native popup bounds use
+        the monitor work area, allowing menus taller than a compact host window.
         """
         if position is None:
             from ..gui.system import QCursor
             position = QCursor.screenPos(backend=self.backend).toTuple()
         elif isinstance(position, QPoint):
             position = position.toTuple()
-        return self.popup(position, context=context, _global_position=True)
+        # Context menus retain a client-relative click anchor, not an absolute
+        # desktop position. Explicit owners avoid guessing from desktop focus.
+        tag = getattr(owner, 'tag', owner)
+        if tag is None and self._parent_window is not None:
+            tag = self._parent_window
+        from ..gui.placement import item_screen_rect, visible_item_screen_rect, at_point
+        if tag is None and self._parent_menu is None:
+            try:
+                from ..core.application import QApplication
+                app = QApplication.instance()
+                candidate = getattr(app.activeWindow(), 'tag', None) if app is not None else None
+                if candidate is not None:
+                    rect = self._popup_screen_rect(item_screen_rect(self.backend, candidate))
+                    if rect[0] <= position[0] < rect[2] and rect[1] <= position[1] < rect[3]:
+                        tag = candidate
+            except (AttributeError, RuntimeError, KeyError, ValueError):
+                pass
+        origin = visible_item_screen_rect(self.backend, tag) if tag is not None else None
+        if origin is not None:
+            origin = self._popup_screen_rect(origin)
+        if tag is not None and origin is None:
+            return False
+        offset = ((position[0] - origin[0], position[1] - origin[1])
+                  if origin is not None else None)
 
-    def popup(self, position=None, *, context=None, _global_position=False):
+        def placement():
+            point = tuple(position)
+            if tag is not None:
+                rect = visible_item_screen_rect(self.backend, tag)
+                if rect is None:
+                    return None
+                rect = self._popup_screen_rect(rect)
+                point = (rect[0] + min(max(0, offset[0]), max(0, rect[2] - rect[0] - 1)),
+                         rect[1] + min(max(0, offset[1]), max(0, rect[3] - rect[1] - 1)))
+            size = self._popup_size()
+            if self._parent_window is not None:
+                bounds = dpg_window_rect(self.backend, self._parent_window)
+                if bounds is None:
+                    return None
+                placed = at_point(point, size, bounds)
+                return (placed[0] - bounds[0], placed[1] - bounds[1]), size
+            return at_point(point, size, self._global_popup_bounds(point)), size
+
+        return self.popup(position, context=context, _global_position=True, _placement=placement)
+
+    def _popup_size(self):
+        config = self.backend.get_item_configuration(self.tag)
+        return (float(config.get('width') or self._min_width),
+                float(config.get('height') or 40))
+
+    def _refresh_popup_position(self):
+        resolver = self._popup_position_resolver
+        if resolver is None or not self.isVisible():
+            return
+        try:
+            resolved = resolver()
+            if resolved is None:
+                self.hide()
+                return
+            position, size = resolved
+            geometry = tuple(round(float(v)) for v in (*position, *size))
+            if geometry == self._last_popup_geometry:
+                return
+            self._last_popup_geometry = geometry
+            position, size = geometry[:2], geometry[2:]
+            if self._popup_global_position and self._parent_window is None:
+                self._native_popup_geometry = (position, size)
+                self._native_popup_pending = (position, size)
+                # Update the native pin before the renderer can replay the old
+                # position. This never emits Show/Hide or changes selection.
+                self._sync_native_popup()
+            self.backend.set_item_pos(self.tag, self._renderer_popup_position(position))
+        except Exception:
+            # A closing/reparented anchor cannot leave an orphaned top-most menu.
+            self.hide()
+
+    def _apply_native_popup_geometry(self):
+        if self._native_popup_geometry is None:
+            return False
+        from ..backends.native_windows import NativeWindowBackend
+        native = NativeWindowBackend(self.backend)
+        position, size = self._native_popup_geometry
+        return native.positionPopup(self.tag, position, size)
+
+    def _sync_native_popup(self, *_args):
+        pending = self._native_popup_pending
+        if pending is None or not self.isVisible():
+            return
+        from ..backends.native_windows import NativeWindowBackend
+        native = NativeWindowBackend(self.backend)
+        if not native.isEnabled():
+            self._native_popup_pending = None
+            return
+        position, size = pending
+        if native.positionPopup(self.tag, position, size):
+            self._native_popup_pending = None
+
+    def popupBelow(self, anchor, *, context=None, global_position=True, anchor_provider=None):
+        """Open below an (left, top, right, bottom) anchor, or above at an edge."""
+        from ..gui.placement import below_anchor
+        def placement():
+            current = anchor_provider() if anchor_provider is not None else anchor
+            if current is None:
+                return None
+            size = self._popup_size()
+            if self._parent_window is not None:
+                bounds = dpg_window_rect(self.backend, self._parent_window)
+                if bounds is None:
+                    return None
+            elif global_position:
+                bounds = self._global_popup_bounds((current[0], current[1]))
+            else:
+                bounds = (0, 0, self.backend.get_viewport_client_width(),
+                          self.backend.get_viewport_client_height())
+            position = below_anchor(current, size, bounds)
+            if self._parent_window is not None:
+                position = (position[0] - bounds[0], position[1] - bounds[1])
+            return position, size
+        return self.popup(context=context, _global_position=global_position, _placement=placement)
+
+    def popup(self, position=None, *, context=None, _global_position=False, _placement=None):
+        # A QMenu can outlive the Settings dialog that changes the application
+        # palette.  Many context menus are intentionally retained for the life
+        # of the app and are not reachable from the main QMenuBar.  Make popup
+        # presentation self-healing: if the process palette changed since this
+        # menu was last materialized, rebuild its surface/rows before showing
+        # it.  This avoids stale Light popup resources in Dark mode without
+        # paying a rebuild cost on ordinary opens.
+        try:
+            from ..gui.palette import color_scheme
+            if color_scheme() != getattr(self, "_palette_scheme", None):
+                self.refreshTheme()
+        except Exception:
+            pass
+        surface = getattr(self, "_popup_surface", None)
+        was_open = bool(surface.isVisible()) if surface is not None else bool(getattr(self, "_popup_open", False))
         self._context = context
         self._popup_global_position = bool(_global_position)
-        if self._parent_menu is None:
+        if _global_position and self._parent_window is None:
+            from ..backends.native_windows import NativeWindowBackend
+            native = NativeWindowBackend(self.backend)
+            if native.isEnabled():
+                # A plain ImGui window remains clipped to the PiP viewport;
+                # explicitly opt this screen-positioned menu into an HWND.
+                native.configure(self.tag)
+        if self._parent_menu is None and not was_open:
             self.aboutToShow.emit(context)
-        if position is not None:
+        self._popup_position_resolver = _placement
+        if _placement is not None:
+            resolved = _placement()
+            if resolved is None:
+                return False
+            position, _size = resolved
+            self.backend.set_item_pos(self.tag, self._renderer_popup_position(position))
+        elif position is not None:
             try:
                 config = self.backend.get_item_configuration(self.tag) or {}
                 width = float(config.get("width") or self._min_width)
@@ -1135,36 +1597,83 @@ class ImGuiMenu(QObject):
                     viewport_w = float(self.backend.get_viewport_client_width())
                     viewport_h = float(self.backend.get_viewport_client_height())
                     if _global_position:
-                        getter = getattr(self.backend, "get_viewport_pos", None)
-                        viewport = getter() if callable(getter) else (0.0, 0.0)
-                        vx, vy = float(viewport[0]), float(viewport[1])
-                        x = max(vx, min(x, max(vx, vx + viewport_w - width - 2.0)))
-                        y = max(vy, min(y, max(vy, vy + viewport_h - height - 2.0)))
+                        left, top, right, bottom = self._global_popup_bounds((x, y))
+                        if x + width > right:
+                            x -= width
+                        if y + height > bottom:
+                            y -= height
+                        x = max(left, min(x, max(left, right - width - 2.0)))
+                        y = max(top, min(y, max(top, bottom - height - 2.0)))
                     else:
                         # Menu-bar/tool-button anchors and submenus already use
                         # renderer coordinates; preserve their existing contract.
                         x = max(0.0, min(x, max(0.0, viewport_w - width - 2.0)))
                         y = max(0.0, min(y, max(0.0, viewport_h - height - 2.0)))
                 position = (x, y)
-                self.backend.set_item_pos(self.tag, tuple(position))
+                self.backend.set_item_pos(self.tag, self._renderer_popup_position(position))
             except Exception:
                 pass
         acquired_here = False
+        if not was_open and surface is not None:
+            try:
+                from ..runtime import QGuiRuntime
+                popup_host = QGuiRuntime(self.backend).windowHost()
+            except Exception:
+                popup_host = None
+            geometry = None
+            try:
+                config = self.backend.get_item_configuration(self.tag) or {}
+                px, py = self.backend.get_item_pos(self.tag)
+                geometry = (int(px), int(py), int(config.get("width") or self._min_width),
+                            int(config.get("height") or 40))
+            except Exception:
+                pass
+            # QObject stores its logical parent as an attribute in DearUIQt.
+            # Do not call self.parent() here: a top-level menu has parent=None.
+            surface.beginShow(owner=getattr(self, "parent", None), host=popup_host, geometry=geometry)
         try:
-            self.backend.configure_item(self.tag, show=True)
-            if self._parent_menu is None:
-                try:
-                    self.backend.focus_item(self.tag)
-                except Exception:
-                    pass
+            if _global_position and self._parent_window is None and position is not None:
+                from ..backends.native_presentation import presentation_for
+                presentation = presentation_for(self.backend, create=True)
+                if presentation is not None:
+                    config = self.backend.get_item_configuration(self.tag)
+                    size = (config['width'], config['height'])
+                    self._native_popup_geometry = (position, size)
+                    presentation.prepare(
+                        self.tag, self._apply_native_popup_geometry)
+            # Reposition/reconfigure an already-open retained popup without
+            # replaying the renderer's show transition. Re-showing the same
+            # native popup can momentarily reactivate its HWND and flash the
+            # owner title bar.
+            if not was_open:
+                self.backend.configure_item(self.tag, show=True)
+            self._popup_open = True
+            if surface is not None:
+                surface.markVisible()
+            if self._parent_menu is None and not was_open:
+                # QMenu popups own logical keyboard/pointer routing through
+                # QApplication._register_popup().  Never focus the renderer
+                # window here: on Windows a native multi-viewport popup can
+                # otherwise become the active HWND for one frame, repainting
+                # the owner's non-client/title bar as inactive and producing
+                # the visible title flash reported by WinUx.
                 try:
                     self._opened_frame = int(self.backend.get_frame_count())
                 except Exception:
                     self._opened_frame = -1
+                self._opening_release_frame = -1
+                self._opening_pointer_buttons = {
+                    button for button in (
+                        self.backend.mvMouseButton_Left, self.backend.mvMouseButton_Right)
+                    if self.backend.is_mouse_button_down(button)
+                }
             if self._parent_menu is None and not self._popup_input_owned:
-                self._popup_input_owned = bool(acquire_popup_input(self))
+                surface_allows_input = True if surface is None else surface.acquireInput()
+                self._popup_input_owned = bool(surface_allows_input and acquire_popup_input(self))
+                if not self._popup_input_owned and surface is not None:
+                    surface.releaseInput()
                 acquired_here = self._popup_input_owned
-            if self._parent_menu is None:
+            if self._parent_menu is None and not was_open:
                 try:
                     from ..core.application import QApplication
                     application = QApplication.instance()
@@ -1174,8 +1683,24 @@ class ImGuiMenu(QObject):
                     pass
             ids = self._visible_action_ids()
             self._set_active_action(ids[0] if ids else None)
+            if _global_position and self._parent_window is None and position is not None:
+                config = self.backend.get_item_configuration(self.tag)
+                self._native_popup_geometry = (position, (config['width'], config['height']))
+                self._native_popup_pending = (position, (config['width'], config['height']))
+                self._sync_native_popup()
+            self._last_popup_geometry = None
+            # All menus need application-deactivation tracking, including
+            # fixed-position popups without a live anchor resolver.
+            from ..gui.popup_tracking import track_popup
+            track_popup(self)
+            if self._popup_position_resolver is not None:
+                self._refresh_popup_position()
             return True
         except Exception:
+            if not was_open:
+                self._popup_open = False
+                if surface is not None:
+                    surface.markHidden()
             if acquired_here:
                 release_popup_input(self, consume_gesture=False)
                 self._popup_input_owned = False
@@ -1186,17 +1711,55 @@ class ImGuiMenu(QObject):
             return False
 
     def hide(self, *, consume_pointer=False):
+        surface = getattr(self, "_popup_surface", None)
+        was_open = bool(surface.isVisible()) if surface is not None else bool(getattr(self, "_popup_open", False))
+        if was_open and surface is not None:
+            surface.beginHide()
+        # Compatibility test doubles / staged callers predating the logical
+        # state flag may only expose renderer visibility.
+        if not hasattr(self, "_popup_open"):
+            try:
+                was_open = bool(self.isVisible())
+            except Exception:
+                pass
+        self._popup_open = False
+        from ..gui.popup_tracking import untrack_popup
+        untrack_popup(self)
+        self._popup_position_resolver = None
+        self._last_popup_geometry = None
+        self._native_popup_pending = None
+        self._native_popup_geometry = None
         self._hide_open_submenu()
         for submenu in tuple(self._submenus.values()):
             try:
                 submenu.hide()
             except Exception:
                 pass
-        hidden = True
         try:
-            self.backend.configure_item(self.tag, show=False)
+            if (was_open and self._popup_global_position and self._parent_window is None
+                    and self.isVisible()):
+                # A menu command may open a dialog in its callback. Return the
+                # native foreground slot before hiding the popup, not after
+                # that callback: otherwise dialog opening sees the dying menu
+                # as foreground and cannot capture its owner's activation lease.
+                from ..backends.native_windows import NativeWindowBackend
+                native = NativeWindowBackend(self.backend)
+                if native.isEnabled():
+                    native.beginOwnerClose(self.tag)
         except Exception:
-            hidden = False
+            # Optional native focus repair must never prevent logical close or
+            # strand the popup's input grab during renderer shutdown.
+            pass
+        hidden = True
+        if was_open:
+            try:
+                self.backend.configure_item(self.tag, show=False)
+                from ..backends.native_presentation import presentation_for
+                presentation = presentation_for(self.backend)
+                if presentation is not None:
+                    presentation.cancel(self.tag)
+            except Exception:
+                hidden = False
         if self._parent_menu is None:
             try:
                 from ..core.application import QApplication
@@ -1212,8 +1775,12 @@ class ImGuiMenu(QObject):
             if self._popup_input_owned:
                 release_popup_input(self, consume_gesture=bool(consume_pointer))
                 self._popup_input_owned = False
-            if hidden:
+                if surface is not None:
+                    surface.releaseInput()
+            if hidden and was_open:
                 self.aboutToHide.emit(self._context)
+        if surface is not None:
+            surface.markHidden()
         return hidden
 
     def context(self):
@@ -1294,6 +1861,14 @@ class ImGuiMenu(QObject):
     def delete(self):
         if self._deleted:
             return
+        self._popup_open = False
+        from ..gui.popup_tracking import untrack_popup
+        untrack_popup(self)
+        self._popup_position_resolver = None
+        from ..backends.native_presentation import presentation_for
+        presentation = presentation_for(self.backend)
+        if presentation is not None:
+            presentation.cancel(self.tag)
         if self._parent_menu is None:
             try:
                 from ..core.application import QApplication
@@ -1317,6 +1892,9 @@ class ImGuiMenu(QObject):
         try:
             if self.backend.does_item_exist(self.tag):
                 self.backend.delete_item(self.tag)
+            if (self._native_popup_registry is not None
+                    and self.backend.does_item_exist(self._native_popup_registry)):
+                self.backend.delete_item(self._native_popup_registry)
             shield = self._input_shield_tag
             if shield is not None and self.backend.does_item_exist(shield):
                 self.backend.delete_item(shield)

@@ -1,8 +1,8 @@
 """Label and push-button controls."""
 from __future__ import annotations
 
-from ..core.object import Signal, QSignalBlocker
-from ..gui.style import bind_theme, button_theme, tool_button_theme, METRICS
+from ..core.object import Signal, QSignalBlocker, Qt, QSize
+from ..gui.style import bind_theme, button_theme, tool_button_theme, METRICS, metrics_for_backend
 from .widget import QWidget
 from ._utils import _bind_focus_state_handlers, _delete_aux_item
 
@@ -16,38 +16,94 @@ class ImGuiLabel(QWidget):
             options["color"] = tuple(color)
         if tag is not None:
             options["tag"] = tag
-        super().__init__(backend.add_text(str(text), **options), parent=parent, after=after, backend=backend)
-        self._properties["value"] = str(text)
+        value = str(text)
+        super().__init__(backend.add_text(value, **options), parent=parent, after=after, backend=backend)
+        self.setFocusPolicy(Qt.NoFocus)
+        self._text = value
+        self._properties["value"] = value
         self._wrap_width = max(0, int(wrap or 0))
+        self._alignment = Qt.AlignLeft | Qt.AlignVCenter
+
+    def _font_metrics(self):
+        from ..gui.system import QFontMetrics
+        return QFontMetrics(self.font(), backend=self.backend)
 
     def setWordWrap(self, enabled):
         enabled = bool(enabled)
+        previous = self.wordWrap()
         if not enabled:
             self._wrap_width = 0
             self._configure("wrap", 0)
         elif self._wrap_width <= 0:
             self._wrap_width = 320
             self._configure("wrap", self._wrap_width)
+        if previous != self.wordWrap():
+            self.updateGeometry()
 
     def wordWrap(self):
         return self._wrap_width > 0
 
     def setWrapWidth(self, width):
-        self._wrap_width = max(0, int(width))
+        width = max(0, int(width))
+        if width == self._wrap_width:
+            return
+        self._wrap_width = width
         self._configure("wrap", self._wrap_width)
+        self.updateGeometry()
 
     def wrapWidth(self):
         return self._wrap_width
 
+    def hasHeightForWidth(self):
+        return self.wordWrap() or super().hasHeightForWidth()
+
+    def heightForWidth(self, width):
+        if not self.wordWrap():
+            return super().heightForWidth(width)
+        width = max(1, int(width))
+        metrics = self._font_metrics()
+        return metrics.size(self._text, Qt.TextWordWrap, width).height()
+
+    def baselineOffset(self, width=None):
+        del width
+        return self._font_metrics().ascent()
+
+    def setAlignment(self, alignment):
+        alignment = int(alignment or 0)
+        if alignment != self._alignment:
+            self._alignment = alignment
+            self.updateGeometry()
+
+    def alignment(self):
+        return int(self._alignment)
+
+    def sizeHint(self):
+        metrics = self._font_metrics()
+        if self.wordWrap():
+            width = max(1, self._wrap_width)
+            return metrics.size(self._text, Qt.TextWordWrap, width)
+        return metrics.size(self._text)
+
+    def minimumSizeHint(self):
+        metrics = self._font_metrics()
+        if not self.wordWrap():
+            return metrics.size(self._text)
+        words = self._text.replace("\n", " ").split()
+        width = max((metrics.horizontalAdvance(word) for word in words), default=0)
+        return QSize(width, metrics.lineSpacing())
+
     def setText(self, text):
-        self._on_ui("value", self._set_value, str(text))
+        self._on_ui("value", self._set_label_text, str(text))
+
+    def _set_label_text(self, text):
+        self._text = str(text)
+        self._properties["value"] = self._text
+        self._set_value(self._text)
+        self.updateGeometry()
 
     def text(self):
         self._require_ui()
-        try:
-            return str(self.backend.get_value(self.tag))
-        except Exception:
-            return str(self._properties.get("value", ""))
+        return str(self._text)
 
 
 class ImGuiPushButton(QWidget):
@@ -57,6 +113,8 @@ class ImGuiPushButton(QWidget):
         backend, options = self._construction(parent, backend)
         requested_text = str(text)
         self._icon = icon
+        self._dpi_auto_height = height is None
+        self._dpi_auto_icon_size = icon_size is None
         if icon_size is None:
             icon_size = (20, 20)
         elif isinstance(icon_size, (int, float)):
@@ -68,6 +126,7 @@ class ImGuiPushButton(QWidget):
         self._icon_size = (max(1, int(icon_size[0])), max(1, int(icon_size[1])))
         self._image_button = bool(
             icon is not None and not requested_text and hasattr(backend, "add_image_button"))
+        metrics = metrics_for_backend(backend)
         if self._image_button:
             # Dear PyGui image-button width/height describe image content, not
             # the outer hit rectangle.  QToolButton's theme padding supplies
@@ -78,7 +137,7 @@ class ImGuiPushButton(QWidget):
                 options["width"] = width
             # QPushButton has a stable style-driven height in Qt.  Do not let
             # arbitrary surrounding ImGui item spacing determine button geometry.
-            options["height"] = METRICS.button_height if height is None else int(height)
+            options["height"] = metrics.button_height if height is None else int(height)
         self.clicked = Signal()
         self.toggled = Signal()
         self._checkable = bool(checkable)
@@ -94,6 +153,11 @@ class ImGuiPushButton(QWidget):
         self._pointer_pressed = False
         self._pointer_generation = 0
         self._native_pointer_suppressed = False
+        # Native DearPyGui callbacks remain a fallback for dialog buttons when
+        # the application-level pointer bridge misses a child hit-test.  A
+        # routed physical gesture marks one native callback as consumed so the
+        # fallback cannot double-activate the same click.
+        self._native_pointer_route_pending = False
         if self._image_button:
             native_icon = icon.nativeId() if hasattr(icon, "nativeId") else icon
             tag = backend.add_image_button(native_icon, callback=self._clicked, **options)
@@ -108,25 +172,28 @@ class ImGuiPushButton(QWidget):
         self._refresh_style()
 
     def _clicked(self, *_args):
-        # Dialogs deliver pointer gestures through QApplication. Native ImGui
-        # activation is still a fallback for keyboard/non-dialog controls, but
-        # must not emit a second clicked() for that same physical mouse release.
+        # Dialogs normally deliver pointer activation through QApplication, but
+        # DearPyGui can still report the native button callback even when the
+        # retained pointer bridge misses a deeply nested child hit-test.  The
+        # old implementation suppressed every native dialog callback whenever
+        # the bridge was installed; that turned a bridge miss into a completely
+        # dead button (notably Plot Digitizer's sidebar Extract button).
+        #
+        # A routed press marks exactly one native callback as consumed.  If no
+        # routed press reached this button, the native callback is the fallback
+        # activation path.  This preserves one-click/one-signal semantics while
+        # making child buttons resilient to transient retained-layout hit-test
+        # gaps.
         if _args and self._dialog_pointer_routing and self._after is not None:
             from ..core.application import QApplication
             application = QApplication.instance()
             if application is not None and application._pointer_bridge_installed:
-                if self._native_pointer_suppressed:
+                if self._native_pointer_route_pending:
+                    self._native_pointer_route_pending = False
                     return
-                # A fast click can enqueue the widget callback before the
-                # global press/release handlers. Let that input batch finish
-                # before deciding whether native delivery is still needed.
-                self._after(0, self._deliver_native_click)
-                return
+                if self._pointer_pressed or self._native_pointer_suppressed:
+                    return
         self._activate_click()
-
-    def _deliver_native_click(self):
-        if not self._native_pointer_suppressed and not self._deleted and self.isVisible():
-            self._activate_click()
 
     def _begin_pointer_click(self):
         if self._deleted or not self.isEnabled():
@@ -135,6 +202,7 @@ class ImGuiPushButton(QWidget):
             self._pointer_generation += 1
         self._pointer_pressed = True
         self._native_pointer_suppressed = True
+        self._native_pointer_route_pending = True
         return True
 
     def _end_pointer_click(self, activate):
@@ -337,6 +405,36 @@ class ImGuiPushButton(QWidget):
             checked=self._checked,
         )
 
+    def _apply_typography_geometry(self):
+        metrics = self.controlMetrics()
+        if self._dpi_auto_height and not self._image_button:
+            self._configure("height", metrics.button_height)
+        self.updateGeometry()
+
+    def sizeHint(self):
+        if self._image_button:
+            return super().sizeHint()
+        from ..gui.system import QFontMetrics
+        fm = QFontMetrics(self.font(), backend=self.backend)
+        metrics = self.controlMetrics()
+        label = self.text()
+        width = fm.horizontalAdvance(label) + metrics.button_pad_x * 2 + metrics.border_size * 2
+        if self._icon is not None:
+            width += self._icon_size[0] + metrics.frame_pad_x
+        requested = int(self._properties.get("width", -1) or -1)
+        if requested > 0:
+            width = max(width, requested)
+        return QSize(max(1, width), metrics.button_height)
+
+    def _apply_dpi_geometry(self, _old_dpi, _new_dpi):
+        metrics = self.controlMetrics()
+        if self._dpi_auto_height and not self._image_button:
+            self._configure("height", metrics.button_height)
+        if self._dpi_auto_icon_size and self._image_button:
+            size = max(1, metrics.tool_button_icon_size)
+            self._icon_size = (size, size)
+            self._configure_many(width=size, height=size)
+
     def delete(self):
         self._require_ui()
         if self._deleted:
@@ -355,7 +453,14 @@ class QToolButton(ImGuiPushButton):
     InstantPopup = 2
 
     def __init__(self, text="", *, parent=None, after=None, backend=None,
-                 width=None, height=28, auto_raise=True, icon=None, icon_size=(20, 20)):
+                 width=None, height=None, auto_raise=True, icon=None, icon_size=None):
+        metrics = metrics_for_backend(backend)
+        auto_height = height is None
+        auto_icon_size = icon_size is None
+        if height is None:
+            height = metrics.tool_button_height
+        if icon_size is None:
+            icon_size = (metrics.tool_button_icon_size, metrics.tool_button_icon_size)
         self._auto_raise = bool(auto_raise)
         self._menu = None
         self._popup_mode = self.DelayedPopup
@@ -370,6 +475,18 @@ class QToolButton(ImGuiPushButton):
             icon=icon,
             icon_size=icon_size,
         )
+        self._dpi_auto_height = auto_height
+        self._dpi_auto_icon_size = auto_icon_size
+
+    def _apply_dpi_geometry(self, _old_dpi, _new_dpi):
+        metrics = self.controlMetrics()
+        if self._dpi_auto_height and not self._image_button:
+            self._configure("height", metrics.tool_button_height)
+        if self._dpi_auto_icon_size:
+            size = max(1, metrics.tool_button_icon_size)
+            self._icon_size = (size, size)
+            if self._image_button:
+                self._configure_many(width=size, height=size)
 
     def _refresh_style(self, *_args):
         # QToolButton uses one compact, transparent chrome for both text and
@@ -419,12 +536,18 @@ class QToolButton(ImGuiPushButton):
         if menu is None:
             return False
         try:
-            x, y = self.backend.get_item_rect_min(self.tag)
-            _width, height = self.backend.get_item_rect_size(self.tag)
-            menu.popup((x, y + height))
+            from ..gui.placement import item_screen_rect, visible_item_screen_rect
+            from ..backends.native_windows import NativeWindowBackend
+            def anchor():
+                if self._deleted or not self.isVisible():
+                    return None
+                return visible_item_screen_rect(self.backend, self.tag)
+            return menu.popupBelow(
+                item_screen_rect(self.backend, self.tag),
+                global_position=NativeWindowBackend(self.backend).isEnabled(),
+                anchor_provider=anchor)
         except Exception:
-            menu.popup()
-        return True
+            return bool(menu.popup())
 
     def _clicked(self, *_args):
         if self._popup_mode == self.InstantPopup and self._menu is not None:

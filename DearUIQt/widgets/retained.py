@@ -30,6 +30,18 @@ class QRetainedItem(QWidget):
         # the first ``show=True`` write is never coalesced away incorrectly.
         self._properties.pop("show", None)
         self._owns_native = bool(owns_native)
+        # A non-owning adapter has no authoritative renderer lifetime.  In
+        # particular, native tags owned by a table/list can be deleted and
+        # reused while an ephemeral QRetainedItem wrapper is still waiting in
+        # QApplication's deferred native-update queue.  Such a queued write can
+        # then configure a different native item with an incompatible property
+        # set.  Commit non-owning adapter writes synchronously on the UI thread;
+        # only wrappers that own their native item may safely participate in
+        # event-turn batching/generation tracking.
+        #
+        # Geometry-sensitive callers can still opt an owning wrapper into
+        # immediate mode explicitly via setImmediateUpdates(True).
+        self._immediate_updates = not self._owns_native
 
     @classmethod
     def focusedItem(cls, *, backend=None, parent=None):
@@ -74,8 +86,44 @@ class QRetainedItem(QWidget):
             visible = bool(values["show"])
             self._explicit_visible = visible
             self._effective_visible = bool(visible and self._parent_effectively_visible())
-        self._on_ui("configure", self._configure_many, **values)
+        callback = (self._configure_many_immediate
+                    if self._immediate_updates else self._configure_many)
+        self._on_ui("configure", callback, **values)
         return self
+
+    def setImmediateUpdates(self, enabled=True):
+        """Commit geometry/state writes synchronously while *enabled*.
+
+        This is intentionally an opt-in interaction primitive. Normal QWidget
+        traffic remains event-turn batched; live splitter/pane geometry can use
+        this mode to avoid the extra one-frame latency of deferred renderer
+        mutation while the pointer owns a resize gesture.
+        """
+        self._immediate_updates = bool(enabled)
+        return self
+
+    def immediateUpdates(self):
+        return bool(self._immediate_updates)
+
+    def _configure_many_immediate(self, **values):
+        changed = {key: value for key, value in values.items()
+                   if self._properties.get(key, object()) != value}
+        if not changed:
+            return {}
+        self._properties.update(changed)
+        self._pending_native_config.update(changed)
+        # Remove any older event-turn write for this retained item so it cannot
+        # replay stale geometry after the live commit.
+        try:
+            from ..core.application import QApplication
+            application = QApplication.instance()
+            if application is not None and application.threadId() == self.threadId():
+                application.removeNativeUpdates(self)
+        except Exception:
+            pass
+        pending = dict(self._pending_native_config)
+        self._commit_native_config(pending)
+        return changed
 
     def isVisible(self):
         """Query native visibility because adapted items may be mutated externally."""
@@ -346,22 +394,21 @@ class QRetainedItem(QWidget):
         return False
 
     def delete(self):
+        self._require_ui()
         if self._deleted:
             return
         if self._owns_native:
             return super().delete()
         # Preserve QWidget bookkeeping without deleting the host-owned native id.
-        if self._updates is not None:
-            self._updates.close()
+        self._close_updates()
+        # QObject.delete already purges application state once per ownership
+        # subtree. A second _clear_widget here rescanned unrelated queues for
+        # every adapter while recursively closing a large tree.
         try:
-            from ..core.application import QApplication
-            application = QApplication.instance()
-            if application is not None:
-                application._clear_widget(self)
-        except Exception:
-            pass
-        self._layout_manager = None
-        QObject.delete(self)
+            QObject.delete(self)
+        finally:
+            if self._deleted:
+                self._layout_manager = None
 
 
 __all__ = ["QRetainedItem"]

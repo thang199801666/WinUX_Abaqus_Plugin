@@ -81,10 +81,11 @@ class ServerNotepadController:
     def _stream(self, dialog, path, operation, retry_missing):
         if self.app._closing or not dialog.winfo_exists():
             return
-        if not self.server.connected:
+        server = self.server
+        if not server.connected:
             dialog.operation_failed("Server connection is not available", str(path), operation)
             return
-        remote_path = self.server.normalize(path)
+        remote_path = server.normalize(path)
         connection = getattr(self.app, "_connection_generation", None)
         key = ("server-notepad-read", id(dialog), str(remote_path))
         cancel = threading.Event()
@@ -129,7 +130,7 @@ class ServerNotepadController:
                 for attempt in range(2 if retry_missing else 1):
                     check_live()
                     try:
-                        self.server.stream_text_snapshot(remote_path, begin, chunk, end)
+                        server.stream_text_snapshot(remote_path, begin, chunk, end)
                         break
                     except Exception as exc:
                         if retry_missing and attempt == 0 and self._is_missing(exc):
@@ -144,7 +145,9 @@ class ServerNotepadController:
             self.view.after(0, self._finish_read, key, cancel, dialog,
                             operation, str(remote_path), final, error, connection)
 
-        handle = self.app._submit_background(
+        submit_remote = getattr(
+            self.app, "_submit_remote_background", self.app._submit_background)
+        handle = submit_remote(
             "server-notepad-{}".format(operation), worker, key=key,
             replace=True, cancel_event=cancel)
         if getattr(handle, "state", None) == "rejected":
@@ -184,7 +187,8 @@ class ServerNotepadController:
             self, dialog, path, text, encoding, expected_signature, force):
         if self.app._closing:
             return
-        if not self.server.connected:
+        server = self.server
+        if not server.connected:
             dialog.operation_failed("Server connection is not available")
             return
         connection = getattr(self.app, "_connection_generation", None)
@@ -195,7 +199,7 @@ class ServerNotepadController:
                     return
                 if connection != getattr(self.app, "_connection_generation", None):
                     raise RuntimeError("Server connection changed; reload the file before saving")
-                snapshot = self.server.write_text_snapshot(
+                snapshot = server.write_text_snapshot(
                     path, text, expected_signature, encoding=encoding,
                     force=force)
             except RemoteTextConflictError as exc:
@@ -209,7 +213,9 @@ class ServerNotepadController:
             self.view.after(
                 0, self.app._server_notepad_saved, dialog, snapshot)
 
-        handle = self.app._submit_background(
+        submit_remote = getattr(
+            self.app, "_submit_remote_background", self.app._submit_background)
+        handle = submit_remote(
             "server-notepad-save", worker,
             key=("server-notepad-save", id(dialog), str(path)), replace=False)
         if getattr(handle, "state", None) == "rejected" and dialog.winfo_exists():

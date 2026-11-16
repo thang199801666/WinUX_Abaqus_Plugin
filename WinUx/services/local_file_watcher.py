@@ -14,9 +14,30 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from DearUIQt.core import QObject, QThread, Signal, Qt
+
 
 ChangeCallback = Callable[[Path], None]
 ErrorCallback = Callable[[Path, BaseException], None]
+
+
+class _LocalWatchWorker(QObject):
+    """QObject worker that owns one blocking directory-watch lease."""
+
+    def __init__(self, watcher, path, stop_event, thread):
+        super().__init__()
+        self.finished = Signal(self)
+        self._watcher = watcher
+        self._path = path
+        self._stop_event = stop_event
+        self._thread = thread
+
+    def run(self):
+        try:
+            self._watcher._run(
+                self._path, self._stop_event, self._thread)
+        finally:
+            self.finished.emit()
 
 
 class LocalFileSystemWatcher:
@@ -33,7 +54,8 @@ class LocalFileSystemWatcher:
         self._on_error = on_error
         self._polling_interval = max(0.20, float(polling_interval))
         self._lock = threading.RLock()
-        self._thread: Optional[threading.Thread] = None
+        self._thread: Optional[QThread] = None
+        self._worker: Optional[_LocalWatchWorker] = None
         self._stop_event = threading.Event()
         self._path: Optional[Path] = None
         self._native_stop_handle = None
@@ -46,7 +68,7 @@ class LocalFileSystemWatcher:
     @property
     def running(self) -> bool:
         with self._lock:
-            return bool(self._thread and self._thread.is_alive())
+            return bool(self._thread and self._thread.isRunning())
 
     def watch(
         self,
@@ -68,14 +90,19 @@ class LocalFileSystemWatcher:
             if callback is not None:
                 self._callback = callback
             self._stop_event = threading.Event()
-            worker = threading.Thread(
-                target=self._run,
-                args=(target, self._stop_event),
-                name="winux-local-file-watcher",
-                daemon=True,
-            )
-            self._thread = worker
-        worker.start()
+            thread = QThread(name="winux-local-file-watcher", daemon=True)
+            worker = _LocalWatchWorker(
+                self, target, self._stop_event, thread)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run, receiver=worker)
+            # quit() is thread-safe and may be invoked directly even when the
+            # QThread object itself was created by a background installer with
+            # no GUI scheduler.
+            worker.finished.connect(thread.quit, connection_type=Qt.DirectConnection)
+            thread.finished.connect(worker.deleteLater, receiver=worker)
+            self._thread = thread
+            self._worker = worker
+        thread.start()
 
     def stop(self, *, wait: bool = True, timeout: float = 2.0) -> None:
         with self._lock:
@@ -83,22 +110,26 @@ class LocalFileSystemWatcher:
             stop_event = self._stop_event
             native_stop = self._native_stop_handle
             self._thread = None
+            self._worker = None
             self._path = None
 
             stop_event.set()
+            if worker is not None:
+                worker.requestInterruption()
             # Serialize signalling with the worker closing this handle.
             if native_stop and os.name == "nt":
                 try:
                     _KERNEL32.SetEvent(native_stop)
                 except Exception:
                     pass
-        if (wait and worker and
-                worker is not threading.current_thread()):
-            worker.join(timeout=max(0.0, float(timeout)))
+        if wait and worker and not worker.isCurrentThread():
+            worker.wait(max(0.0, float(timeout)) * 1000.0)
 
     close = stop
 
-    def _run(self, path: Path, stop_event: threading.Event) -> None:
+    def _run(
+        self, path: Path, stop_event: threading.Event, thread: QThread
+    ) -> None:
         try:
             if os.name == "nt":
                 self._run_windows(path, stop_event)
@@ -109,8 +140,9 @@ class LocalFileSystemWatcher:
                 self._report_error(path, exc)
         finally:
             with self._lock:
-                if self._thread is threading.current_thread():
+                if self._thread is thread:
                     self._thread = None
+                    self._worker = None
                     self._path = None
 
     def _notify(self, path: Path) -> None:

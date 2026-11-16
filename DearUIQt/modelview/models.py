@@ -75,8 +75,14 @@ class QtItemViewState:
             self.keys = keys
         valid = self._key_index.keys()
         self.selected.intersection_update(valid)
+        # Model/data replacement must never invent a UI current item.
+        # If the previous current/anchor no longer exists, leave the view with
+        # an invalid current index until a user gesture or an explicit caller
+        # chooses one.  Auto-promoting keys[0] here caused every retained
+        # QListView/QTableView refresh to reclaim focus/current on the first
+        # row, even when the user had moved elsewhere.
         if self.current not in valid:
-            self.current = keys[0] if keys else None
+            self.current = None
         if self.anchor not in valid:
             self.anchor = self.current
         return self

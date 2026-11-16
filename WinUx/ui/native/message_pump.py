@@ -7,7 +7,7 @@ import os
 import time
 
 
-def pump_native_messages(max_messages=64):
+def pump_native_messages(max_messages=64, on_message=None):
     """Pump a bounded batch without rendering or invoking DPG callbacks.
 
     PeekMessage also dispatches synchronous cross-thread sent messages. An IPC
@@ -30,11 +30,13 @@ def pump_native_messages(max_messages=64):
             break
         if message.message == 0x0012:  # WM_QUIT must not disappear into a wait.
             return False
+        if on_message is not None:
+            on_message(int(message.message))
         user32.TranslateMessage(ctypes.byref(message))
         user32.DispatchMessageW(ctypes.byref(message))
     return True
 
-def wait_native_messages(timeout_ms=16, max_messages=64):
+def wait_native_messages(timeout_ms=16, max_messages=64, on_input=None):
     """Sleep efficiently until native input/IPC wake traffic or timeout.
 
     Qt's GUI thread blocks in the platform dispatcher when no events are ready;
@@ -46,8 +48,17 @@ def wait_native_messages(timeout_ms=16, max_messages=64):
     if os.name != "nt":
         time.sleep(timeout_ms / 1000.0)
         return True
-    if not pump_native_messages(max_messages):
+    received = []
+    def observe(message):
+        received.append(message)
+        if on_input is not None and (
+                0x0100 <= message <= 0x0109 or 0x0200 <= message <= 0x020E or
+                0x00A0 <= message <= 0x00AD or message in (0x0005, 0x001C, 0x0021)):
+            on_input()
+    if not pump_native_messages(max_messages, observe):
         return False
+    if received:
+        return True
     user32 = ctypes.windll.user32
     user32.MsgWaitForMultipleObjects.argtypes = [
         wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.BOOL,
@@ -55,7 +66,7 @@ def wait_native_messages(timeout_ms=16, max_messages=64):
     ]
     user32.MsgWaitForMultipleObjects.restype = wintypes.DWORD
     user32.MsgWaitForMultipleObjects(0, None, False, timeout_ms, 0x04FF)
-    return True
+    return pump_native_messages(max_messages, observe)
 
 
 __all__ = ["pump_native_messages", "wait_native_messages"]

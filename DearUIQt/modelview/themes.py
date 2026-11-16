@@ -1,7 +1,7 @@
 """Dear ImGui theme helpers shared by Qt-style item views."""
 from __future__ import annotations
 
-from ..gui.palette import QtFusionMetrics, QtFusionPalette
+from ..gui.palette import QtFusionMetrics, QtFusionPalette, color_scheme
 from ..backends.dearpygui import add_dpg_scroller_style
 
 _ITEM_VIEW_THEME = None
@@ -11,6 +11,17 @@ _CONTEXT_MENU_THEME = None
 _ROW_THEME_CACHE = {}
 _TEXT_THEME_CACHE = {}
 LIST_CHECKBOX_PAD_Y = 3
+
+
+def invalidate_modelview_theme_cache():
+    """Forget palette-derived item-view resources after a scheme change."""
+    global _ITEM_VIEW_THEME, _LIST_VIEW_THEME, _CHECK_LIST_ROW_THEME, _CONTEXT_MENU_THEME
+    _ITEM_VIEW_THEME = None
+    _LIST_VIEW_THEME = None
+    _CHECK_LIST_ROW_THEME = None
+    _CONTEXT_MENU_THEME = None
+    _ROW_THEME_CACHE.clear()
+    _TEXT_THEME_CACHE.clear()
 
 
 def _theme_exists(backend, item):
@@ -29,18 +40,19 @@ def qt_item_view_theme(backend):
     p = QtFusionPalette
     with backend.theme() as _ITEM_VIEW_THEME:
         with backend.theme_component(backend.mvTable):
-            backend.add_theme_color(backend.mvThemeCol_TableHeaderBg, p.TOOLBAR)
+            backend.add_theme_color(backend.mvThemeCol_ChildBg, p.TABLE_ROW)
+            backend.add_theme_color(backend.mvThemeCol_TableHeaderBg, p.TABLE_HEADER)
             # ImGui table headers consume the generic Header hover/active roles
             # while TableHeaderBg supplies their normal surface.
-            backend.add_theme_color(backend.mvThemeCol_Header, p.TOOLBAR)
+            backend.add_theme_color(backend.mvThemeCol_Header, p.TABLE_HEADER)
             backend.add_theme_color(backend.mvThemeCol_HeaderHovered, p.HEADER_HOVER)
             backend.add_theme_color(backend.mvThemeCol_HeaderActive, p.HEADER_PRESSED)
             backend.add_theme_color(backend.mvThemeCol_Text, p.TEXT)
-            backend.add_theme_color(backend.mvThemeCol_TableBorderStrong, p.BORDER)
-            backend.add_theme_color(backend.mvThemeCol_TableBorderLight, p.BORDER_LIGHT)
-            backend.add_theme_color(backend.mvThemeCol_TableRowBg, p.BASE)
-            backend.add_theme_color(backend.mvThemeCol_TableRowBgAlt, p.ALTERNATE_BASE)
-            backend.add_theme_style(backend.mvStyleVar_CellPadding, 6, 3)
+            backend.add_theme_color(backend.mvThemeCol_TableBorderStrong, p.TABLE_BORDER)
+            backend.add_theme_color(backend.mvThemeCol_TableBorderLight, p.TABLE_GRID)
+            backend.add_theme_color(backend.mvThemeCol_TableRowBg, p.TABLE_ROW)
+            backend.add_theme_color(backend.mvThemeCol_TableRowBgAlt, p.TABLE_ROW_ALT)
+            backend.add_theme_style(backend.mvStyleVar_CellPadding, *QtFusionMetrics.TABLE_CELL_PADDING)
             add_dpg_scroller_style(backend, track=p.WINDOW_ALT)
         with backend.theme_component(backend.mvSelectable):
             # Qt/Fusion list/table selection remains readable with dark text in
@@ -56,7 +68,7 @@ def qt_item_view_theme(backend):
             backend.add_theme_style(backend.mvStyleVar_FramePadding, 5, 3)
         with backend.theme_component(backend.mvButton):
             # Dear PyGui renders sortable headers as buttons internally.
-            backend.add_theme_color(backend.mvThemeCol_Button, p.TOOLBAR)
+            backend.add_theme_color(backend.mvThemeCol_Button, p.TABLE_HEADER)
             backend.add_theme_color(backend.mvThemeCol_ButtonHovered, p.HEADER_HOVER)
             backend.add_theme_color(backend.mvThemeCol_ButtonActive, p.HEADER_PRESSED)
             backend.add_theme_color(backend.mvThemeCol_Text, p.TEXT)
@@ -68,11 +80,19 @@ def qt_item_view_theme(backend):
                 backend.add_theme_style(backend.mvStyleVar_ButtonTextAlign, 0.0, 0.5)
             except Exception:
                 pass
+        with backend.theme_component(backend.mvButton, enabled_state=False):
+            # Centered, noninteractive presentation headers used by editable
+            # job tables share the same chrome as native sortable headers.
+            backend.add_theme_color(backend.mvThemeCol_Button, (0, 0, 0, 0))
+            backend.add_theme_color(backend.mvThemeCol_Text, p.TABLE_HEADER_TEXT)
+            backend.add_theme_style(backend.mvStyleVar_ButtonTextAlign, .5, .5)
+            backend.add_theme_style(backend.mvStyleVar_FrameBorderSize, 0)
+            backend.add_theme_style(backend.mvStyleVar_FramePadding, 0, 0)
     return _ITEM_VIEW_THEME
 
 
 
-def qt_item_row_theme(backend, *, selected=False, disabled=False, current=False, active=True):
+def qt_item_row_theme(backend, option=None, *, selected=False, disabled=False, current=False, active=True, hovered=False):
     """Return a QAbstractItemView-like row theme for one interaction state.
 
     Qt distinguishes *selection* from the *current index*.  Active selected
@@ -82,16 +102,24 @@ def qt_item_row_theme(backend, *, selected=False, disabled=False, current=False,
     in grids with extended selection instead of painting every selected row as
     if it owned keyboard focus.
     """
-    state = (bool(selected), bool(disabled), bool(current), bool(active))
+    if option is not None:
+        selected = bool(getattr(option, "selected", selected))
+        disabled = bool(getattr(option, "disabled", disabled))
+        current = bool(getattr(option, "current", current))
+        active = bool(getattr(option, "focused", getattr(option, "active", active)))
+        hovered = bool(getattr(option, "hovered", hovered))
+    state = (bool(selected), bool(disabled), bool(current), bool(active), bool(hovered))
     cached = _ROW_THEME_CACHE.get(state)
     if _theme_exists(backend, cached):
         return cached
     p = QtFusionPalette
-    tag = "dearuiqt.qt.itemrow.{}.{}.{}.{}".format(
+    tag = "dearuiqt.qt.itemrow.{}.{}.{}.{}.{}.{}".format(
+        color_scheme().lower(),
         "selected" if selected else "normal",
         "disabled" if disabled else "enabled",
         "current" if current else "other",
         "active" if active else "inactive",
+        "hovered" if hovered else "rest",
     )
     try:
         if backend.does_item_exist(tag):
@@ -120,12 +148,22 @@ def qt_item_row_theme(backend, *, selected=False, disabled=False, current=False,
                 text = p.TEXT
                 border = p.SELECTION_INACTIVE_BORDER
             else:
-                # Header is only painted while selected.  For an unselected
-                # row the hover role is the visible state; keep it subtle like
-                # QAbstractItemView::item:hover.
-                selected_fill = p.HIGHLIGHT_SOFT
-                hover = p.HIGHLIGHT_HOVER if active else p.WINDOW_ALT
-                pressed = p.BUTTON_ACTIVE if active else p.SELECTION_INACTIVE
+                # Dear ImGui toggles an mvSelectable's native pressed/selected
+                # state before the callback reaches the retained selection
+                # model.  Painting that transient press with BUTTON_ACTIVE used
+                # to produce a one-frame dark flash before the Qt-like selected
+                # theme was bound.  Use the eventual selection fill for the
+                # press phase so mouse-down and retained selection are visually
+                # continuous.
+                # Keep Dear ImGui's immediate native selection toggle visually
+                # identical to the retained-model selection that follows in the
+                # callback.  mvSelectable flips its boolean value before DearUIQt
+                # receives the click; if Header uses HIGHLIGHT_SOFT here, one
+                # transient frame is painted with a different fill and the row
+                # appears to blink.
+                selected_fill = p.SELECTION_ACTIVE if active else p.SELECTION_INACTIVE
+                hover = p.HIGHLIGHT_HOVER if (active or hovered) else p.WINDOW_ALT
+                pressed = selected_fill
                 text = p.TEXT
                 border = p.FOCUS if active else p.SELECTION_INACTIVE_BORDER
             backend.add_theme_color(backend.mvThemeCol_Header, selected_fill)
@@ -145,7 +183,7 @@ def qt_item_row_theme(backend, *, selected=False, disabled=False, current=False,
     return tag
 
 
-def qt_item_text_theme(backend, *, selected=False, disabled=False, active=True):
+def qt_item_text_theme(backend, option=None, *, selected=False, disabled=False, active=True):
     """Qt display-role text for non-primary cells in a selected table row.
 
     ``span_columns`` gives the first selectable a full-row background, but
@@ -153,12 +191,17 @@ def qt_item_text_theme(backend, *, selected=False, disabled=False, active=True):
     in the remaining columns.  QTableView does, so keep those display-role
     cells synchronized with the row's active/inactive selection palette.
     """
+    if option is not None:
+        selected = bool(getattr(option, "selected", selected))
+        disabled = bool(getattr(option, "disabled", disabled))
+        active = bool(getattr(option, "focused", getattr(option, "active", active)))
     state = (bool(selected), bool(disabled), bool(active))
     cached = _TEXT_THEME_CACHE.get(state)
     if _theme_exists(backend, cached):
         return cached
     p = QtFusionPalette
-    tag = "dearuiqt.qt.itemtext.{}.{}.{}".format(
+    tag = "dearuiqt.qt.itemtext.{}.{}.{}.{}".format(
+        color_scheme().lower(),
         "selected" if selected else "normal",
         "disabled" if disabled else "enabled",
         "active" if active else "inactive",
@@ -198,8 +241,8 @@ def qt_context_menu_theme(backend):
             backend.add_theme_color(backend.mvThemeCol_Header, p.MENU_HOVER)
             backend.add_theme_color(backend.mvThemeCol_HeaderHovered, p.MENU_HOVER)
             backend.add_theme_color(backend.mvThemeCol_HeaderActive, p.MENU_ACTIVE)
-            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 4, 3)
-            backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 5, 2)
+            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 5, 4)
+            backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 4, 1)
             backend.add_theme_style(backend.mvStyleVar_WindowRounding, QtFusionMetrics.POPUP_ROUNDING)
             backend.add_theme_style(backend.mvStyleVar_PopupRounding, QtFusionMetrics.POPUP_ROUNDING)
             backend.add_theme_style(backend.mvStyleVar_WindowBorderSize, 1)
@@ -248,7 +291,10 @@ def qt_list_view_theme(backend):
         with backend.theme_component(backend.mvChildWindow):
             backend.add_theme_color(backend.mvThemeCol_ChildBg, p.BASE)
             backend.add_theme_color(backend.mvThemeCol_Border, p.BORDER)
-            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 6, 0)
+            # Insets here shrink the selectable fill as well as the text,
+            # leaving a white strip along both sides of every selected row.
+            # Keep the viewport flush; QListView owns the label's text inset.
+            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 0, 0)
             backend.add_theme_style(backend.mvStyleVar_ChildRounding, 0)
             backend.add_theme_style(backend.mvStyleVar_ChildBorderSize, 1)
             backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 0, 0)

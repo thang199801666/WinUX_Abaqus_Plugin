@@ -5,6 +5,9 @@ import ctypes
 from ctypes import wintypes
 import os
 
+from DearUIQt.backends.native_windows import NativeTopLevelWindow
+from DearUIQt.backends.native_caption import NativeCaptionHoverGuard
+
 from .native_dialog_host import (
     attach_native_owner, apply_native_qt_chrome, handoff_owner_before_close,
     prepare_owned_dialog_stack,
@@ -25,15 +28,11 @@ SW_SHOWNOACTIVATE = 4
 
 
 def window_rect(hwnd):
-    if os.name != "nt" or not hwnd:
+    geometry = NativeTopLevelWindow(hwnd).geometry()
+    if geometry is None:
         return None
-    user32 = ctypes.windll.user32
-    user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
-    user32.GetWindowRect.restype = wintypes.BOOL
-    rect = wintypes.RECT()
-    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
-        return None
-    return rect.left, rect.top, rect.right, rect.bottom
+    x, y, width, height = geometry
+    return x, y, x + width, y + height
 
 
 def work_area(owner_hwnd):
@@ -87,20 +86,8 @@ def set_cloaked(hwnd, hidden):
 
 
 def set_native_window_visible(hwnd, visible):
-    """Show/hide one viewport without implicitly activating it."""
-    if os.name != "nt" or not hwnd:
-        return False
-    try:
-        user32 = ctypes.windll.user32
-        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-        user32.ShowWindow.restype = wintypes.BOOL
-        user32.ShowWindow(
-            wintypes.HWND(int(hwnd)),
-            SW_SHOWNOACTIVATE if bool(visible) else SW_HIDE,
-        )
-        return True
-    except Exception:
-        return False
+    """Show/hide one viewport through the shared Qt native adapter."""
+    return NativeTopLevelWindow(hwnd).setVisible(bool(visible), activate=False)
 
 
 class ViewportCreationGuard:
@@ -144,6 +131,14 @@ class ViewportCreationGuard:
                         style = getter(message.hwnd, -16)
                         if not style & 0x40000000 and style & 0x00c00000:  # top-level caption
                             self.hwnd = int(message.hwnd)
+                            # Make the initial GLFW focus request ineligible,
+                            # before ShowWindow/SetForegroundWindow can disturb
+                            # the foreground application. A cloak alone does
+                            # not prevent a hidden HWND from taking activation.
+                            ex_style = getter(message.hwnd, GWL_EXSTYLE)
+                            setter(message.hwnd, GWL_EXSTYLE, ex_style | 0x08000000)
+                            user32.EnableWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
+                            user32.EnableWindow(message.hwnd, False)
                             if self._hide_taskbar:
                                 # DWM cloak hides pixels, not shell identity. Set
                                 # this before GLFW's initial ShowWindow so idle
@@ -222,14 +217,73 @@ class NativeViewport:
         self._published = False
         self._owner_hwnd = 0
         self._old_proc = None
-        # Win32 owns the non-client Close button.  GLFW can occasionally emit
-        # a stale WM_NCMOUSELEAVE while its per-frame event pump is running,
-        # even though the cursor is still physically over HTCLOSE.  If that
-        # leave reaches DefWindowProc, DWM clears the red hover state and the
-        # next WM_NCMOUSEMOVE paints it again, producing a continuous blink.
-        # Keep only the tiny bit of state needed to reject that stale leave.
-        self._caption_close_hover = False
         self.reveal_count = 0
+        self._activation_blocked = True
+        self._activation_hook = None
+        self._activation_callback = None
+        self._install_activation_guard()
+        self._apply_activation_policy()
+
+    def _apply_activation_policy(self):
+        if os.name != "nt" or not self.hwnd:
+            return
+        user32 = ctypes.windll.user32
+        getter = user32.GetWindowLongPtrW if ctypes.sizeof(ctypes.c_void_p) == 8 else user32.GetWindowLongW
+        setter = user32.SetWindowLongPtrW if ctypes.sizeof(ctypes.c_void_p) == 8 else user32.SetWindowLongW
+        getter.argtypes = [wintypes.HWND, ctypes.c_int]
+        getter.restype = ctypes.c_ssize_t
+        setter.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+        setter.restype = ctypes.c_ssize_t
+        handle = wintypes.HWND(self.hwnd)
+        style = int(getter(handle, GWL_EXSTYLE))
+        desired = style | 0x08000000 if self._activation_blocked else style & ~0x08000000
+        if desired != style:
+            setter(handle, GWL_EXSTYLE, desired)  # WS_EX_NOACTIVATE
+        user32.EnableWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
+        user32.EnableWindow(handle, not self._activation_blocked)
+
+    def _install_activation_guard(self):
+        """Reject focus for the entire hidden/warm lifetime, not just ShowWindow.
+
+        GLFW can request focus in later render/message-pump turns. DWM cloak
+        only hides pixels; a cloaked console/idle worker can otherwise activate
+        above WinUx and cause an unrelated app to win foreground when it hides.
+        This hook belongs only to the worker's GUI thread and its own HWND.
+        """
+        if os.name != "nt" or not self.hwnd:
+            return
+        user32 = ctypes.windll.user32
+        callback_type = ctypes.WINFUNCTYPE(
+            ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+        user32.SetWindowsHookExW.argtypes = [
+            ctypes.c_int, ctypes.c_void_p, wintypes.HINSTANCE, wintypes.DWORD]
+        user32.SetWindowsHookExW.restype = wintypes.HANDLE
+        user32.CallNextHookEx.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+        user32.CallNextHookEx.restype = ctypes.c_ssize_t
+
+        @callback_type
+        def activation(code, wparam, lparam):
+            if (code in (5, 9) and self._activation_blocked
+                    and int(wparam) == self.hwnd):
+                return 1  # HCBT_ACTIVATE / HCBT_SETFOCUS
+            return user32.CallNextHookEx(self._activation_hook, code, wparam, lparam)
+
+        self._activation_callback = activation
+        self._activation_hook = user32.SetWindowsHookExW(
+            5, activation, None, ctypes.windll.kernel32.GetCurrentThreadId())
+        if not self._activation_hook:
+            self._activation_callback = None
+            raise ctypes.WinError()
+
+    def close_activation_guard(self):
+        """Release the thread-local hook only at terminal renderer shutdown."""
+        if self._activation_hook:
+            user32 = ctypes.windll.user32
+            user32.UnhookWindowsHookEx.argtypes = [wintypes.HANDLE]
+            user32.UnhookWindowsHookEx(self._activation_hook)
+            self._activation_hook = None
+        self._activation_callback = None
 
     def winfo_id(self):
         return self.hwnd
@@ -254,14 +308,40 @@ class NativeViewport:
             self, window_role="tool" if hide_taskbar else "dialog",
             allow_minimize=bool(allow_minimize) and not hide_taskbar,
             allow_maximize=bool(allow_maximize) and not hide_taskbar)
+        if self._activation_blocked:
+            self._apply_activation_policy()
 
     def center(self, owner_hwnd):
         rect = window_rect(self.hwnd)
         if rect:
             x, y = centered_position(window_rect(owner_hwnd), (rect[2]-rect[0], rect[3]-rect[1]), work_area(owner_hwnd))
-            user32 = ctypes.windll.user32
-            user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
-            user32.SetWindowPos(self.hwnd, None, x, y, 0, 0, 0x0001 | 0x0004 | 0x0010)
+            NativeTopLevelWindow(self.hwnd).move(x, y, no_activate=True)
+
+    def restore_geometry(self, geometry):
+        """Restore a saved outer HWND rectangle before the viewport is revealed."""
+        if os.name != "nt" or not self.hwnd or not isinstance(geometry, dict):
+            return False
+        try:
+            pos = geometry.get("pos")
+            size = geometry.get("size")
+            if (not isinstance(pos, (list, tuple)) or len(pos) < 2
+                    or not isinstance(size, (list, tuple)) or len(size) < 2):
+                return False
+            x, y = int(pos[0]), int(pos[1])
+            width, height = max(320, int(size[0])), max(220, int(size[1]))
+        except (TypeError, ValueError, OverflowError):
+            return False
+        # Keep at least a caption-sized portion reachable after monitor changes.
+        monitor = work_area(self._owner_hwnd or self.hwnd)
+        if monitor:
+            left, top, right, bottom = map(int, monitor)
+            width = min(width, max(320, right - left))
+            height = min(height, max(220, bottom - top))
+            x = min(max(x, left - width + 96), right - 96)
+            y = min(max(y, top), bottom - 48)
+        # Geometry changes remain non-activating while the viewport is cloaked.
+        return NativeTopLevelWindow(self.hwnd).setGeometry(
+            x, y, width, height, no_activate=True)
 
     def prepare_rendering(self):
         """Resume a warm swap-chain under its cloak without activating it."""
@@ -277,35 +357,56 @@ class NativeViewport:
         """Place the cloaked dock's native caption under the grabbed point."""
         from .native_dock_gesture import cursor_position
         point, rect = cursor_position(), window_rect(self.hwnd)
-        if not point or not rect or not isinstance(anchor, (list, tuple)) or len(anchor) != 2:
+        if not point or not rect or not isinstance(anchor, (list, tuple)) or len(anchor) < 2:
             return False
-        try:
-            ax = max(0, min(int(anchor[0]), rect[2] - rect[0] - 24))
-            ay = max(4, min(int(anchor[1]), 24))
-        except (TypeError, ValueError, OverflowError):
+        from .native_dock_gesture import resolve_drag_anchor, _native_caption_band
+        resolved = resolve_drag_anchor(anchor, rect[2] - rect[0], _native_caption_band(self.hwnd))
+        if resolved is None:
             return False
-        user32 = ctypes.windll.user32
-        user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
-                                      ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
-        user32.SetWindowPos(self.hwnd, None, point[0] - ax, point[1] - ay, 0, 0,
-                            0x0001 | 0x0004 | 0x0010)
-        return True
+        ax, ay = resolved
+        return NativeTopLevelWindow(self.hwnd).move(
+            point[0] - ax, point[1] - ay, no_activate=True)
 
-    def begin_dock_move(self):
-        """Continue a tear-off only while the physical initiating press is held."""
+    def begin_dock_move(self, anchor=None):
+        """Continue the *same* title-bar drag across a dock -> float handoff.
+
+        Qt keeps the physical mouse-down gesture alive when a dock widget tears
+        away from its parent.  The detached native HWND must therefore appear
+        under the grabbed title-bar point and immediately enter the Win32 move
+        loop; requiring a second click makes the tear-off feel disconnected.
+
+        ``anchor`` includes the cursor offset and, for new callers, the source
+        title width.  The horizontal point is scaled onto the floating caption
+        so a center grab stays centered after dock -> float.  It is applied
+        again immediately before WM_NCLBUTTONDOWN so a
+        warm/reused floating HWND follows the current cursor as well as a newly
+        created one.
+        """
         from .native_dock_gesture import cursor_position
-        if os.name != "nt" or not self.visible or not self.is_foreground():
+        if os.name != "nt" or not self.visible or not self.hwnd:
             return False
         user32 = ctypes.windll.user32
         user32.GetAsyncKeyState.argtypes = [ctypes.c_int]
         user32.GetAsyncKeyState.restype = ctypes.c_short
         if not (int(user32.GetAsyncKeyState(1)) & 0x8000):
             return False
+        if anchor is not None:
+            self.position_for_tearoff(anchor)
         point = cursor_position()
         if point is None:
             return False
+        # The old embedded viewport released capture before the floating host
+        # was requested.  Bring the detached HWND to the foreground now, but do
+        # not wait for another focus/IPC round trip before starting the move.
+        try:
+            user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            user32.SetForegroundWindow(self.hwnd)
+        except Exception:
+            pass
         user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-        packed = (point[0] & 0xffff) | ((point[1] & 0xffff) << 16)
+        # WM_NCLBUTTONDOWN/HTCAPTION enters the ordinary Windows drag loop.  The
+        # lParam for this non-client message is in screen coordinates.
+        packed = (int(point[0]) & 0xffff) | ((int(point[1]) & 0xffff) << 16)
         return bool(user32.PostMessageW(self.hwnd, 0x00A1, 2, packed))
 
     def stage_publish(self, visible):
@@ -344,9 +445,7 @@ class NativeViewport:
         visible = bool(visible)
         if os.name == "nt":
             user32 = ctypes.windll.user32
-            user32.IsWindowVisible.argtypes = [wintypes.HWND]
-            user32.IsWindowVisible.restype = wintypes.BOOL
-            if bool(user32.IsWindowVisible(self.hwnd)) != visible:
+            if NativeTopLevelWindow(self.hwnd).isVisible() != visible:
                 self._show(visible)
             set_cloaked(self.hwnd, False)
         self._published = True
@@ -364,6 +463,9 @@ class NativeViewport:
         # double transition can briefly move focus/Z-order through the owner and
         # make WinUx appear to blink. Reveal without activation; the runtime
         # performs one explicit activation after publication.
+        if not visible:
+            self._activation_blocked = True
+            self._apply_activation_policy()
         set_native_window_visible(self.hwnd, visible)
 
     def set_visible(self, visible):
@@ -389,24 +491,26 @@ class NativeViewport:
     def activate(self):
         if os.name == "nt" and self.hwnd:
             user32 = ctypes.windll.user32
+            if self._activation_blocked:
+                self._activation_blocked = False
+                self._apply_activation_policy()
             user32.IsWindowEnabled.argtypes = [wintypes.HWND]
             user32.IsWindowEnabled.restype = wintypes.BOOL
             if not user32.IsWindowEnabled(self.hwnd):
                 # A nested native dialog owns activation until it releases this
                 # viewport. Never raise/restore/focus its disabled parent.
                 return
+            # Only an explicit show/activate operation may release the guard.
+            # Warm-up rendering and hidden resident workers never call this.
             # Keep the cross-process owned-window pair in the same normal
             # Z-order group before activation.  This is a no-op if some other
             # application owns foreground, so background work never raises WinUx.
             if self._owner_hwnd:
                 prepare_owned_dialog_stack(self._owner_hwnd, self.hwnd)
-            user32.IsIconic.argtypes = [wintypes.HWND]
-            user32.IsIconic.restype = wintypes.BOOL
-            if user32.IsIconic(self.hwnd):
-                user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
-                user32.ShowWindow(self.hwnd, 9)  # SW_RESTORE for an explicitly reactivated tool.
-            user32.SetForegroundWindow.argtypes = [wintypes.HWND]
-            user32.SetForegroundWindow(self.hwnd)
+            native_window = NativeTopLevelWindow(self.hwnd)
+            if native_window.isMinimized():
+                native_window.restore(activate=False)
+            native_window.activate()
             # Foreground/Z-order alone does not establish this UI thread's
             # input focus, especially when claiming a cloaked prewarm window.
             # GLFW must receive WM_SETFOCUS before it forwards pointer/keyboard
@@ -423,7 +527,7 @@ class NativeViewport:
                 user32.SetFocus(self.hwnd)
 
     def install_close_handler(self, view, callback, character_callback=None, pointer_callback=None,
-                              dock_callback=None):
+                              dock_callback=None, context_callback=None):
         if os.name != "nt" or not self.hwnd:
             return
         user32 = ctypes.windll.user32
@@ -434,47 +538,11 @@ class NativeViewport:
         user32.CallWindowProcW.restype = ctypes.c_ssize_t
         proc_type = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
 
-        def _cursor_is_still_over_native_close(hwnd):
-            """Verify HTCLOSE at the current cursor without trusting a stale leave."""
-            try:
-                point = wintypes.POINT()
-                user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
-                user32.GetCursorPos.restype = wintypes.BOOL
-                if not user32.GetCursorPos(ctypes.byref(point)):
-                    return False
-                user32.GetForegroundWindow.argtypes = []
-                user32.GetForegroundWindow.restype = wintypes.HWND
-                if int(user32.GetForegroundWindow() or 0) != int(hwnd):
-                    return False
-                user32.IsWindowEnabled.argtypes = [wintypes.HWND]
-                user32.IsWindowEnabled.restype = wintypes.BOOL
-                if not user32.IsWindowEnabled(hwnd):
-                    return False
-                packed = ((int(point.x) & 0xffff) |
-                          ((int(point.y) & 0xffff) << 16))
-                user32.SendMessageW.argtypes = [
-                    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
-                user32.SendMessageW.restype = ctypes.c_ssize_t
-                return int(user32.SendMessageW(
-                    hwnd, WM_NCHITTEST, 0, packed)) == HTCLOSE
-            except Exception:
-                return False
+        caption_hover = NativeCaptionHoverGuard(user32)
 
         def procedure(hwnd, message, wparam, lparam):
-            # Let USER32/DWM keep ownership of the caption Close-button visual
-            # state.  Some GLFW/Windows combinations generate an extra
-            # WM_NCMOUSELEAVE during the render/event pump.  Suppressing only a
-            # leave that hit-testing proves is stale prevents the native red
-            # hover from alternating on/off every frame, while a real pointer
-            # departure, deactivation or disable still flows to the original
-            # GLFW window procedure unchanged.
-            if message == WM_NCMOUSEMOVE:
-                self._caption_close_hover = int(wparam) == HTCLOSE
-            elif message == WM_NCMOUSELEAVE:
-                if (self._caption_close_hover and
-                        _cursor_is_still_over_native_close(hwnd)):
-                    return 0
-                self._caption_close_hover = False
+            if caption_hover.suppress(hwnd, message, wparam):
+                return 1 if int(message) == 0x0086 else 0
 
             if dock_callback is not None:
                 if message == 0x00A3 and int(wparam) == 2:  # WM_NCLBUTTONDBLCLK / HTCAPTION
@@ -506,6 +574,21 @@ class NativeViewport:
                 x = ctypes.c_short(int(lparam) & 0xffff).value
                 y = ctypes.c_short((int(lparam) >> 16) & 0xffff).value
                 view.after(0, pointer_callback, "mouse-down", (x, y))
+            if message in (0x0205, 0x007B) and context_callback is not None:  # WM_RBUTTONUP / WM_CONTEXTMENU
+                # The detached Console owns a different native viewport than
+                # the main WinUx window, so its RMB gesture must be bridged at
+                # this WNDPROC too. Capture a desktop coordinate here and defer
+                # all retained/DPG work until after native dispatch completes.
+                point = wintypes.POINT()
+                user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+                user32.GetCursorPos.restype = wintypes.BOOL
+                if user32.GetCursorPos(ctypes.byref(point)):
+                    position = (int(point.x), int(point.y))
+                    # WM_CONTEXTMENU is already semantic; RMBUP is delayed a
+                    # little so an ordinary DearPyGui release callback can win
+                    # first without creating a duplicate popup.
+                    delay = 1 if message == 0x007B else 25
+                    view.after(delay, context_callback, position)
             if message == 0x0020 and (int(lparam) & 0xffff) == 1:  # WM_SETCURSOR / HTCLIENT
                 cursor = getattr(view, "_tool_cursor", None)
                 handle = cursor.native_handle() if cursor is not None else None
@@ -534,4 +617,3 @@ class NativeViewport:
             setter.restype = ctypes.c_ssize_t
             setter(self.hwnd, -4, self._old_proc)
             self._old_proc = None
-        self._caption_close_hover = False

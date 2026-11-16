@@ -8,6 +8,7 @@ import tempfile
 
 from DearUIQt.core import QProcess
 from ...runtime.child_processes import register_child_process
+from winux_runtime.logging_policy import trim_log_tail
 
 
 def floating_dialog_command(script):
@@ -27,12 +28,14 @@ def floating_dialog_log_path(name):
     log_dir.mkdir(parents=True, exist_ok=True)
     path = log_dir / "floating_dialog_{}.log".format(name)
     path.touch(exist_ok=True)
+    trim_log_tail(str(path), max_bytes=256 * 1024, keep_bytes=64 * 1024)
     return str(path)
 
 
 def launch_dialog_process(script, *, environment, log_path, child_label):
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     Path(log_path).touch(exist_ok=True)
+    trim_log_tail(log_path, max_bytes=256 * 1024, keep_bytes=64 * 1024)
     command = floating_dialog_command(script)
     with open(log_path, "ab", buffering=0) as log:
         process = QProcess(childLabel=child_label)

@@ -209,6 +209,37 @@ def set_file_drop(paths: Iterable[os.PathLike], move: bool = False,
     return sequence_number()
 
 
+def set_internal_reference(token: str, move: bool = False) -> int:
+    """Publish a WinUX-only file reference without materializing files.
+
+    Remote server paths are not Windows filesystem paths, so exposing them as
+    CF_HDROP would require downloading every selected item first.  This custom
+    clipboard payload intentionally publishes only the WinUX token and the
+    requested copy/cut effect.  WinUX can resolve the real remote paths from
+    its in-process clipboard while Explorer simply sees no pasteable files.
+    """
+    if os.name != "nt":
+        return 0
+    token = str(token or "").strip()
+    if not token:
+        raise ValueError("A WinUX clipboard token is required")
+
+    effect = DROP_EFFECT_MOVE if move else DROP_EFFECT_COPY
+    effect_payload = int(effect).to_bytes(4, byteorder="little", signed=False)
+    token_payload = (token + "\0").encode("utf-16-le")
+
+    with _ClipboardSession():
+        if not _user32.EmptyClipboard():
+            error = ctypes.get_last_error()
+            raise OSError(error, "EmptyClipboard failed")
+        if _preferred_drop_effect_format:
+            _publish_bytes(_preferred_drop_effect_format, effect_payload)
+        if _winux_token_format:
+            _publish_bytes(_winux_token_format, token_payload)
+
+    return sequence_number()
+
+
 def _read_dword(format_id: int) -> Optional[int]:
     if not format_id or not _user32.IsClipboardFormatAvailable(format_id):
         return None

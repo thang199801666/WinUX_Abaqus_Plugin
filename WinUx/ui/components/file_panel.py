@@ -5,7 +5,13 @@ from ...runtime.paths import safe_current_directory
 import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-from .explorer_list_view import ExplorerListView, ListViewItem
+from .explorer.list_view import ExplorerListView, ListViewItem
+from .explorer.list_model import FILE_METADATA_KEYS
+from .explorer.item_model import stable_item_identity
+from ...services.file_color_rules import FileColorRules
+from ...services.file_filter import compile_file_filter
+from ...services.file_types import file_type_name
+from ...preferences.navigation import NavigationPreferences
 from .toolbar import (
     FileToolbar, ResourceTextures, file_status_bar_theme, file_status_text_theme,
 )
@@ -15,7 +21,8 @@ from DearUIQt.themes import (
 )
 from DearUIQt.widgets import QFrame, QLabel, QSpacer, QRetainedItem
 from DearUIQt.layouts import QHBoxLayout
-from DearUIQt.gui import QCursor
+from DearUIQt.gui import QCursor, QtFusionPalette
+from DearUIQt.gui.placement import item_screen_rect
 
 
 class ValueProxy:
@@ -41,6 +48,8 @@ class ValueProxy:
 class FilePanel:
     """Complete local or server file panel for the Dear PyGui view layer."""
 
+    HISTORY_LIMIT = 256
+
     # --- Thống nhất kích thước chuẩn ---
     TOOLBAR_HEIGHT = 34
     STATUS_HEIGHT = 20
@@ -61,6 +70,8 @@ class FilePanel:
         has_toolbar: bool = True,
         has_status: bool = True,
         show_hidden_files: bool = False,
+        file_colors: bool = True,
+        file_color_rules=None,
     ):
         self.panel_id = panel_id
         self.callbacks = callbacks
@@ -76,8 +87,15 @@ class FilePanel:
         self._rename_commit_callback: Optional[Callable[[str], None]] = None
         self._pending_created_rename: Optional[Dict[str, Any]] = None
         self._source_items: List[ListViewItem] = []
+        # Lazy, order-insensitive metadata snapshot used by watcher refreshes.
+        # Navigation invalidates it; repeated refreshes reuse the current-side
+        # signature so an unchanged directory only fingerprints the incoming
+        # listing instead of sorting both sides on every poll.
+        self._directory_signature = None
         self._filter_query = ""
         self._show_hidden_files = bool(show_hidden_files)
+        self._file_colors = bool(file_colors)
+        self._color_rules = FileColorRules(file_color_rules)
         self._pinned_parent: Optional[ListViewItem] = None
         self.status_prefix = ""
         
@@ -147,6 +165,11 @@ class FilePanel:
 
         # 6. List View
         self.listview = self._create_listview()
+        self._column_preferences = NavigationPreferences()
+        state = self._column_preferences.load_columns(self.panel_id)
+        if state:
+            self.listview.restore_column_state(state)
+        self.listview.on_columns_change = lambda state: self._column_preferences.save_columns(self.panel_id, state)
 
     @classmethod
     def local(cls, parent, callbacks):
@@ -184,6 +207,32 @@ class FilePanel:
             self.toolbar.set_path_text("Log-in")
         if self.has_status:
             self.status.set("Not connected")
+
+    def reset_server_session(self):
+        """Drop all server-side presentation state at a session boundary."""
+        if self.panel_id != "server":
+            return
+        self.current_path = PurePosixPath("/")
+        self.history = []
+        self.history_index = -1
+        self.status_prefix = ""
+        self._source_items = []
+        self._directory_signature = None
+        self._pinned_parent = None
+        self._pending_created_rename = None
+        try:
+            self.listview.current_path = "/"
+            self.listview._pinned_item = None
+            self.listview._pinned_command = None
+            self.listview.set_items([])
+            self.listview.clear_selection()
+        except Exception:
+            pass
+        if self.toolbar:
+            self.toolbar.set_path_text("Log-in")
+        if self.has_status:
+            self.status.set("Not connected")
+            self.selected_status.set("0 selected")
 
     def focus(self):
         self.listview._set_keyboard_focus(True)
@@ -280,24 +329,39 @@ class FilePanel:
 
     @staticmethod
     def _point_in_item(tag, x, y):
+        """Return whether a *physical desktop* point is inside ``tag``.
+
+        Do not use ``QRetainedItem.globalGeometry()`` here.  That geometry is
+        renderer/viewport-relative on the primary WinUx host, while internal
+        Explorer drags are now routed exclusively with USER32 screen pixels.
+        Mixing those spaces is exactly what made the highlighted/drop row move
+        away from the real cursor after moving or resizing the main window.
+        """
         if not tag:
             return False
         item = QRetainedItem(tag)
         if not item.exists():
             return False
         try:
-            rect = item.globalGeometry()
+            rect = item_screen_rect(item.backend, tag)
         except Exception:
             return False
-        return (rect.width() > 1 and rect.height() > 1
-                and rect.contains((float(x), float(y))))
+        if rect is None:
+            return False
+        try:
+            x0, y0, x1, y1 = map(float, rect)
+        except Exception:
+            return False
+        return (x1 - x0 > 1.0 and y1 - y0 > 1.0
+                and x0 <= float(x) < x1 and y0 <= float(y) < y1)
 
     def screen_rect(self):
-        """Return the stable outer pane rectangle in viewport coordinates.
+        """Return the live outer pane rectangle in physical desktop pixels.
 
-        Dragging uses global mouse handlers.  Child-window rectangles can be
-        stale for one frame while the source pane owns mouse capture, so the
-        outer FilePanel container is the authoritative hit-test target.
+        The drag source can own mouse capture while the pointer crosses between
+        Local and Server panes.  The only coordinate contract that remains
+        unambiguous in that situation is USER32 screen space, so map the live
+        retained item through its native client origin on every query.
         """
         for tag in (getattr(self, "container", None), getattr(self, "body", None)):
             if not tag:
@@ -306,16 +370,21 @@ class FilePanel:
             if not item.exists():
                 continue
             try:
-                rect = item.globalGeometry()
+                rect = item_screen_rect(item.backend, tag)
             except Exception:
                 continue
-            if rect.width() > 2 and rect.height() > 2:
-                return (rect.left(), rect.top(),
-                        rect.left() + rect.width(), rect.top() + rect.height())
+            if rect is None:
+                continue
+            try:
+                x0, y0, x1, y1 = map(float, rect)
+            except Exception:
+                continue
+            if x1 - x0 > 2.0 and y1 - y0 > 2.0:
+                return x0, y0, x1, y1
         return None
 
     def contains_screen_point(self, x, y):
-        """Return True when a viewport-space point is inside this file pane."""
+        """Return True when a physical desktop point is inside this file pane."""
         rect = self.screen_rect()
         if rect is None:
             return False
@@ -324,25 +393,26 @@ class FilePanel:
         return x0 <= x < x1 and y0 <= y < y1
 
     def _drop_row_at_point(self, x, y):
-        """Return (is_pinned, row_index) for an explicit viewport-space point."""
+        """Return (is_pinned, row_index) for a physical desktop point."""
         lv = self.listview
         x, y = float(x), float(y)
         pinned_tag = getattr(lv, "pinned_canvas", None)
         if lv._pinned_item is not None and self._point_in_item(pinned_tag, x, y):
             return True, None
 
-        body = getattr(lv, "body_window", None)
-        if not self._point_in_item(body, x, y):
-            return False, None
-        try:
-            body_item = QRetainedItem(body)
-            by = float(body_item.globalGeometry().top())
-            scroll_y = body_item.verticalScrollValue()
-        except Exception:
-            return False, None
-        index = int((y - by + scroll_y) // max(1, lv.ROW_HEIGHT))
-        if 0 <= index < len(lv.items):
-            return False, index
+        # The drop pipeline is screen-space end-to-end.  Never feed a desktop
+        # point into row_at_viewport_point(); doing so silently applies the main
+        # window's desktop offset a second time and is the root cause of the
+        # displaced drop target reported after resize/move/maximize.
+        row_at_point = getattr(lv, "row_at_screen_point", None)
+        if callable(row_at_point):
+            return False, row_at_point(x, y)
+
+        # Legacy/non-native test adapter only. Production ExplorerListView
+        # always exposes row_at_screen_point().
+        row_at_point = getattr(lv, "row_at_viewport_point", None)
+        if callable(row_at_point) and os.name != "nt":
+            return False, row_at_point(x, y)
         return False, None
 
     def drop_destination_at(self, x, y):
@@ -362,7 +432,7 @@ class FilePanel:
 
     def drop_destination_at_mouse(self):
         try:
-            x, y = QCursor.pos().toTuple()
+            x, y = QCursor.screenPos().toTuple()
         except Exception:
             return self.current_path
         return self.drop_destination_at(x, y)
@@ -383,7 +453,7 @@ class FilePanel:
 
     def set_external_drop_highlight_at_mouse(self, enabled=True):
         try:
-            x, y = QCursor.pos().toTuple()
+            x, y = QCursor.screenPos().toTuple()
         except Exception:
             self.clear_external_drop_highlight()
             return
@@ -414,9 +484,9 @@ class FilePanel:
         return make_theme(theme_component(
             ThemeTarget.CHILD_WINDOW,
             colors={
-                ThemeColor.CHILD_BACKGROUND: self.BACKGROUND_COLOR,
-                ThemeColor.BORDER: self.BORDER_COLOR,
-                ThemeColor.TEXT: self.TEXT_COLOR,
+                ThemeColor.CHILD_BACKGROUND: QtFusionPalette.BASE,
+                ThemeColor.BORDER: QtFusionPalette.BORDER_LIGHT,
+                ThemeColor.TEXT: QtFusionPalette.TEXT,
             },
             styles={
                 ThemeStyle.WINDOW_PADDING: (0, 0),
@@ -425,9 +495,22 @@ class FilePanel:
             },
         ))
 
+    def apply_theme(self):
+        """Rebind palette-derived surfaces after a Light/Dark scheme change."""
+        self._container_theme = self._create_container_theme()
+        self._container_widget.setTheme(self._container_theme)
+        if self.toolbar is not None:
+            refresh = getattr(self.toolbar, "apply_theme", None)
+            if callable(refresh):
+                refresh()
+        if getattr(self, "listview", None) is not None:
+            self.listview.set_theme(self.listview.get_theme())
+        return self
+
     def _create_listview(self) -> Any:
         listview = ExplorerListView(
             parent=self.body,
+            name_color_provider=self._color_rules if self._file_colors else None,
             items=[],
             width=-1,
             height=-1,
@@ -470,6 +553,13 @@ class FilePanel:
         # Use the same metrics and header contract as ImGuiDataGridView.  The
         # file renderer remains specialized for Shell icons/drag/drop/rename,
         # but visually behaves like a compact QTreeView/QHeaderView.
+        # Main WinUx Local/Server panes live in the primary native viewport.
+        # Pin only the drag-preview paint surface to that viewport so preview
+        # placement uses the same client-space coordinates as drag hit-testing.
+        # Do not pin the rubber-band/front input overlay: doing so can intercept
+        # the gesture before it is promoted into a drag.
+        listview._drag_preview.set_primary_viewport(True)
+        listview._set_item_tooltips_primary_viewport(True)
         listview.set_metrics(row_height=23, header_height=26, cell_padding=6)
         listview.setAlternatingRowColors(False)
         listview.setShowGrid(False)
@@ -491,37 +581,32 @@ class FilePanel:
         icon = ResourceTextures.get
         if self.panel_id == "server":
             menu.append(("Run Job", "run_job", icon("Execute")))
-            menu.append({
-                "id": "check_odb_group",
-                "label": "Check ODB",
-                "icon": icon("Check_File"),
-                "children": [
-                    {
-                        "id": "check_odb_quick",
-                        "label": "Quick Check",
-                        "action": "check_odb",
-                        "icon": icon("Check_File"),
-                        "enabled": False,
-                    },
-                    {
-                        "id": "extract_odb_data",
-                        "label": "Extract Data",
-                        "action": "extract_odb",
-                        "icon": icon("Details"),
-                        "enabled": False,
-                    },
-                ],
-            })
-        else:
-            # Local ODB inspection uses the same result dialog as the server
-            # action, but runs Abaqus against the selected local file.
-            menu.append({
-                "id": "check_odb_local",
-                "label": "Check ODB",
-                "action": "check_odb",
-                "icon": icon("Check_File"),
-                "enabled": False,
-            })
+        odb_tools = [{
+            "id": "check_odb_quick" if self.panel_id == "server" else "check_odb_local",
+            "label": "Quick Check",
+            "action": "check_odb",
+            "icon": icon("Check_File"),
+            "enabled": False,
+        }, {
+            "id": "extract_odb_data",
+            "label": "Extract Data",
+            "action": "extract_odb",
+            "icon": icon("Details"),
+            "enabled": False,
+        }]
+        odb_tools.append({
+            "id": "upgrade_odb",
+            "label": "Upgrade ODB",
+            "action": "upgrade_odb",
+            "icon": icon("Editor_Reload"),
+            "enabled": False,
+        })
+        menu.append({
+            "id": "odb_tools_group",
+            "label": "Odb Tools",
+            "icon": icon("Check_File"),
+            "children": odb_tools,
+        })
         menu.extend([("Check INP", "check_inp", icon("Check_File")), ("---", None)])
         if self.panel_id == "local":
             # Works with the complete ListView selection, so Ctrl/Shift click
@@ -615,28 +700,111 @@ class FilePanel:
         return menu
 
     def _context_menu_open(self, items: List[ListViewItem]) -> None:
-        """Update context-sensitive ODB actions without rebuilding popup."""
-        real_items = [
-            item for item in list(items or [])
-            if not item.data.get("parent")
-        ]
-        can_check_odb = (
-            len(real_items) == 1
-            and not bool(real_items[0].is_dir)
-            and str(real_items[0].name or "").casefold().endswith(".odb")
+        """Synchronize every Explorer menu action with live UI state.
+
+        The menu structure is retained and never rebuilt here.  Only QAction-
+        like enabled state changes, so opening a context menu remains cheap and
+        selection/focus are not disturbed.
+        """
+        all_items = list(items or [])
+        real_items = [item for item in all_items if not item.data.get("parent")]
+        selected_count = len(real_items)
+        has_selection = selected_count > 0
+        single_real = selected_count == 1
+        single_target = len(all_items) == 1
+        single_file = single_real and not bool(real_items[0].is_dir)
+
+        try:
+            server_connected = bool(self.callbacks.get(
+                "server_connected", lambda: True)())
+        except Exception:
+            server_connected = False
+        source_ready = self.panel_id != "server" or server_connected
+
+        try:
+            clipboard_available = bool(self.callbacks.get(
+                "file_clipboard_available", lambda: False)())
+        except Exception:
+            clipboard_available = False
+        paste_ready = clipboard_available and (
+            self.panel_id != "server" or server_connected)
+
+        def suffix(item, extension):
+            if item is None or bool(item.is_dir):
+                return False
+            name = str(item.name or item.data.get("path") or item.path or "")
+            return name.casefold().endswith(extension)
+
+        only_item = real_items[0] if single_real else None
+        can_check_inp = source_ready and single_file and suffix(only_item, ".inp")
+        can_check_odb = source_ready and single_file and suffix(only_item, ".odb")
+        # Upgrade ODB is a batch operation over the ODB subset of the current
+        # selection.  Explorer-style mixed selections are valid: unrelated
+        # files/folders are ignored instead of disabling the command.
+        can_upgrade_odb = (
+            source_ready and any(suffix(item, ".odb") for item in real_items)
         )
-        self.listview.set_context_menu_item_enabled(
-            "check_odb", can_check_odb)
+        can_run_job = (
+            self.panel_id == "server" and server_connected
+            and any(suffix(item, ".inp") for item in real_items)
+        )
+        can_open = source_ready and single_target
+        can_modify_selection = source_ready and has_selection
+        can_rename = source_ready and single_real
+
+        # Selection-sensitive core operations.
+        states = {
+            "command:open": can_open,
+            "command:copy": can_modify_selection,
+            "command:cut": can_modify_selection,
+            "command:paste": paste_ready,
+            "command:rename": can_rename,
+            "command:delete": can_modify_selection,
+            "check_inp": can_check_inp,
+            "upgrade_odb": can_upgrade_odb,
+            "odb_tools_group": can_check_odb or can_upgrade_odb,
+            "command:refresh": source_ready,
+            "new_group": source_ready,
+            "command:new_folder": source_ready,
+            "command:new_file": source_ready,
+        }
+
         if self.panel_id == "server":
-            self.listview.set_context_menu_item_enabled(
-                "extract_odb", can_check_odb)
-            can_edit_server = (
-                len(real_items) == 1
-                and not bool(real_items[0].is_dir)
-                and int(real_items[0].size or 0) <= 8 * 1024 * 1024
-            )
-            self.listview.set_context_menu_item_enabled(
-                "edit_server_file", can_edit_server)
+            states.update({
+                "run_job": can_run_job,
+                "check_odb": can_check_odb,
+                "extract_odb": can_check_odb,
+                "edit_server_file": (
+                    server_connected and single_file
+                    and int(only_item.size or 0) <= 8 * 1024 * 1024
+                ),
+                "command:download_selected": server_connected and has_selection,
+            })
+            quick_extensions = (".odb", ".sta", ".dat", ".inp")
+            quick_group = False
+            for extension in quick_extensions:
+                enabled = server_connected and bool(self.visible_files(extension))
+                states["quick:{}".format(extension)] = enabled
+                quick_group = quick_group or enabled
+            states["quick_download_group"] = quick_group
+        else:
+            states.update({
+                "check_odb": can_check_odb,
+                "extract_odb": can_check_odb,
+                # Upload always requires a live destination server, even though
+                # the selected source items are local.
+                "command:upload_selected": server_connected and has_selection,
+            })
+            quick_extensions = (".inp", ".dat")
+            quick_group = False
+            for extension in quick_extensions:
+                enabled = server_connected and bool(self.visible_files(extension))
+                states["quick:{}".format(extension)] = enabled
+                quick_group = quick_group or enabled
+            states["quick_upload_group"] = quick_group
+
+        for action, enabled in states.items():
+            self.listview.set_context_menu_item_enabled(action, bool(enabled))
 
     def _menu_action(self, action: Any, items: List[ListViewItem]) -> None:
         action = str(action or "")
@@ -654,6 +822,18 @@ class FilePanel:
             self.callbacks["check_inp"](self)
         elif action == "check_odb":
             self.callbacks["check_odb"](self, paths)
+        elif action == "upgrade_odb":
+            # Pass only real ODB files from a potentially mixed selection.
+            # The controller repeats this filter defensively for non-menu
+            # callers, but filtering here also excludes folders named *.odb.
+            odb_paths = [
+                item.data.get("path") or item.path
+                for item in list(items or [])
+                if (not item.data.get("parent") and not bool(item.is_dir)
+                    and str(item.name or item.data.get("path") or item.path or "")
+                    .casefold().endswith(".odb"))
+            ]
+            self.callbacks["upgrade_odb"](self, odb_paths)
         elif action == "extract_odb":
             self.callbacks["extract_odb"](self, paths)
         elif action == "edit_server_file":
@@ -745,21 +925,51 @@ class FilePanel:
 
     @staticmethod
     def _matches_filter(item: ListViewItem, query: str) -> bool:
-        query = str(query or "").strip().casefold()
-        if not query:
+        # Directory navigation must never be hidden by a file mask.  This
+        # mirrors Explorer/Qt proxy-model behaviour: the filter constrains
+        # file rows while directory rows remain available for navigation.
+        if bool(getattr(item, "is_dir", False)):
             return True
-        values = (
-            getattr(item, "name", ""),
-            getattr(item, "item_type", ""),
-            getattr(item, "path", ""),
-        )
-        return any(query in str(value or "").casefold() for value in values)
+        return bool(compile_file_filter(query)(item))
+
+    def _filtered_snapshot(self) -> Tuple[List[ListViewItem], int]:
+        """Return filtered rows plus the visible-source count in one pass.
+
+        FilePanel frequently needs both values together for rendering and the
+        status strip.  Keeping the hidden check and filter predicate in the
+        same source traversal avoids allocating an intermediate visible list
+        and avoids immediately rescanning the directory just to count it.
+        """
+        source = self._source_items
+        show_hidden = getattr(self, "_show_hidden_files", False)
+        query = self._filter_query
+        if not str(query or "").strip():
+            if show_hidden:
+                return list(source), len(source)
+            visible = [item for item in source if not self._is_hidden_item(item)]
+            return visible, len(visible)
+
+        matches = compile_file_filter(query)
+        if show_hidden:
+            return [
+                item for item in source
+                if bool(getattr(item, "is_dir", False)) or matches(item)
+            ], len(source)
+
+        filtered: List[ListViewItem] = []
+        append = filtered.append
+        visible = 0
+        is_hidden = self._is_hidden_item
+        for item in source:
+            if is_hidden(item):
+                continue
+            visible += 1
+            if bool(getattr(item, "is_dir", False)) or matches(item):
+                append(item)
+        return filtered, visible
 
     def _filtered_items(self) -> List[ListViewItem]:
-        return [
-            item for item in self._visible_source_items()
-            if self._matches_filter(item, self._filter_query)
-        ]
+        return self._filtered_snapshot()[0]
 
     @staticmethod
     def _is_hidden_item(item: Any) -> bool:
@@ -774,57 +984,128 @@ class FilePanel:
             return self._source_items
         return [item for item in self._source_items if not self._is_hidden_item(item)]
 
+    def set_file_colors(self, enabled: bool, rules=None) -> None:
+        self._file_colors = bool(enabled)
+        if rules is not None:
+            self._color_rules = FileColorRules(rules)
+        self.listview.name_color_provider = self._color_rules if self._file_colors else None
+        self.listview.refresh_row_visuals()
+
     def set_show_hidden_files(self, enabled: bool) -> None:
         enabled = bool(enabled)
         if enabled == self._show_hidden_files:
             return
         self._show_hidden_files = enabled
-        self._render_items(self._filtered_items())
-        self._update_item_status()
+        filtered, visible_total = self._filtered_snapshot()
+        self._render_items(filtered)
+        self._update_item_status_snapshot(filtered, visible_total)
         self.selected_status.set("0 selected")
 
-    def _update_item_status(self) -> None:
+    def _update_item_status_snapshot(self, filtered, total: int) -> None:
+        """Update status from an already-computed render snapshot."""
         if not self.has_status:
             return
-        visible = len(self._filtered_items())
-        total = len(self._visible_source_items())
         prefix = "{} | ".format(self.status_prefix) if self.status_prefix else ""
         if self._filter_query.strip():
-            self.status.set(f"{prefix}{visible} of {total} items")
+            self.status.set(f"{prefix}{len(filtered)} of {total} items")
         else:
             self.status.set(f"{prefix}{total} items")
 
-    def apply_filter(self, query: str) -> None:
+    def _update_item_status(self, filtered=None) -> None:
+        if not self.has_status:
+            return
+        prefix = "{} | ".format(self.status_prefix) if self.status_prefix else ""
+        if self._filter_query.strip():
+            if filtered is None:
+                # Status-only updates need counts but no temporary row list.
+                # Fuse hidden visibility and mask matching into one traversal.
+                matches = compile_file_filter(self._filter_query)
+                show_hidden = getattr(self, "_show_hidden_files", False)
+                total = 0
+                visible = 0
+                is_hidden = self._is_hidden_item
+                for item in self._source_items:
+                    if not show_hidden and is_hidden(item):
+                        continue
+                    total += 1
+                    if bool(getattr(item, "is_dir", False)) or matches(item):
+                        visible += 1
+            else:
+                visible = len(filtered)
+                if getattr(self, "_show_hidden_files", False):
+                    total = len(self._source_items)
+                else:
+                    total = sum(1 for item in self._source_items
+                                if not self._is_hidden_item(item))
+            self.status.set(f"{prefix}{visible} of {total} items")
+        else:
+            # No search means the label needs only a total, not a filter pass.
+            # Do not cache counts across calls: hidden metadata may change.
+            total = (len(self._source_items) if getattr(self, "_show_hidden_files", False) else
+                     sum(1 for item in self._source_items if not self._is_hidden_item(item)))
+            self.status.set(f"{prefix}{total} items")
+
+    def apply_filter(self, query: str) -> bool:
         """Filter the current folder without another filesystem round trip."""
+        try:
+            compile_file_filter(str(query or ''))
+        except ValueError as exc:
+            # An incomplete/invalid mask while typing must not empty the pane,
+            # clear selection or escape into the render loop. Keep the last
+            # valid filter and report the error without opening a modal.
+            self.status.set('Invalid filter (previous results kept): {}'.format(exc))
+            return False
         self._filter_query = str(query or "")
-        self._render_items(self._filtered_items())
-        self._update_item_status()
-        self.selected_status.set("0 selected")
+        filtered, total = self._filtered_snapshot()
+        self._render_items(filtered, incremental=True)
+        self._update_item_status_snapshot(filtered, total)
+        self.selected_status.set('{} selected'.format(len(self.selected_transfer_paths())))
+        return True
 
     @staticmethod
-    def _convert(item: Any) -> ListViewItem:
-        return ListViewItem(
+    def _convert(item: Any, existing=None) -> ListViewItem:
+        values = (
             item.name,
             str(item.path),
             bool(item.is_dir),
             int(getattr(item, "size", 0) or 0),
             float(getattr(item, "modified", 0) or 0),
-            item_type=getattr(item, "type_text", None),
-            data={"source": item, "path": item.path,
-                  "is_hidden": bool(getattr(item, "is_hidden", False))},
         )
+        item_type = getattr(item, "type_text", None)
+        data = {"source": item, "path": item.path,
+                **{key: getattr(item, key, None) for key in FILE_METADATA_KEYS},
+                "is_hidden": bool(getattr(item, "is_hidden", False))}
+        if existing is None:
+            return ListViewItem(*values, item_type=item_type, data=data)
+        attributes = ("name", "path", "is_dir", "size", "mtime", "item_type", "extension")
+        updated = values + (item_type or file_type_name(item.name, bool(item.is_dir)),
+                            os.path.splitext(item.name)[1])
+        changed = (any(getattr(existing, key) != value for key, value in zip(attributes, updated)) or
+                   any(existing.data.get(key) != value for key, value in data.items() if key != "source"))
+        for key, value in zip(attributes, updated):
+            setattr(existing, key, value)
+        # Even equal metadata snapshots must point at the latest source object.
+        # Preserve unrelated row-local data, as the preceding refresh did.
+        existing.data.update(data)
+        if changed:
+            existing.refresh_display_cache()
+        return existing
 
     def display(self, path: Any, items: List[Any], record_history: bool = True) -> None:
         path_changed = path != self.current_path
         self.current_path = path
-        if path_changed:
-            self._filter_query = ""
-            if self.toolbar:
-                self.toolbar.clear_search()
+        # Filtering is panel state, not directory state.  A Qt-style view keeps
+        # its active proxy/filter while the underlying directory/model changes.
+        # Do not clear either the query or the search editor when navigating;
+        # disabling the filter explicitly is the only operation that removes its
+        # effect.
         if record_history:
             del self.history[self.history_index + 1 :]
             if not self.history or self.history[-1] != path:
                 self.history.append(path)
+            if len(self.history) > self.HISTORY_LIMIT:
+                overflow = len(self.history) - self.HISTORY_LIMIT
+                del self.history[:overflow]
             self.history_index = len(self.history) - 1
 
         if self.toolbar:
@@ -845,15 +1126,21 @@ class FilePanel:
             )
         converted.extend(self._convert(x) for x in items)
         self._source_items = converted
+        # A navigation/display replaces the complete source snapshot. Build the
+        # comparison signature lazily on the first watcher refresh so ordinary
+        # folder navigation pays no extra O(N log N) signature cost.
+        self._directory_signature = None
         self._pinned_parent = pinned_parent
-        self._render_items(self._filtered_items())
+        filtered, visible_total = self._filtered_snapshot()
+        self._render_items(filtered)
         self._consume_pending_created_rename()
 
         if self.has_status:
-            self._update_item_status()
+            self._update_item_status_snapshot(filtered, visible_total)
             self.selected_status.set("0 selected")
 
-    def _render_items(self, converted: List[ListViewItem], *, incremental=False) -> None:
+    def _render_items(self, converted: List[ListViewItem], *, incremental=False,
+                      changed_identities=None) -> None:
         """Render an already converted subset while retaining folder state."""
         pinned_parent = self._pinned_parent
         if hasattr(self, "listview") and self.listview:
@@ -861,7 +1148,8 @@ class FilePanel:
             if incremental:
                 # The folder/parent row and native scroll owner are unchanged.
                 # Do not show/rebuild the pane or reset its focus/selection.
-                self.listview.set_items(converted, incremental=True)
+                self.listview.set_items(
+                    converted, incremental=True, changed_identities=changed_identities)
                 return
             # Update the pinned parent state without rendering it separately.
             # set_items() rebuilds the pinned row and body together, preventing
@@ -896,8 +1184,13 @@ class FilePanel:
         return os.path.normcase(text) if os.name == "nt" else text
 
     @classmethod
-    def _item_signature(cls, item: Any) -> Tuple[str, bool, int, int, bool]:
-        path = (getattr(item, "data", None) or {}).get("path")
+    def _item_signature(cls, item: Any) -> tuple:
+        # getattr's default expression is evaluated even when the attribute
+        # exists. Read loaded row metadata once, not once per fallback field.
+        # This local reference is discarded after the call; no stat/cache TTL
+        # or mutable-listing invalidation policy changes here.
+        data = getattr(item, "data", None) or {}
+        path = data.get("path")
         if path is None:
             path = getattr(item, "path", None)
         modified = getattr(item, "modified", getattr(item, "mtime", 0.0))
@@ -907,6 +1200,8 @@ class FilePanel:
             int(getattr(item, "size", 0) or 0),
             int(float(modified or 0.0) * 1_000_000),
             cls._is_hidden_item(item),
+            tuple(getattr(item, key, data.get(key))
+                  for key in FILE_METADATA_KEYS),
         )
 
     def refresh_directory(self, path: Any, items: List[Any]):
@@ -918,38 +1213,49 @@ class FilePanel:
         if self._path_identity(path) != self._path_identity(self.current_path):
             return None
 
-        current_signature = tuple(sorted(
-            (self._item_signature(item) for item in self._source_items),
-            key=lambda row: row[0],
-        ))
+        current_signature = getattr(self, "_directory_signature", None)
+        same_count = len(self._source_items) == len(items)
+        if current_signature is None and same_count:
+            current_signature = tuple(sorted(
+                (self._item_signature(item) for item in self._source_items),
+                key=lambda row: row[0],
+            ))
+            self._directory_signature = current_signature
+
         incoming_signature = tuple(sorted(
             (self._item_signature(item) for item in items),
             key=lambda row: row[0],
         ))
-        if current_signature == incoming_signature:
+        if same_count and current_signature == incoming_signature:
             return None
 
         previous = {self._path_identity(item.data.get("path", item.path)): item
                     for item in self._source_items}
         converted = []
+        changed_identities = set()
         for source in items:
-            incoming = self._convert(source)
             existing = previous.get(self._path_identity(source.path))
-            if existing is None:
-                converted.append(incoming)
-                continue
             # Keep identity-dependent style/selection caches and external row
             # references alive while attaching the latest filesystem snapshot.
-            for attribute in ("name", "path", "is_dir", "size", "mtime", "item_type", "extension"):
-                setattr(existing, attribute, getattr(incoming, attribute))
-            existing.data.update(incoming.data)
-            existing.refresh_display_cache()
-            converted.append(existing)
+            previous_generation = (
+                existing.display_generation if existing is not None else None)
+            converted_item = self._convert(source, existing=existing)
+            converted.append(converted_item)
+            if (existing is None or
+                    converted_item.display_generation != previous_generation):
+                changed_identities.add(
+                    stable_item_identity(converted_item))
         self._source_items = converted
-        self._render_items(self._filtered_items(), incremental=True)
+        # The converted rows now represent exactly the incoming snapshot. Keep
+        # its already-computed canonical signature for subsequent watcher
+        # polls; do not immediately re-fingerprint the same metadata.
+        self._directory_signature = incoming_signature
+        filtered, visible_total = self._filtered_snapshot()
+        self._render_items(
+            filtered, incremental=True, changed_identities=changed_identities)
         self._consume_pending_created_rename()
         if self.has_status:
-            self._update_item_status()
+            self._update_item_status_snapshot(filtered, visible_total)
             self.selected_status.set("{} selected".format(len(self.listview.selected)))
         return None
 

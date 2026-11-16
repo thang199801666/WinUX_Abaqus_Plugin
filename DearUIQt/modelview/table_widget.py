@@ -99,6 +99,20 @@ class QTableWidget(QWidget):
     FixedFit = "fixed_fit"
     FixedSame = "fixed_same"
 
+    def enableSpreadsheet(self, **options):
+        """Enable shared rectangular selection, clipboard and cell editing."""
+        behavior = getattr(self, '_spreadsheet_behavior', None)
+        if behavior is None:
+            # Empty items still need a native cell: otherwise Dear ImGui's
+            # row-child ordering collapses holes and shifts later columns.
+            for row in range(self.rowCount()):
+                for column in range(self.columnCount()):
+                    if self.item(row, column) is None:
+                        self.setItem(row, column, QTableWidgetItem(''))
+            from .spreadsheet_behavior import SpreadsheetBehavior
+            behavior = self._spreadsheet_behavior = SpreadsheetBehavior(self, **options)
+        return behavior
+
     @staticmethod
     def _resolve_sizing_policy(backend, policy):
         if policy is None:
@@ -131,6 +145,8 @@ class QTableWidget(QWidget):
         table_options.update(native_options)
         tag = backend.add_table(**table_options)
         super().__init__(tag, parent=parent, after=after, backend=backend)
+        from .themes import qt_item_view_theme
+        self.setTheme(qt_item_view_theme(backend))
         self.cellClicked = Signal(self)
         self.cellDoubleClicked = Signal(self)
         self.cellChanged = Signal(self)
@@ -177,9 +193,75 @@ class QTableWidget(QWidget):
         try:
             top = float(self.backend.get_item_rect_min(self.tag)[1])
         except Exception:
-            return -1
+            return self._painted_row_at_global(float(y))
         header = float(QtFusionMetrics.HEADER_HEIGHT) if self._header_row_visible else 0.0
-        return self._row_at_screen_y(float(y), top, header)
+        row = self._row_at_screen_y(float(y), top, header)
+        return row if row >= 0 else self._painted_row_at_global(float(y))
+
+    def _painted_row_at_global(self, y):
+        """Native DPG tables/rows may not expose rect_min; their cells do.
+
+        Calibrate row pitch from adjacent painted cells and probe near the
+        scroll position, rather than scanning every logical row on mouse drag.
+        """
+        if not self._rows:
+            return -1
+        backend = self.backend
+        pitch = getattr(self, '_painted_row_pitch', float(QtFusionMetrics.ROW_HEIGHT))
+        try:
+            scroll = max(0.0, float(backend.get_y_scroll(self.tag)))
+        except Exception:
+            scroll = 0.0
+
+        def geometry(row):
+            if not 0 <= row < self._rows:
+                return None
+            for column in range(self.columnCount()):
+                tag = self.nativeItem(row, column)
+                if tag is None:
+                    continue
+                try:
+                    if not backend.is_item_visible(tag):
+                        continue
+                    top = float(backend.get_item_rect_min(tag)[1])
+                    height = float(backend.get_item_rect_size(tag)[1])
+                    if height > 0:
+                        return top, height
+                except (KeyError, RuntimeError, SystemError):
+                    continue
+            return None
+
+        first = max(0, min(self._rows - 1, int(scroll / max(1.0, pitch))))
+        for distance in range(33):
+            for row in (first + distance, first - distance) if distance else (first,):
+                rect = geometry(row)
+                if rect is None:
+                    continue
+                following = geometry(row + 1)
+                third = geometry(row + 2)
+                if following is not None and third is not None and third[0] > following[0]:
+                    pitch = self._painted_row_pitch = third[0] - following[0]
+                elif following is not None and following[0] > rect[0]:
+                    pitch = self._painted_row_pitch = following[0] - rect[0]
+                padding = max(0.0, (pitch - rect[1]) / 2)
+                target = row + int((y - rect[0] + padding) // max(1.0, pitch))
+                for candidate in (target, target - 1, target + 1, target - 2, target + 2):
+                    target_rect = geometry(candidate)
+                    if target_rect is None:
+                        continue
+                    # A transient editor can make one row taller. Use actual
+                    # neighbouring cell centres for its hit boundaries, not a
+                    # uniform-pitch estimate that can select the previous row.
+                    centre = target_rect[0] + target_rect[1] / 2
+                    previous, next_rect = geometry(candidate - 1), geometry(candidate + 1)
+                    lower = ((previous[0] + previous[1] / 2 + centre) / 2
+                             if previous is not None else target_rect[0] - padding)
+                    upper = ((next_rect[0] + next_rect[1] / 2 + centre) / 2
+                             if next_rect is not None else target_rect[0] + pitch - padding)
+                    if lower <= y < upper:
+                        return candidate
+                return -1
+        return -1
 
     def _row_at_screen_y(self, y, table_top, header):
         if not self._rows or y < table_top + header:
@@ -238,6 +320,9 @@ class QTableWidget(QWidget):
 
     def setColumnCount(self, count):
         count = max(0, int(count))
+        behavior = getattr(self, '_spreadsheet_behavior', None)
+        if behavior is not None and count != self._columns:
+            behavior.reset_selection()
         while self._columns < count:
             column = self._columns
             tag = self.backend.add_table_column(
@@ -246,6 +331,9 @@ class QTableWidget(QWidget):
             self._column_tags.append(tag)
             self._headers.append("")
             self._columns += 1
+            if behavior is not None:
+                for row in range(self.rowCount()):
+                    self.setItem(row, column, QTableWidgetItem(''))
         while self._columns > count:
             self.removeColumn(self._columns - 1)
         return self
@@ -259,6 +347,9 @@ class QTableWidget(QWidget):
         return self
 
     def insertRow(self, row):
+        behavior = getattr(self, '_spreadsheet_behavior', None)
+        if behavior is not None:
+            behavior.reset_selection()
         row = max(0, min(int(row), self._rows))
         old_rows = self._rows
         tag = self.backend.add_table_row(parent=self.tag)
@@ -277,12 +368,18 @@ class QTableWidget(QWidget):
         if row < old_rows:
             self._reindex_after_row_change(row, +1)
             self._shift_current_for_row_insert(row)
+        if getattr(self, '_spreadsheet_behavior', None) is not None:
+            for column in range(self.columnCount()):
+                self.setItem(row, column, QTableWidgetItem(''))
         return row
 
     def removeRow(self, row):
         row = int(row)
         if not 0 <= row < self._rows:
             return False
+        behavior = getattr(self, '_spreadsheet_behavior', None)
+        if behavior is not None:
+            behavior.reset_selection()
         tail_remove = row == self._rows - 1
 
         # QTableWidget owns widgets installed with setCellWidget(). Dispose

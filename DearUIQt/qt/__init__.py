@@ -11,15 +11,15 @@ _LAZY_EXPORTS = {
     # QtCore-style primitives
     "Qt": ".core", "QPoint": ".core", "QPointF": ".core", "QSize": ".core", "QRect": ".core", "QMargins": ".core", "QSizePolicy": ".core", "QObject": ".core", "Signal": ".core",
     "SignalConnection": ".core", "QSignalBlocker": ".core", "QMetaObject": ".core", "QPointer": ".core",
-    "QEvent": ".core", "QCloseEvent": ".core", "QChildEvent": ".core", "QKeyEvent": ".core", "QMouseEvent": ".core",
+    "QEvent": ".core", "QCloseEvent": ".core", "QChildEvent": ".core", "QKeyEvent": ".core", "QMouseEvent": ".core", "QWheelEvent": ".core",
     "QInputTarget": ".input_target",
-    "QCoreApplication": ".application", "QApplication": ".application", "QTimer": ".timer", "QThread": ".thread",
+    "QCoreApplication": ".application", "QApplication": ".application", "QEventLoop": ".event_loop", "QTimer": ".timer", "QThread": ".thread",
     "QRunnable": ".concurrent", "QFuture": ".concurrent",
     "QFutureWatcher": ".concurrent", "QThreadPool": ".concurrent",
-    "QtConcurrent": ".concurrent", "QProcess": ".process",
+    "QtConcurrent": ".concurrent", "QProcess": ".process", "QSocketNotifier": ".socket_notifier",
 
     # Actions / base windows
-    "QAction": ".action", "QActionGroup": ".action",
+    "QAction": ".action", "QActionGroup": ".action", "QKeySequence": ".shortcut", "QShortcut": ".shortcut",
     "QWidget": ".widget", "QMainWindow": ".windows",
 
     # Controls

@@ -8,7 +8,8 @@ from .storage import JsonPreferenceStore
 class NavigationPreferences:
     """Store navigation state without mixing it with encrypted credentials."""
 
-    SORT_COLUMNS = ("#0", "type", "size", "modified")
+    SORT_COLUMNS = ("#0", "type", "size", "modified", "permissions", "owner", "group",
+                    "extension", "created", "accessed", "attributes", "path")
 
     def __init__(self, root=None):
         self._store = JsonPreferenceStore("navigation.json", root=root)
@@ -138,6 +139,23 @@ class NavigationPreferences:
             return None
         return column, bool(value.get("descending", False))
 
+    def load_columns(self, panel_id):
+        states = self._load().get('columns', {})
+        value = states.get(str(panel_id)) if isinstance(states, dict) else None
+        return value if isinstance(value, dict) else None
+
+    def save_columns(self, panel_id, state):
+        if str(panel_id) not in ('local', 'server') or not isinstance(state, dict):
+            return
+        data = self._load()
+        states = data.get('columns')
+        if not isinstance(states, dict):
+            states = data['columns'] = {}
+        if states.get(str(panel_id)) == state:
+            return
+        states[str(panel_id)] = state
+        self._save(data)
+
     def save_sort(self, panel_id, column, descending):
         """Persist the active sort independently for Local and Server."""
         if column not in self.SORT_COLUMNS:
@@ -148,6 +166,29 @@ class NavigationPreferences:
             "column": column,
             "descending": bool(descending),
         }
+        self._save(data)
+
+    def load_filter(self, panel_id):
+        """Return persisted ``(enabled, query)`` state for one file panel."""
+        states = self._load().get("filters", {})
+        value = states.get(str(panel_id)) if isinstance(states, dict) else None
+        if not isinstance(value, dict):
+            return False, ""
+        return bool(value.get("enabled", False)), str(value.get("query") or "")
+
+    def save_filter(self, panel_id, enabled, query):
+        """Persist filter visibility/activation and the last typed query."""
+        panel_id = str(panel_id)
+        if not panel_id:
+            return
+        state = {"enabled": bool(enabled), "query": str(query or "")}
+        data = self._load()
+        states = data.get("filters")
+        if not isinstance(states, dict):
+            states = data["filters"] = {}
+        if states.get(panel_id) == state:
+            return
+        states[panel_id] = state
         self._save(data)
 
     def _load(self):

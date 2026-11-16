@@ -3,12 +3,21 @@ from ..widgets.widget import QWidget
 from ..core.object import Qt, QSize, QMargins, QSizePolicy
 from ..widgets.buttons import QLabel
 from ..gui.style import METRICS, bind_theme, form_row_theme, aligned_cell_theme
+from .geometry import (
+    _layout_hint, _axis_metrics, _solve_metric_lengths, _solve_axis_lengths,
+    _dependent_extent, _baseline_row_extent,
+)
 
 
 class QLayoutItem:
-    """A non-owning reference returned by layout inspection/removal APIs."""
-    def __init__(self, value):
+    """A compact non-owning reference returned by layout inspection/removal APIs."""
+
+    __slots__ = ("_value", "_owner", "_alignment")
+
+    def __init__(self, value, owner=None, alignment=0):
         self._value = value
+        self._owner = owner
+        self._alignment = int(alignment or 0)
 
     def widget(self):
         return None if getattr(self._value, "_is_layout", False) else self._value
@@ -32,29 +41,41 @@ class QLayoutItem:
         policy = callback() if callable(callback) else None
         return 0 if policy is None else policy.expandingDirections()
 
+    def hasHeightForWidth(self):
+        callback = getattr(self._value, "hasHeightForWidth", None)
+        return bool(callback()) if callable(callback) else False
 
-def _layout_hint(child, minimum=False):
-    """Return a child's participating hint using Qt hidden/size-policy rules."""
-    hidden = getattr(child, "isHidden", lambda: False)()
-    policy = getattr(child, "sizePolicy", lambda: None)()
-    retain_hidden = bool(policy is not None and policy.retainSizeWhenHidden())
-    if hidden and not retain_hidden:
-        return None
-    callback = child.minimumSizeHint if minimum else child.sizeHint
-    hint = callback()
-    if not isinstance(hint, QSize) or not hint.isValid():
-        return QSize(0, 0)
-    if policy is not None:
-        try:
-            width, height = hint.width(), hint.height()
-            if policy.horizontalPolicy() == QSizePolicy.Ignored:
-                width = 0
-            if policy.verticalPolicy() == QSizePolicy.Ignored:
-                height = 0
-            hint = QSize(width, height)
-        except Exception:
-            pass
-    return hint
+    def heightForWidth(self, width):
+        if not self.hasHeightForWidth():
+            return -1
+        callback = getattr(self._value, "heightForWidth", None)
+        return int(callback(int(width))) if callable(callback) else -1
+
+    def hasWidthForHeight(self):
+        callback = getattr(self._value, "hasWidthForHeight", None)
+        return bool(callback()) if callable(callback) else False
+
+    def widthForHeight(self, height):
+        if not self.hasWidthForHeight():
+            return -1
+        callback = getattr(self._value, "widthForHeight", None)
+        return int(callback(int(height))) if callable(callback) else -1
+
+    def alignment(self):
+        if self._owner is not None:
+            callback = getattr(self._owner, "_item_alignment", None)
+            if callable(callback):
+                return int(callback(self._value))
+        return int(self._alignment)
+
+    def setAlignment(self, alignment):
+        alignment = int(alignment or 0)
+        if self._owner is not None:
+            callback = getattr(self._owner, "setAlignment", None)
+            if callable(callback):
+                return bool(callback(self._value, alignment))
+        self._alignment = alignment
+        return True
 
 
 def _invalidate_owner(layout):
@@ -64,6 +85,8 @@ def _invalidate_owner(layout):
         owner._layout_dirty = True
         owner._cached_size_hint = None
         owner._cached_minimum_size = None
+        if hasattr(owner, '_cached_entries'):
+            owner._cached_entries = None
         owner = owner.parent
     update = getattr(owner, "updateGeometry", None)
     if callable(update):
@@ -91,9 +114,12 @@ def _detach(layout, widget):
     native_parent = layout.backend.get_item_parent(layout.tag)
     if not native_parent:
         raise RuntimeError("layout removal requires an enclosing native container")
+    alignment = int(getattr(layout, "_item_alignment", lambda _item: 0)(widget))
+    if hasattr(layout, "_alignments"):
+        layout._alignments.pop(widget, None)
     layout.backend.move_item(widget._layout_tag(), parent=native_parent)
     widget.setParent(layout.parent)
-    return QLayoutItem(widget)
+    return QLayoutItem(widget, alignment=alignment)
 
 
 class QBoxLayout(QWidget):
@@ -118,22 +144,40 @@ class QBoxLayout(QWidget):
         self._contents_margins = QMargins(0, 0, 0, 0)
         self._cached_size_hint = None
         self._cached_minimum_size = None
+        self._cached_items = None
+        self._cached_hfw = None
+        self._cached_wfh = None
+        self._alignments = {}
+        self._layout_alignment = 0
+
+    def childEvent(self, event):
+        super().childEvent(event)
+        if (not self._deleted and hasattr(self, '_layout_dirty')
+                and isinstance(event.child(), QWidget)):
+            self.invalidate()
 
     def invalidate(self):
         self._layout_dirty = True
         self._cached_size_hint = None
         self._cached_minimum_size = None
+        self._cached_items = None
+        self._cached_hfw = None
+        self._cached_wfh = None
         _invalidate_owner(self)
         return True
 
     def activate(self):
         if not self._layout_enabled or not self._layout_dirty:
             return False
-        for child in self._items():
-            child.ensurePolished()
-            if getattr(child, "_is_layout", False):
-                child.activate()
         self._layout_dirty = False
+        try:
+            for child in self._items():
+                child.ensurePolished()
+                if getattr(child, "_is_layout", False):
+                    child.activate()
+        except Exception:
+            self._layout_dirty = True
+            raise
         return True
 
     def setEnabled(self, enabled):
@@ -183,6 +227,72 @@ class QBoxLayout(QWidget):
             if not self._horizontal and policy.verticalStretch() > 0:
                 directions |= Qt.Vertical
         return directions
+
+    def hasHeightForWidth(self):
+        return any(getattr(child, "hasHeightForWidth", lambda: False)()
+                   for child in self._items())
+
+    def hasWidthForHeight(self):
+        return any(getattr(child, "hasWidthForHeight", lambda: False)()
+                   for child in self._items())
+
+    def _height_for_width(self, width, minimum=False):
+        if not self.hasHeightForWidth():
+            return -1
+        width = max(0, int(width))
+        cache = self._cached_hfw
+        if cache is not None and cache[0] == width and cache[1] == bool(minimum):
+            return cache[2]
+        children = [child for child in self._items() if _layout_hint(child, minimum) is not None]
+        margins = self._contents_margins
+        horizontal_margin = margins.left() + margins.right()
+        vertical_margin = margins.top() + margins.bottom()
+        if not children:
+            value = vertical_margin
+        elif self._horizontal:
+            gap = self._spacing * max(0, len(children) - 1)
+            lengths = _solve_axis_lengths(children, width - horizontal_margin - gap, True, minimum)
+            value = _baseline_row_extent(
+                children, lengths, self._alignments, minimum=minimum) + vertical_margin
+        else:
+            child_width = max(0, width - horizontal_margin)
+            value = sum(_dependent_extent(child, child_width, height_for_width=True, minimum=minimum)
+                        for child in children)
+            value += self._spacing * max(0, len(children) - 1) + vertical_margin
+        self._cached_hfw = (width, bool(minimum), int(value))
+        return int(value)
+
+    def heightForWidth(self, width):
+        return self._height_for_width(width, False)
+
+    def minimumHeightForWidth(self, width):
+        return self._height_for_width(width, True)
+
+    def widthForHeight(self, height):
+        if not self.hasWidthForHeight():
+            return -1
+        height = max(0, int(height))
+        cache = self._cached_wfh
+        if cache is not None and cache[0] == height:
+            return cache[1]
+        children = [child for child in self._items() if _layout_hint(child, False) is not None]
+        margins = self._contents_margins
+        horizontal_margin = margins.left() + margins.right()
+        vertical_margin = margins.top() + margins.bottom()
+        if not children:
+            value = horizontal_margin
+        elif not self._horizontal:
+            gap = self._spacing * max(0, len(children) - 1)
+            lengths = _solve_axis_lengths(children, height - vertical_margin - gap, False, False)
+            value = max((_dependent_extent(child, length, height_for_width=False)
+                         for child, length in zip(children, lengths)), default=0) + horizontal_margin
+        else:
+            child_height = max(0, height - vertical_margin)
+            value = sum(_dependent_extent(child, child_height, height_for_width=False)
+                        for child in children)
+            value += self._spacing * max(0, len(children) - 1) + horizontal_margin
+        self._cached_wfh = (height, int(value))
+        return int(value)
 
     def addSpacing(self, size):
         from ..widgets.primitives import QSpacer
@@ -246,32 +356,34 @@ class QBoxLayout(QWidget):
         return value if isinstance(value, QSize) and value.isValid() else QSize(0, 0)
 
     def _aggregate_hint(self, minimum=False):
-        hints = []
+        width = height = count = 0
         for child in self._items():
             hint = _layout_hint(child, minimum)
             if hint is not None:
-                hints.append(self._valid_hint(hint))
+                hint = self._valid_hint(hint)
+                count += 1
+                if self._horizontal:
+                    width += hint.width()
+                    height = max(height, hint.height())
+                else:
+                    width = max(width, hint.width())
+                    height += hint.height()
         margins = self._contents_margins
         horizontal_margin = margins.left() + margins.right()
         vertical_margin = margins.top() + margins.bottom()
-        if not hints:
-            return QSize(horizontal_margin, vertical_margin)
-        gap = self._spacing * max(0, len(hints) - 1)
-        if self._horizontal:
-            return QSize(sum(item.width() for item in hints) + gap + horizontal_margin,
-                         max(item.height() for item in hints) + vertical_margin)
-        return QSize(max(item.width() for item in hints) + horizontal_margin,
-                     sum(item.height() for item in hints) + gap + vertical_margin)
+        gap = self._spacing * max(0, count - 1)
+        return QSize(width + horizontal_margin + (gap if self._horizontal else 0),
+                     height + vertical_margin + (0 if self._horizontal else gap))
 
     def sizeHint(self):
         if self._cached_size_hint is None:
             self._cached_size_hint = self._aggregate_hint(False)
-        return self._cached_size_hint
+        return QSize(self._cached_size_hint.width(), self._cached_size_hint.height())
 
     def minimumSize(self):
         if self._cached_minimum_size is None:
             self._cached_minimum_size = self._aggregate_hint(True)
-        return self._cached_minimum_size
+        return QSize(self._cached_minimum_size.width(), self._cached_minimum_size.height())
 
     minimumSizeHint = minimumSize
 
@@ -280,15 +392,50 @@ class QBoxLayout(QWidget):
 
     def _items(self):
         self._require_ui()
-        return [child for child in self._children if isinstance(child, QWidget)]
+        if self._cached_items is None:
+            self._cached_items = tuple(child for child in self._children if isinstance(child, QWidget))
+        return self._cached_items
 
     def itemAt(self, index):
         items = self._items()
-        return QLayoutItem(items[index]) if 0 <= index < len(items) else None
+        return (QLayoutItem(items[index], owner=self, alignment=self._item_alignment(items[index]))
+                if 0 <= index < len(items) else None)
+
+    def _item_alignment(self, widget):
+        return int(self._alignments.get(widget, 0) or 0)
+
+    def alignment(self):
+        return int(self._layout_alignment)
+
+    def setAlignment(self, widget_or_alignment, alignment=None):
+        """Set layout alignment or one item's Qt.Alignment flags.
+
+        ``setAlignment(flags)`` sets this layout's own alignment metadata while
+        ``setAlignment(widget, flags)`` matches QLayout's item overload.
+        """
+        if alignment is None:
+            value = int(widget_or_alignment or 0)
+            if value != self._layout_alignment:
+                self._layout_alignment = value
+                self.invalidate()
+            return True
+        widget = widget_or_alignment
+        if self.indexOf(widget) < 0:
+            return False
+        value = int(alignment or 0)
+        if value:
+            self._alignments[widget] = value
+        else:
+            self._alignments.pop(widget, None)
+        self.invalidate()
+        return True
 
     def indexOf(self, widget):
         items = self._items()
-        return items.index(widget) if widget in items else -1
+        try:
+            return items.index(widget)
+        except ValueError:
+            return -1
 
     def _insert(self, index, widget):
         _validate_placement(self, widget)
@@ -307,19 +454,33 @@ class QBoxLayout(QWidget):
         self.invalidate()
         return widget
 
-    def addWidget(self, widget):
-        return self._insert(-1, widget)
+    def addWidget(self, widget, stretch=0, alignment=0):
+        result = self._insert(-1, widget)
+        if stretch:
+            self.setStretch(self.indexOf(widget), stretch)
+        if alignment:
+            self.setAlignment(widget, alignment)
+        return result
 
-    def insertWidget(self, index, widget):
-        return self._insert(index, widget)
+    def insertWidget(self, index, widget, stretch=0, alignment=0):
+        result = self._insert(index, widget)
+        actual = self.indexOf(widget)
+        if stretch:
+            self.setStretch(actual, stretch)
+        if alignment:
+            self.setAlignment(widget, alignment)
+        return result
 
-    def addLayout(self, layout):
-        return self.insertLayout(-1, layout)
+    def addLayout(self, layout, stretch=0):
+        return self.insertLayout(-1, layout, stretch=stretch)
 
-    def insertLayout(self, index, layout):
+    def insertLayout(self, index, layout, stretch=0):
         if not getattr(layout, "_is_layout", False):
             raise ValueError("addLayout requires a layout")
-        return self._insert(index, layout)
+        result = self._insert(index, layout)
+        if stretch:
+            self.setStretch(self.indexOf(layout), stretch)
+        return result
 
     def takeAt(self, index):
         items = self._items()
@@ -339,15 +500,30 @@ class QBoxLayout(QWidget):
         taking Qt layout items and calling ``deleteLater`` on their widgets.
         It also keeps renderer child deletion out of application code.
         """
-        items = list(self._items())
+        items = tuple(self._items())
         if delete:
             for child in reversed(items):
                 child.delete()
             self.invalidate()
             return len(items)
-        for index in range(len(items) - 1, -1, -1):
-            self.takeAt(index)
+        for child in reversed(items):
+            if not child._deleted and child.parent is self:
+                _detach(self, child)
+        if items:
+            self.invalidate()
         return len(items)
+
+    def delete(self):
+        try:
+            super().delete()
+        finally:
+            if self._deleted:
+                self._cached_items = None
+                self._cached_size_hint = None
+                self._alignments.clear()
+                self._cached_minimum_size = None
+                self._cached_hfw = None
+                self._cached_wfh = None
 
 
 class QHBoxLayout(QBoxLayout):
@@ -410,7 +586,8 @@ class QGridLayout(QWidget):
     _is_layout = True
 
     def __init__(self, columns=2, *, column_widths=None, parent=None, after=None, backend=None,
-                 width=-1, height=-1, vertical_dividers=False, horizontal_dividers=False):
+                 width=-1, height=-1, vertical_dividers=False, horizontal_dividers=False,
+                 resizable=False):
         if not isinstance(columns, int) or isinstance(columns, bool) or columns < 1:
             raise ValueError("grid columns must be a positive integer")
         widths = (None,) * columns if column_widths is None else tuple(column_widths)
@@ -428,6 +605,7 @@ class QGridLayout(QWidget):
             native_height = 0
         tag = backend.add_table(header_row=False, width=int(width), height=native_height,
             policy=backend.mvTable_SizingStretchProp, pad_outerX=False,
+            resizable=bool(resizable),
             borders_innerH=bool(horizontal_dividers), borders_outerH=False,
             borders_innerV=bool(vertical_dividers), borders_outerV=False, **options)
         super().__init__(tag, parent=parent, after=after, backend=backend)
@@ -440,31 +618,52 @@ class QGridLayout(QWidget):
         self._vertical_spacing = 0
         self._cached_size_hint = None
         self._cached_minimum_size = None
+        self._cached_entries = None
+        self._cached_hfw = None
+        self._cached_wfh = None
+        self._alignments = {}
+        self._layout_alignment = 0
         try:
             for width in widths:
                 if width is None:
-                    backend.add_table_column(parent=tag, width_stretch=True)
+                    # Explicit equal weights avoid ImGui deriving column
+                    # proportions from early/disabled button captions.
+                    backend.add_table_column(parent=tag, width_stretch=True,
+                                             init_width_or_weight=1.0)
                 else:
                     backend.add_table_column(parent=tag, width_fixed=True, init_width_or_weight=width)
         except Exception:
             self.delete()
             raise
 
+    def childEvent(self, event):
+        super().childEvent(event)
+        if (not self._deleted and hasattr(self, '_layout_dirty')
+                and isinstance(event.child(), QWidget)):
+            self.invalidate()
+
     def invalidate(self):
         self._layout_dirty = True
         self._cached_size_hint = None
         self._cached_minimum_size = None
+        self._cached_entries = None
+        self._cached_hfw = None
+        self._cached_wfh = None
         _invalidate_owner(self)
         return True
 
     def activate(self):
         if not self._layout_enabled or not self._layout_dirty:
             return False
-        for _row, _column, child in self._entries():
-            child.ensurePolished()
-            if getattr(child, "_is_layout", False):
-                child.activate()
         self._layout_dirty = False
+        try:
+            for _row, _column, child in self._entries():
+                child.ensurePolished()
+                if getattr(child, "_is_layout", False):
+                    child.activate()
+        except Exception:
+            self._layout_dirty = True
+            raise
         return True
 
     def setEnabled(self, enabled):
@@ -515,6 +714,104 @@ class QGridLayout(QWidget):
             directions |= child.sizePolicy().expandingDirections()
         return directions
 
+    def hasHeightForWidth(self):
+        return any(getattr(child, "hasHeightForWidth", lambda: False)()
+                   for _row, _column, child in self._entries())
+
+    def hasWidthForHeight(self):
+        return any(getattr(child, "hasWidthForHeight", lambda: False)()
+                   for _row, _column, child in self._entries())
+
+    def _column_lengths(self, available, minimum=False):
+        entries = self._entries()
+        columns = [[] for _ in range(self.columns)]
+        for _row, column, child in entries:
+            if _layout_hint(child, minimum) is not None:
+                columns[column].append(child)
+        base, low, high, stretch, grow, shrink = [], [], [], [], [], []
+        for children in columns:
+            metrics = [_axis_metrics(child, True, minimum) for child in children]
+            metrics = [item for item in metrics if item is not None]
+            if not metrics:
+                base.append(0); low.append(0); high.append(16777215)
+                stretch.append(0); grow.append(True); shrink.append(True)
+                continue
+            base.append(max(item[0] for item in metrics))
+            low.append(max(item[1] for item in metrics))
+            high.append(max(item[2] for item in metrics))
+            stretch.append(max(item[3] for item in metrics))
+            grow.append(any(item[4] for item in metrics))
+            shrink.append(any(item[5] for item in metrics))
+        metrics = [[base[i], low[i], high[i], stretch[i], grow[i], shrink[i]]
+                   for i in range(self.columns)]
+        return _solve_metric_lengths(metrics, available)
+
+    def _height_for_width(self, width, minimum=False):
+        if not self.hasHeightForWidth():
+            return -1
+        width = max(0, int(width))
+        cache = self._cached_hfw
+        if cache is not None and cache[0] == width and cache[1] == bool(minimum):
+            return cache[2]
+        margins = self._contents_margins
+        content = width - margins.left() - margins.right()
+        content -= self._horizontal_spacing * max(0, self.columns - 1)
+        columns = self._column_lengths(content, minimum)
+        row_count = max(1, self.rowCount())
+        row_children = [[] for _ in range(row_count)]
+        row_widths = [[] for _ in range(row_count)]
+        for row, column, child in self._entries():
+            if _layout_hint(child, minimum) is None:
+                continue
+            row_children[row].append(child)
+            row_widths[row].append(columns[column])
+        rows = [_baseline_row_extent(children, widths, self._alignments, minimum=minimum)
+                for children, widths in zip(row_children, row_widths)]
+        value = sum(rows) + self._vertical_spacing * max(0, len(rows) - 1)
+        value += margins.top() + margins.bottom()
+        self._cached_hfw = (width, bool(minimum), int(value))
+        return int(value)
+
+    def heightForWidth(self, width):
+        return self._height_for_width(width, False)
+
+    def minimumHeightForWidth(self, width):
+        return self._height_for_width(width, True)
+
+    def widthForHeight(self, height):
+        if not self.hasWidthForHeight():
+            return -1
+        height = max(0, int(height))
+        cache = self._cached_wfh
+        if cache is not None and cache[0] == height:
+            return cache[1]
+        margins = self._contents_margins
+        entries = self._entries()
+        row_count = max(1, self.rowCount())
+        available = height - margins.top() - margins.bottom()
+        available -= self._vertical_spacing * max(0, row_count - 1)
+        # Build row representatives exactly like column width negotiation.
+        row_children = [[] for _ in range(row_count)]
+        for row, _column, child in entries:
+            if _layout_hint(child, False) is not None:
+                row_children[row].append(child)
+        row_bases = [max((_axis_metrics(child, False, False)[0] for child in children), default=0)
+                     for children in row_children]
+        total_base = sum(row_bases)
+        if row_count and available > total_base:
+            extra = (available - total_base) // row_count
+            row_bases = [value + extra for value in row_bases]
+        widths = [0] * self.columns
+        for row, column, child in entries:
+            if _layout_hint(child, False) is None:
+                continue
+            widths[column] = max(widths[column], _dependent_extent(
+                child, row_bases[row], height_for_width=False))
+        value = sum(widths) + self._horizontal_spacing * max(0, self.columns - 1)
+        value += margins.left() + margins.right()
+        self._cached_wfh = (height, int(value))
+        return int(value)
+
     def _aggregate_hint(self, minimum=False):
         widths = [0] * self.columns
         heights = [0] * max(1, self.rowCount())
@@ -538,12 +835,12 @@ class QGridLayout(QWidget):
     def sizeHint(self):
         if self._cached_size_hint is None:
             self._cached_size_hint = self._aggregate_hint(False)
-        return self._cached_size_hint
+        return QSize(self._cached_size_hint.width(), self._cached_size_hint.height())
 
     def minimumSize(self):
         if self._cached_minimum_size is None:
             self._cached_minimum_size = self._aggregate_hint(True)
-        return self._cached_minimum_size
+        return QSize(self._cached_minimum_size.width(), self._cached_minimum_size.height())
 
     minimumSizeHint = minimumSize
 
@@ -572,21 +869,50 @@ class QGridLayout(QWidget):
                 raise
             self._rows.append(native_row)
             self._cells.update(((index, col), cell) for col, cell in enumerate(cells))
+            self.invalidate()
         return self._cells[row, column]
 
-    def addWidget(self, widget, row, column):
+    def _item_alignment(self, widget):
+        return int(self._alignments.get(widget, 0) or 0)
+
+    def alignment(self):
+        return int(self._layout_alignment)
+
+    def setAlignment(self, widget_or_alignment, alignment=None):
+        if alignment is None:
+            value = int(widget_or_alignment or 0)
+            if value != self._layout_alignment:
+                self._layout_alignment = value
+                self.invalidate()
+            return True
+        widget = widget_or_alignment
+        if self.indexOf(widget) < 0:
+            return False
+        value = int(alignment or 0)
+        if value:
+            self._alignments[widget] = value
+        else:
+            self._alignments.pop(widget, None)
+        self.invalidate()
+        return True
+
+    def addWidget(self, widget, row, column, alignment=0):
         _validate_placement(self, widget)
         cell = self.cell(row, column)
         if widget.parent is not cell:
             self.backend.move_item(widget._layout_tag(), parent=cell.tag)
             widget.setParent(cell)
+        if alignment:
+            self._alignments[widget] = int(alignment)
+        else:
+            self._alignments.pop(widget, None)
         self.invalidate()
         return widget
 
-    def addLayout(self, layout, row, column):
+    def addLayout(self, layout, row, column, alignment=0):
         if not getattr(layout, "_is_layout", False):
             raise ValueError("addLayout requires a layout")
-        return self.addWidget(layout, row, column)
+        return self.addWidget(layout, row, column, alignment=alignment)
 
     def rowCount(self):
         self._require_ui()
@@ -597,15 +923,20 @@ class QGridLayout(QWidget):
 
     def _entries(self):
         self._require_ui()
-        return [(row, col, child) for (row, col), cell in sorted(self._cells.items())
-                for child in cell._children if isinstance(child, QWidget)]
+        if self._cached_entries is None:
+            self._cached_entries = tuple(
+                (row, col, child) for (row, col), cell in sorted(self._cells.items())
+                for child in cell._children if isinstance(child, QWidget))
+        return self._cached_entries
 
     def count(self):
         return len(self._entries())
 
     def itemAt(self, index):
         entries = self._entries()
-        return QLayoutItem(entries[index][2]) if 0 <= index < len(entries) else None
+        return (QLayoutItem(entries[index][2], owner=self,
+                            alignment=self._item_alignment(entries[index][2]))
+                if 0 <= index < len(entries) else None)
 
     def itemAtPosition(self, row, column):
         self._require_ui()
@@ -635,14 +966,18 @@ class QGridLayout(QWidget):
         return self.takeAt(self.indexOf(widget))
 
     def clear(self, *, delete=True):
-        entries = list(self._entries())
+        entries = tuple(self._entries())
         if delete:
             for _row, _column, child in reversed(entries):
                 child.delete()
             self.invalidate()
             return len(entries)
-        for index in range(len(entries) - 1, -1, -1):
-            self.takeAt(index)
+        for row, column, child in reversed(entries):
+            cell = self._cells.get((row, column))
+            if not child._deleted and child.parent is cell:
+                _detach(self, child)
+        if entries:
+            self.invalidate()
         return len(entries)
 
     def delete(self):
@@ -653,6 +988,12 @@ class QGridLayout(QWidget):
             if self._deleted:
                 self._rows.clear()
                 self._cells.clear()
+                self._cached_entries = None
+                self._cached_size_hint = None
+                self._cached_minimum_size = None
+                self._cached_hfw = None
+                self._cached_wfh = None
+                self._alignments.clear()
 
 
 class QFormLayout(QGridLayout):
@@ -687,6 +1028,17 @@ class QFormLayout(QGridLayout):
             if created_label:
                 label.delete()
             raise
+        # Retain Qt baseline semantics for text-bearing label/field pairs.
+        # The native renderer may still use its own cell placement, but layout
+        # size negotiation now reserves the correct mixed-font ascent/descent.
+        self.setAlignment(label, Qt.AlignBaseline)
+        baseline = getattr(field, "baselineOffset", None)
+        if callable(baseline):
+            try:
+                if int(baseline()) >= 0:
+                    self.setAlignment(field, Qt.AlignBaseline)
+            except Exception:
+                pass
         return row
 
     def labelForField(self, field):

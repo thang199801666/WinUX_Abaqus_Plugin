@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ..transfer_center_form import (
+from ..transfer.transfer_center_form import (
     TransferCenterDialog as TransferCenterForm,
     TransferTaskHandle,
     _TransferItemRow,

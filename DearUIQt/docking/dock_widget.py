@@ -12,11 +12,12 @@ from typing import Callable, Optional
 
 from ..backends import dpg
 
-from ..gui.palette import QtFusionPalette
+from ..gui.palette import QtFusionPalette, color_scheme
 from ..gui.action import QAction
 from ..widgets.menu import QMenu
 from ..widgets.widget import QWidget
 from ..core.object import Signal
+from .widget_state import QDockWidgetStateController
 from ..gui.style import (
     dock_content_theme, dock_control_theme, dock_frame_theme, dock_title_theme,
 )
@@ -93,13 +94,15 @@ class DockWidget:
     CONTROL_SIZE = 18
     CONTROL_GAP = 0
     TITLE_LEFT_PADDING = 7
-    TITLE_TOP_PADDING = 2
+    TITLE_TOP_PADDING = 3
+    TITLE_TEXT_HEIGHT = 13
+    TITLE_TEXT_OPTICAL_Y = -3
     TITLE_TEXT_RIGHT_PADDING = 6
 
     # Text/glyph colors remain local geometry details; surface/state colors are
     # supplied by the shared Dear ImGui Qt/Fusion style foundation.
     TEXT_COLOR = QtFusionPalette.TEXT
-    GLYPH_COLOR = (55, 55, 55, 255)
+    GLYPH_COLOR = QtFusionPalette.TEXT_MUTED
 
     def __init__(
             self,
@@ -132,6 +135,10 @@ class DockWidget:
         self.topLevelChanged = Signal()
         self.visibilityChanged = Signal()
         self.windowTitleChanged = Signal()
+        self.tabGroupChanged = Signal()
+        self.activeTabChanged = Signal()
+        self.splitTopologyChanged = Signal()
+        self.topologyChanged = Signal()
 
         # QMainWindow::saveState identifies each dock by QObject::objectName.
         # Use the stable Dear PyGui tag as the default identity so every dock
@@ -147,6 +154,20 @@ class DockWidget:
         if not self.is_area_allowed(self.dock_area):
             self.dock_area = self._first_allowed_area()
         self.floating = False
+        self._state_controller = QDockWidgetStateController(
+            mode="docked", visible=visible, request_floating=on_float_change,
+            dock_area=self.dock_area)
+        self._state_controller.topLevelChanged.connect(
+            self._state_controller_top_level_changed)
+        self._state_controller.visibilityChanged.connect(
+            self._state_controller_visibility_changed)
+        self._state_controller.dockAreaChanged.connect(
+            self._state_controller_dock_area_changed)
+        self._state_controller.tabGroupChanged.connect(self.tabGroupChanged.emit)
+        self._state_controller.activeTabChanged.connect(self.activeTabChanged.emit)
+        self._state_controller.splitTopologyChanged.connect(
+            self.splitTopologyChanged.emit)
+        self._state_controller.topologyChanged.connect(self.topologyChanged.emit)
         self._visible = bool(visible)
         self._effective_visible = bool(visible)
         self._last_layout_size = (0, 0)
@@ -321,6 +342,7 @@ class DockWidget:
         self._content_theme = dock_content_theme(dpg)
         self._float_control_theme = dock_control_theme(dpg, close=False)
         self._close_control_theme = dock_control_theme(dpg, close=True)
+        self._palette_signature = self._current_palette_signature()
 
         with dpg.theme() as self._drag_theme:
             with dpg.theme_component(dpg.mvButton):
@@ -331,6 +353,95 @@ class DockWidget:
                 dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
                 dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
                 dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 0, 0)
+
+    @staticmethod
+    def _current_palette_signature():
+        """Fingerprint palette roles that materially affect retained dock chrome."""
+        return (
+            color_scheme(), QtFusionPalette.TITLE, QtFusionPalette.TITLE_ACTIVE,
+            QtFusionPalette.TITLE_BORDER, QtFusionPalette.BASE,
+            QtFusionPalette.TEXT, QtFusionPalette.TEXT_MUTED,
+        )
+
+    def _ensure_theme_current(self):
+        """Self-heal a dock retained across an application palette transition."""
+        current = self._current_palette_signature()
+        if current != getattr(self, "_palette_signature", None):
+            self.refreshTheme()
+
+    def refreshTheme(self):
+        """Rebind retained QDockWidget chrome to the active application palette.
+
+        Dock title/content surfaces, control buttons and vector glyphs are
+        retained for the full lifetime of WinUx.  A runtime Light/Dark switch
+        therefore has to replace their scheme-specific native themes rather
+        than relying on the global application theme to recolor them in place.
+        """
+        self._frame_theme = dock_frame_theme(dpg)
+        self._title_theme = dock_title_theme(dpg, active=True)
+        self._content_theme = dock_content_theme(dpg)
+        self._float_control_theme = dock_control_theme(dpg, close=False)
+        self._close_control_theme = dock_control_theme(dpg, close=True)
+        self._palette_signature = self._current_palette_signature()
+
+        # Class aliases are refreshed by WinUx's static-palette synchronizer,
+        # but use the live palette directly as well so DearUIQt remains correct
+        # when used independently of WinUx.
+        self.TEXT_COLOR = QtFusionPalette.TEXT
+        self.GLYPH_COLOR = QtFusionPalette.TEXT_MUTED
+
+        for item, theme in (
+            (getattr(self, "root", None), self._frame_theme),
+            (getattr(self, "title_bar", None), self._title_theme),
+            (getattr(self, "content", None), self._content_theme),
+            (getattr(self, "float_button", None), self._float_control_theme),
+            (getattr(self, "close_button", None), self._close_control_theme),
+        ):
+            if item is None:
+                continue
+            try:
+                if dpg.does_item_exist(item):
+                    dpg.bind_item_theme(item, theme)
+            except Exception:
+                pass
+
+        try:
+            if dpg.does_item_exist(self.title_text):
+                dpg.configure_item(self.title_text, color=self.TEXT_COLOR)
+        except Exception:
+            pass
+        for glyph in (
+            getattr(self, "_float_back", None), getattr(self, "_float_front", None),
+            getattr(self, "_close_line_a", None), getattr(self, "_close_line_b", None),
+        ):
+            if glyph is None:
+                continue
+            try:
+                if dpg.does_item_exist(glyph):
+                    dpg.configure_item(glyph, color=self.GLYPH_COLOR)
+            except Exception:
+                pass
+        try:
+            self._sync_close_glyph_visual()
+        except Exception:
+            pass
+
+        menu = getattr(self, "_title_menu_obj", None)
+        refresh = getattr(menu, "refreshTheme", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                pass
+
+        custom_title = getattr(self, "_title_bar_widget", None)
+        refresh = getattr(custom_title, "refreshTheme", None)
+        if callable(refresh):
+            try:
+                refresh()
+            except Exception:
+                pass
+        return True
 
     @classmethod
     def _normalize_dock_area(cls, area):
@@ -365,14 +476,18 @@ class DockWidget:
         name = self._normalize_dock_area(area)
         if not self.is_area_allowed(name):
             return False
-        changed = name != self.dock_area
-        self.dock_area = name
-        self._sync_action_visibility()
-        if changed:
-            self.dockLocationChanged.emit(name)
+        controller = getattr(self, "_state_controller", None)
+        if controller is None:
+            changed = name != self.dock_area
+            self.dock_area = name
+            if changed:
+                self._sync_action_visibility()
+                self.dockLocationChanged.emit(name)
+        else:
+            changed = controller.setDockArea(name)
         if changed and notify and callable(self.on_dock_area_change):
             self.on_dock_area_change(name)
-        return True
+        return bool(changed)
 
     # ------------------------------------------------------------------
     # QDockWidget-compatible retained state API
@@ -427,17 +542,48 @@ class DockWidget:
     def setFeatures(self, features):
         return self.set_features(features)
 
+    def stateController(self):
+        """Return the retained QDockWidget state controller."""
+        return self._state_controller
+
+    def tabifiedDockKeys(self):
+        return self._state_controller.tabifiedKeys()
+
+    def activeTabKey(self):
+        return self._state_controller.activeTabKey()
+
+    def isActiveTab(self):
+        return self._state_controller.isActiveTab()
+
+    def splitOrientation(self):
+        return self._state_controller.splitOrientation()
+
+    def splitPath(self):
+        return self._state_controller.splitPath()
+
+    def topologySnapshot(self):
+        return self._state_controller.topologySnapshot()
+
+    def tabGroupController(self):
+        """Return the owning QMainWindow tab-group controller, if managed."""
+        main_window = self._state_controller.mainWindow()
+        getter = getattr(main_window, "dockTabGroupController", None)
+        if callable(getter):
+            try:
+                return getter()
+            except Exception:
+                return None
+        return None
+
+    def lifecycle(self):
+        """Return the shared retained dock-window lifecycle."""
+        return self._state_controller.lifecycle()
+
     def isFloating(self):
-        return bool(self.floating)
+        return bool(self._state_controller.isFloating())
 
     def setFloating(self, floating):
-        desired = bool(floating)
-        if desired == self.floating:
-            return False
-        if callable(self.on_float_change):
-            self.on_float_change(desired)
-            return True
-        return self.set_floating(desired)
+        return self._state_controller.requestFloating(bool(floating))
 
     def isVisible(self):
         return bool(self._visible)
@@ -681,8 +827,7 @@ class DockWidget:
         if not self.floatable and not self.closable and not self.movable:
             return
         try:
-            mx, my = map(int, dpg.get_mouse_pos(local=False))
-            menu.popup((mx, my), context=self)
+            menu.popupGlobal(context=self, owner=self.root)
         except Exception:
             menu.popup(context=self)
 
@@ -761,6 +906,45 @@ class DockWidget:
         self.sync_layout(force=True)
         return True
 
+    def _state_controller_top_level_changed(self, floating):
+        sync = bool(getattr(self, "_state_controller_sync_hint", True))
+        self._apply_floating_presentation(bool(floating), sync=sync)
+
+    def _state_controller_visibility_changed(self, visible):
+        # The renderer-facing visibility path may already have applied this
+        # state. Keep presentation synchronized without re-entering lifecycle.
+        visible = bool(visible)
+        self._visible = visible
+        self._sync_toggle_view_action()
+
+    def _state_controller_dock_area_changed(self, area):
+        area = self._normalize_dock_area(area)
+        if area == self.dock_area:
+            return
+        self.dock_area = area
+        self._sync_action_visibility()
+        if not self.floating:
+            self.dockLocationChanged.emit(area)
+
+    def _apply_floating_presentation(self, floating: bool, *, sync=True):
+        floating = bool(floating)
+        if self.floating == floating:
+            if sync:
+                self.sync_layout(force=True)
+            return False
+        self.floating = floating
+        self._hide_title_menu()
+        self._sync_action_visibility()
+        self.topLevelChanged.emit(floating)
+        self.dockLocationChanged.emit(None if floating else self.dock_area)
+        if dpg.does_item_exist(self.title_bar):
+            dpg.configure_item(
+                self.title_bar,
+                show=bool(not floating or self._title_bar_widget is not None))
+        if sync:
+            self.sync_layout(force=True)
+        return True
+
     def _set_effective_visibility(self, visible: bool):
         """Update presentation visibility without changing toggleViewAction.
 
@@ -779,6 +963,7 @@ class DockWidget:
         visible = bool(visible)
         changed = self._visible != visible
         self._visible = visible
+        self._state_controller.setVisible(visible)
         try:
             if dpg.does_item_exist(self.root):
                 dpg.configure_item(self.root, show=visible)
@@ -790,21 +975,29 @@ class DockWidget:
             self.on_visibility_change(visible)
         return changed
 
-    def set_floating(self, floating: bool):
+    def set_floating(self, floating: bool, *, sync=True):
+        """Adopt a committed renderer top-level state.
+
+        Host transactions call this only after their native/renderer hand-off
+        is committed. The state controller owns the logical mode; this method
+        mirrors that state into the retained dock presentation.
+        """
         floating = bool(floating)
-        if self.floating == floating:
-            self.sync_layout(force=True)
-            return
-        self.floating = floating
-        self._hide_title_menu()
-        self._sync_action_visibility()
-        self.topLevelChanged.emit(floating)
-        self.dockLocationChanged.emit(None if floating else self.dock_area)
-        if dpg.does_item_exist(self.title_bar):
-            dpg.configure_item(
-                self.title_bar,
-                show=bool(not floating or self._title_bar_widget is not None))
-        self.sync_layout(force=True)
+        self._state_controller_sync_hint = bool(sync)
+        try:
+            changed = self._state_controller.adoptFloating(floating)
+        finally:
+            self._state_controller_sync_hint = True
+        # ``adoptFloating`` emits topLevelChanged and therefore normally applies
+        # presentation through the controller slot. If logical state was already
+        # committed, still make sure renderer chrome matches the requested state.
+        if not changed:
+            self._apply_floating_presentation(floating, sync=sync)
+        elif not sync:
+            # The signal path uses eager sync for ordinary callers; transaction
+            # paths explicitly request deferred layout, so avoid a second pass.
+            pass
+        return changed
 
     def _sync_close_glyph_visual(self, sender=None, app_data=None, user_data=None):
         """Keep the vector X readable over the red close-button hover state."""
@@ -860,21 +1053,55 @@ class DockWidget:
                 text = text[:max_chars - 3].rstrip() + "..."
         return "\n".join(text)
 
+    @classmethod
+    def _horizontal_title_text_y(cls, title_height):
+        """Return a visually centered baseline offset for the default dock title.
+
+        Dear PyGui positions text by its top edge while the dock controls are
+        centered from their full button geometry.  Keeping a small nominal
+        text-height estimate here avoids the title sitting 1-2 px too high in
+        the compact 20 px Fusion-style title strip.
+        """
+        try:
+            height = max(1, int(title_height))
+        except Exception:
+            height = cls.TITLE_HEIGHT
+        geometric = int(round((height - cls.TITLE_TEXT_HEIGHT) * 0.5))
+        # Dear ImGui/DPG font metrics include internal top leading that is not
+        # visible glyph ink.  Compensate optically so the visible title glyphs
+        # align with the centered dock controls rather than sitting low.
+        return max(0, geometric + int(cls.TITLE_TEXT_OPTICAL_Y))
+
     def sync_layout(self, width=None, height=None, force=False):
-        """Keep Qt-like chrome aligned while the host/splitter is resized."""
+        """Keep Qt-like chrome aligned while the host/splitter is resized.
+
+        Explicit dimensions are the hot path used by DockManager.  Do not ask
+        Dear PyGui for rect/configuration data in that case: those native
+        queries are comparatively expensive and were previously repeated for
+        every dock during each attach/detach layout commit.
+        """
+        # Docks can outlive the palette resource that created them (for
+        # example when Settings switches Light/Dark while the SSH Console is
+        # retained). Menus already self-heal on popup; make dock chrome follow
+        # the same contract before every geometry/paint synchronization.
+        self._ensure_theme_current()
         if not dpg.does_item_exist(self.root):
             return
 
-        try:
-            actual_w, actual_h = dpg.get_item_rect_size(self.root)
-            actual_w, actual_h = int(actual_w), int(actual_h)
-        except Exception:
-            actual_w, actual_h = 0, 0
-
-        try:
-            cfg = dpg.get_item_configuration(self.root)
-        except Exception:
-            cfg = {}
+        actual_w = actual_h = 0
+        cfg = {}
+        if width is None or height is None:
+            try:
+                actual_w, actual_h = dpg.get_item_rect_size(self.root)
+                actual_w, actual_h = int(actual_w), int(actual_h)
+            except Exception:
+                actual_w, actual_h = 0, 0
+            if ((width is None and actual_w <= 1)
+                    or (height is None and actual_h <= 1)):
+                try:
+                    cfg = dpg.get_item_configuration(self.root)
+                except Exception:
+                    cfg = {}
 
         if width is None:
             width = actual_w if actual_w > 1 else int(cfg.get("width", 1) or 1)
@@ -1042,7 +1269,8 @@ class DockWidget:
                     self.title_text, self._elide_title(self.title, title_available))
                 dpg.configure_item(
                     self.title_text,
-                    pos=(self.TITLE_LEFT_PADDING, self.TITLE_TOP_PADDING), show=True)
+                    pos=(self.TITLE_LEFT_PADDING,
+                         self._horizontal_title_text_y(title_h)), show=True)
             dpg.configure_item(
                 self.title_overlay, pos=(0, 0), width=title_w,
                 height=title_h, show=True)
@@ -1092,33 +1320,312 @@ class DockWidget:
 
 
 class DockDropPreview:
-    """Viewport-front translucent dock target preview.
+    """Polished Visual-Studio/Qt-like docking guide overlay.
 
-    QMainWindow paints docking feedback above the central widget while a
-    floating QDockWidget is dragged near an allowed dock area.  A normal child
-    drawlist can be obscured by sibling child windows, so the host keeps this
-    feedback in a lazy viewport-front drawlist.  The overlay is visual only and
-    never participates in hit testing.
+    Hit testing remains based on ``zone_rectangles`` and
+    ``outer_zone_rectangles``. Rendering is deliberately richer: each guide is
+    a compact white tile with a mini-layout diagram and a small directional
+    triangle, closely matching common IDE docking affordances.
     """
 
-    BORDER = (0, 120, 215, 235)
-    FILL = (0, 120, 215, 52)
-    INNER_BORDER = (0, 120, 215, 150)
-    INNER_FILL = (0, 120, 215, 24)
+    # These aliases are refreshed from QtFusionPalette by _refresh_palette().
+    # They remain class attributes for compatibility with existing tests/callers.
+    BORDER = QtFusionPalette.HIGHLIGHT[:3] + (235,)
+    FILL = QtFusionPalette.HIGHLIGHT[:3] + (44,)
+    INNER_BORDER = QtFusionPalette.HIGHLIGHT[:3] + (105,)
+    INNER_FILL = QtFusionPalette.HIGHLIGHT[:3] + (18,)
+    SCRIM_FILL = QtFusionPalette.SHADOW[:3] + (24,)
+    PANEL_BORDER = QtFusionPalette.BORDER[:3] + (225,)
+    PANEL_FILL = QtFusionPalette.MENU[:3] + (232,)
+    SHADOW = QtFusionPalette.SHADOW[:3] + (48,)
+
+    ZONE_BORDER = QtFusionPalette.BORDER
+    ZONE_FILL = QtFusionPalette.BASE[:3] + (248,)
+    ZONE_ACTIVE_BORDER = QtFusionPalette.HIGHLIGHT
+    ZONE_ACTIVE_FILL = QtFusionPalette.HIGHLIGHT_SOFT
+
+    FRAME = QtFusionPalette.TEXT_MUTED
+    FRAME_ACTIVE = QtFusionPalette.HIGHLIGHT
+    TARGET = QtFusionPalette.SELECTION_BORDER
+    TARGET_ACTIVE = QtFusionPalette.HIGHLIGHT
+    ARROW = QtFusionPalette.TEXT_MUTED
+    ARROW_ACTIVE = QtFusionPalette.HIGHLIGHT
+    CENTER_BORDER = QtFusionPalette.BORDER[:3] + (245,)
+    CENTER_FILL = QtFusionPalette.MENU[:3] + (248,)
+    ZONES = ("left", "right", "top", "bottom")
 
     def __init__(self, tag="dearuiqt_dock_drop_preview"):
         self.tag = str(tag)
         self._layer = None
+        self._scrim = None
+        self._panel = None
         self._rect = None
         self._inner = None
+        self._center_shadow = None
+        self._center_item = None
+        self._center_frame = None
+        self._zone_shadows = {}
+        self._outer_zone_shadows = {}
+        self._zone_items = {}
+        self._outer_zone_items = {}
+        self._zone_frames = {}
+        self._outer_zone_frames = {}
+        self._zone_targets = {}
+        self._outer_zone_targets = {}
+        self._zone_arrows = {}
+        self._outer_zone_arrows = {}
         self._last_rect = None
+        self._last_inset = None
+        self._last_zone_bounds = None
+        self._active_zone = None
+        self._active_scope = None
+        self._palette_scheme = None
+        self._refresh_palette()
+
+    def _refresh_palette(self):
+        """Resolve docking-guide chrome from the active application palette."""
+        p = QtFusionPalette
+        self.BORDER = p.HIGHLIGHT[:3] + (235,)
+        self.FILL = p.HIGHLIGHT[:3] + (44,)
+        self.INNER_BORDER = p.HIGHLIGHT[:3] + (105,)
+        self.INNER_FILL = p.HIGHLIGHT[:3] + (18,)
+        self.SCRIM_FILL = p.SHADOW[:3] + ((34 if color_scheme() == "Dark" else 20),)
+        self.PANEL_BORDER = p.BORDER[:3] + (225,)
+        self.PANEL_FILL = p.MENU[:3] + (232,)
+        self.SHADOW = p.SHADOW[:3] + ((72 if color_scheme() == "Dark" else 40),)
+        self.ZONE_BORDER = p.BORDER
+        self.ZONE_FILL = p.BASE[:3] + (248,)
+        self.ZONE_ACTIVE_BORDER = p.HIGHLIGHT
+        self.ZONE_ACTIVE_FILL = p.HIGHLIGHT_SOFT
+        self.FRAME = p.TEXT_MUTED
+        self.FRAME_ACTIVE = p.HIGHLIGHT
+        self.TARGET = p.SELECTION_BORDER
+        self.TARGET_ACTIVE = p.HIGHLIGHT
+        self.ARROW = p.TEXT_MUTED
+        self.ARROW_ACTIVE = p.HIGHLIGHT
+        self.CENTER_BORDER = p.BORDER[:3] + (245,)
+        self.CENTER_FILL = p.MENU[:3] + (248,)
+        self._palette_scheme = color_scheme()
+
+    @staticmethod
+    def zone_rectangles(bounds):
+        x, y, width, height = map(float, bounds)
+        width, height = max(1.0, width), max(1.0, height)
+        cx, cy = x + width * 0.5, y + height * 0.5
+        base = min(width, height)
+        center = min(40.0, max(32.0, base * 0.092))
+        gap = min(9.0, max(6.0, center * 0.18))
+        side_w = min(27.0, max(20.0, center * 0.60))
+        side_h = min(40.0, max(30.0, center * 0.94))
+        return {
+            "left": (cx - center * 0.5 - gap - side_w, cy - side_h * 0.5,
+                     side_w, side_h),
+            "right": (cx + center * 0.5 + gap, cy - side_h * 0.5,
+                      side_w, side_h),
+            "top": (cx - side_h * 0.5, cy - center * 0.5 - gap - side_w,
+                    side_h, side_w),
+            "bottom": (cx - side_h * 0.5, cy + center * 0.5 + gap,
+                       side_h, side_w),
+        }
+
+    @staticmethod
+    def outer_zone_rectangles(bounds):
+        x, y, width, height = map(float, bounds)
+        width, height = max(1.0, width), max(1.0, height)
+        cx, cy = x + width * 0.5, y + height * 0.5
+        margin_x = min(52.0, max(22.0, width * 0.095))
+        margin_y = min(48.0, max(20.0, height * 0.10))
+        box_w = min(21.0, max(16.0, min(width, height) * 0.043))
+        box_h = min(31.0, max(23.0, min(width, height) * 0.066))
+        return {
+            "left": (x + margin_x, cy - box_h * 0.5, box_w, box_h),
+            "right": (x + width - margin_x - box_w, cy - box_h * 0.5,
+                      box_w, box_h),
+            "top": (cx - box_h * 0.5, y + margin_y, box_h, box_w),
+            "bottom": (cx - box_h * 0.5, y + height - margin_y - box_w,
+                       box_h, box_w),
+        }
+
+    @staticmethod
+    def panel_geometry(bounds):
+        rects = DockDropPreview.zone_rectangles(bounds)
+        xs = [r[0] for r in rects.values()]
+        ys = [r[1] for r in rects.values()]
+        x2s = [r[0] + r[2] for r in rects.values()]
+        y2s = [r[1] + r[3] for r in rects.values()]
+        pad = 9.0
+        return (min(xs) - pad, min(ys) - pad,
+                max(x2s) - min(xs) + 2.0 * pad,
+                max(y2s) - min(ys) + 2.0 * pad)
+
+    @staticmethod
+    def center_rect(bounds):
+        x, y, width, height = DockDropPreview.panel_geometry(bounds)
+        cx, cy = x + width * 0.5, y + height * 0.5
+        size = min(38.0, max(30.0, min(width, height) * 0.22))
+        return (cx - size * 0.5, cy - size * 0.5, size, size)
+
+    @staticmethod
+    def zone_at(point, bounds, tolerance=0.0):
+        if point is None or bounds is None:
+            return None
+        mx, my = map(float, point)
+        tolerance = max(0.0, float(tolerance))
+        for zone, rect in DockDropPreview.zone_rectangles(bounds).items():
+            x, y, w, h = rect
+            if (x - tolerance <= mx <= x + w + tolerance
+                    and y - tolerance <= my <= y + h + tolerance):
+                return zone
+        return None
+
+    @staticmethod
+    def outer_zone_at(point, bounds, tolerance=0.0):
+        if point is None or bounds is None:
+            return None
+        mx, my = map(float, point)
+        tolerance = max(0.0, float(tolerance))
+        for zone, rect in DockDropPreview.outer_zone_rectangles(bounds).items():
+            x, y, w, h = rect
+            if (x - tolerance <= mx <= x + w + tolerance
+                    and y - tolerance <= my <= y + h + tolerance):
+                return zone
+        return None
+
+    @staticmethod
+    def zone_hit(point, bounds, tolerance=0.0):
+        if point is None or bounds is None:
+            return None, None
+        mx, my = map(float, point)
+
+        # The center tile is intentionally neutral.  It is a visual anchor for
+        # the four-way guide, not a drop target.  Check it before applying any
+        # tolerance to the surrounding zones so their expanded hitboxes can
+        # never steal the center and resolve to a nearest dock direction.
+        cx, cy, cw, ch = DockDropPreview.center_rect(bounds)
+        center_guard = 2.0
+        if (cx - center_guard <= mx <= cx + cw + center_guard
+                and cy - center_guard <= my <= cy + ch + center_guard):
+            return None, None
+
+        # Keep the central directional guides precise.  Outer edge guides may
+        # use the caller's larger tolerance because they are isolated and are
+        # intended to be easy edge targets.
+        inner_tolerance = min(max(0.0, float(tolerance)), 2.0)
+        zone = DockDropPreview.zone_at(point, bounds, inner_tolerance)
+        if zone is not None:
+            return zone, "inner"
+        zone = DockDropPreview.outer_zone_at(point, bounds, tolerance)
+        if zone is not None:
+            return zone, "outer"
+        return None, None
+
+    @staticmethod
+    def _configure_rect(item, rect, **kwargs):
+        x, y, w, h = map(float, rect)
+        dpg.configure_item(item, pmin=(x, y), pmax=(x + w, y + h), **kwargs)
+
+    @staticmethod
+    def _shadow_rect(rect):
+        x, y, w, h = map(float, rect)
+        return (x + 1.2, y + 1.8, w, h)
+
+    @staticmethod
+    def _mini_frame_rect(rect, zone=None):
+        """Reserve a dedicated gutter for the directional arrow.
+
+        Keeping the miniature layout and arrow in separate visual regions
+        prevents the icon overlap that made the previous guide look cramped.
+        """
+        x, y, w, h = map(float, rect)
+        zone = str(zone or "").lower()
+        if zone == "left":
+            arrow_w = max(6.0, w * 0.28)
+            return (x + max(3.0, w * 0.12), y + max(4.0, h * 0.19),
+                    max(6.0, w - arrow_w - max(6.0, w * 0.26)),
+                    max(7.0, h - 2.0 * max(4.0, h * 0.19)))
+        if zone == "right":
+            arrow_w = max(6.0, w * 0.28)
+            left_pad = arrow_w + max(3.0, w * 0.14)
+            return (x + left_pad, y + max(4.0, h * 0.19),
+                    max(6.0, w - left_pad - max(3.0, w * 0.12)),
+                    max(7.0, h - 2.0 * max(4.0, h * 0.19)))
+        if zone == "top":
+            arrow_h = max(6.0, h * 0.30)
+            return (x + max(4.0, w * 0.18), y + max(3.0, h * 0.10),
+                    max(8.0, w - 2.0 * max(4.0, w * 0.18)),
+                    max(6.0, h - arrow_h - max(5.0, h * 0.24)))
+        if zone == "bottom":
+            arrow_h = max(6.0, h * 0.30)
+            top_pad = arrow_h + max(3.0, h * 0.14)
+            return (x + max(4.0, w * 0.18), y + top_pad,
+                    max(8.0, w - 2.0 * max(4.0, w * 0.18)),
+                    max(6.0, h - top_pad - max(3.0, h * 0.10)))
+        px = max(5.0, w * 0.22)
+        py = max(5.0, h * 0.22)
+        return (x + px, y + py, max(8.0, w - 2 * px), max(8.0, h - 2 * py))
+
+    @staticmethod
+    def _target_rect(frame_rect, zone):
+        x, y, w, h = map(float, frame_rect)
+        edge = max(2.0, min(w, h) * 0.28)
+        if zone == "left":
+            return (x, y, min(edge, w), h)
+        if zone == "right":
+            return (x + max(0.0, w - edge), y, min(edge, w), h)
+        if zone == "top":
+            return (x, y, w, min(edge, h))
+        return (x, y + max(0.0, h - edge), w, min(edge, h))
+
+    @staticmethod
+    def _arrow_points(rect, zone):
+        x, y, w, h = map(float, rect)
+        s = max(1.8, min(w, h) * 0.085)
+        if zone == "left":
+            cx, cy = x + w * 0.86, y + h * 0.5
+            return ((cx - s, cy), (cx + s, cy - s), (cx + s, cy + s))
+        if zone == "right":
+            cx, cy = x + w * 0.14, y + h * 0.5
+            return ((cx + s, cy), (cx - s, cy - s), (cx - s, cy + s))
+        if zone == "top":
+            cx, cy = x + w * 0.5, y + h * 0.87
+            return ((cx, cy - s), (cx - s, cy + s), (cx + s, cy + s))
+        cx, cy = x + w * 0.5, y + h * 0.13
+        return ((cx, cy + s), (cx - s, cy - s), (cx + s, cy - s))
+
+    @staticmethod
+    def _configure_triangle(item, points, **kwargs):
+        p1, p2, p3 = points
+        dpg.configure_item(item, p1=p1, p2=p2, p3=p3, **kwargs)
 
     def _ensure_built(self):
+        scheme = color_scheme()
+        if scheme != self._palette_scheme:
+            self._refresh_palette()
+            # Retained draw primitives carry literal colors; recreate them once
+            # when Light/Dark changes so an open docking interaction cannot
+            # keep the previous scheme's white/black tiles.
+            if self._layer and dpg.does_item_exist(self._layer):
+                self.destroy()
         if self._layer and dpg.does_item_exist(self._layer):
             return True
         self._layer = None
+        self._scrim = None
+        self._panel = None
         self._rect = None
         self._inner = None
+        self._center_shadow = None
+        self._center_item = None
+        self._center_frame = None
+        self._zone_shadows = {}
+        self._outer_zone_shadows = {}
+        self._zone_items = {}
+        self._outer_zone_items = {}
+        self._zone_frames = {}
+        self._outer_zone_frames = {}
+        self._zone_targets = {}
+        self._outer_zone_targets = {}
+        self._zone_arrows = {}
+        self._outer_zone_arrows = {}
         if dpg.does_item_exist(self.tag):
             try:
                 dpg.delete_item(self.tag)
@@ -1136,41 +1643,151 @@ class DockDropPreview:
             self._layer = None
             return False
         try:
-            self._rect = dpg.draw_rectangle(
-                (0, 0), (1, 1), parent=self._layer, color=self.BORDER,
-                fill=self.FILL, thickness=2.0, rounding=1.0, show=False)
-            self._inner = dpg.draw_rectangle(
-                (0, 0), (1, 1), parent=self._layer, color=self.INNER_BORDER,
-                fill=self.INNER_FILL, thickness=1.0, rounding=1.0, show=False)
+            self._scrim = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                color=(0, 0, 0, 0), fill=self.SCRIM_FILL, thickness=0.0, show=False)
+            self._rect = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                color=self.BORDER, fill=self.FILL, thickness=1.5, rounding=0.0, show=False)
+            self._inner = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                color=self.INNER_BORDER, fill=self.INNER_FILL, thickness=1.0, rounding=0.0, show=False)
+            self._panel = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                color=self.PANEL_BORDER, fill=self.PANEL_FILL, thickness=1.0, rounding=2.0, show=False)
+            self._center_shadow = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                color=(0, 0, 0, 0), fill=self.SHADOW, thickness=0.0, rounding=1.5, show=False)
+            self._center_item = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                color=self.CENTER_BORDER, fill=self.CENTER_FILL, thickness=1.0, rounding=1.5, show=False)
+            self._center_frame = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                color=self.FRAME_ACTIVE, fill=(0, 0, 0, 0), thickness=1.1, rounding=0.0, show=False)
+            for zone in self.ZONES:
+                self._zone_shadows[zone] = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                    color=(0, 0, 0, 0), fill=self.SHADOW, thickness=0.0, rounding=1.5, show=False)
+                self._outer_zone_shadows[zone] = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                    color=(0, 0, 0, 0), fill=self.SHADOW, thickness=0.0, rounding=1.5, show=False)
+                self._zone_items[zone] = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                    color=self.ZONE_BORDER, fill=self.ZONE_FILL, thickness=1.0, rounding=1.5, show=False)
+                self._outer_zone_items[zone] = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                    color=self.ZONE_BORDER, fill=self.ZONE_FILL, thickness=1.0, rounding=1.5, show=False)
+                self._zone_frames[zone] = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                    color=self.FRAME, fill=(0, 0, 0, 0), thickness=1.0, rounding=0.0, show=False)
+                self._outer_zone_frames[zone] = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                    color=self.FRAME, fill=(0, 0, 0, 0), thickness=1.0, rounding=0.0, show=False)
+                self._zone_targets[zone] = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                    color=self.TARGET, fill=self.TARGET, thickness=1.0, rounding=0.0, show=False)
+                self._outer_zone_targets[zone] = dpg.draw_rectangle((0, 0), (1, 1), parent=self._layer,
+                    color=self.TARGET, fill=self.TARGET, thickness=1.0, rounding=0.0, show=False)
+                self._zone_arrows[zone] = dpg.draw_triangle((0, 0), (1, 1), (0, 1), parent=self._layer,
+                    color=self.ARROW, fill=self.ARROW, thickness=1.0, show=False)
+                self._outer_zone_arrows[zone] = dpg.draw_triangle((0, 0), (1, 1), (0, 1), parent=self._layer,
+                    color=self.ARROW, fill=self.ARROW, thickness=1.0, show=False)
         except Exception:
             self.destroy()
             return False
         return True
 
+    def prepare(self):
+        return bool(self._ensure_built())
+
     def show(self, x, y, width, height, *, inset=True):
         if not self._ensure_built():
             return False
-        x = float(x)
-        y = float(y)
-        width = max(1.0, float(width))
-        height = max(1.0, float(height))
-        x2 = x + width
-        y2 = y + height
+        self._hide_guides()
+        return self._show_result((x, y, width, height), inset=inset)
+
+    def _show_result(self, geometry, *, inset=True):
+        x, y, width, height = map(float, geometry)
+        width, height = max(1.0, width), max(1.0, height)
+        x2, y2 = x + width, y + height
         try:
-            dpg.configure_item(
-                self._rect, pmin=(x, y), pmax=(x2, y2), show=True)
+            dpg.configure_item(self._rect, pmin=(x, y), pmax=(x2, y2), show=True)
             if inset and width > 24 and height > 24:
-                pad = min(10.0, width * 0.08, height * 0.08)
-                dpg.configure_item(
-                    self._inner,
-                    pmin=(x + pad, y + pad),
-                    pmax=(x2 - pad, y2 - pad), show=True)
+                pad = min(9.0, width * 0.065, height * 0.065)
+                dpg.configure_item(self._inner, pmin=(x + pad, y + pad),
+                                   pmax=(x2 - pad, y2 - pad), show=True)
             else:
                 dpg.configure_item(self._inner, show=False)
             self._last_rect = (x, y, width, height)
+            self._last_inset = bool(inset)
             return True
         except Exception:
             return False
+
+    def _configure_guide(self, rect, zone, active, shadow, item, frame, target, arrow):
+        border = self.ZONE_ACTIVE_BORDER if active else self.ZONE_BORDER
+        fill = self.ZONE_ACTIVE_FILL if active else self.ZONE_FILL
+        frame_color = self.FRAME_ACTIVE if active else self.FRAME
+        target_color = self.TARGET_ACTIVE if active else self.TARGET
+        arrow_color = self.ARROW_ACTIVE if active else self.ARROW
+        self._configure_rect(shadow, self._shadow_rect(rect), show=True)
+        self._configure_rect(item, rect, show=True, color=border, fill=fill,
+                             thickness=(1.35 if active else 1.0), rounding=1.5)
+        mini = self._mini_frame_rect(rect, zone)
+        self._configure_rect(frame, mini, show=True, color=frame_color,
+                             fill=(0, 0, 0, 0), thickness=(1.15 if active else 1.0), rounding=0.0)
+        self._configure_rect(target, self._target_rect(mini, zone), show=True,
+                             color=target_color, fill=target_color, thickness=1.0, rounding=0.0)
+        self._configure_triangle(arrow, self._arrow_points(rect, zone), show=True,
+                                 color=arrow_color, fill=arrow_color, thickness=1.0)
+
+    def show_zones(self, bounds, *, active=None, active_scope=None, preview_rect=None):
+        if not self._ensure_built():
+            return False
+        active = str(active or "").strip().lower() or None
+        if active not in self.ZONES:
+            active = None
+        active_scope = str(active_scope or "").strip().lower() or None
+        if active_scope not in ("inner", "outer"):
+            active_scope = None
+        try:
+            dpg.configure_item(self._scrim, pmin=(bounds[0], bounds[1]),
+                               pmax=(bounds[0] + bounds[2], bounds[1] + bounds[3]), show=True)
+            self._configure_rect(self._panel, self.panel_geometry(bounds), show=True)
+            center = self.center_rect(bounds)
+            self._configure_rect(self._center_shadow, self._shadow_rect(center), show=True)
+            self._configure_rect(self._center_item, center, show=True)
+            self._configure_rect(self._center_frame, self._mini_frame_rect(center, None), show=True,
+                                 color=self.FRAME_ACTIVE, fill=(0, 0, 0, 0), thickness=1.1, rounding=0.0)
+            rects = self.zone_rectangles(bounds)
+            outer = self.outer_zone_rectangles(bounds)
+            for zone in self.ZONES:
+                self._configure_guide(rects[zone], zone,
+                    zone == active and active_scope == "inner",
+                    self._zone_shadows[zone], self._zone_items[zone],
+                    self._zone_frames[zone], self._zone_targets[zone], self._zone_arrows[zone])
+                self._configure_guide(outer[zone], zone,
+                    zone == active and active_scope == "outer",
+                    self._outer_zone_shadows[zone], self._outer_zone_items[zone],
+                    self._outer_zone_frames[zone], self._outer_zone_targets[zone], self._outer_zone_arrows[zone])
+            self._last_zone_bounds = tuple(map(float, bounds))
+            self._active_zone = active
+            self._active_scope = active_scope
+            if active is not None and preview_rect is not None:
+                self._show_result(preview_rect, inset=True)
+            else:
+                dpg.configure_item(self._rect, show=False)
+                dpg.configure_item(self._inner, show=False)
+                self._last_rect = None
+                self._last_inset = None
+            return True
+        except Exception:
+            return False
+
+    def _hide_guides(self):
+        items = [self._scrim, self._panel, self._center_shadow,
+                 self._center_item, self._center_frame]
+        for mapping in (self._zone_shadows, self._outer_zone_shadows,
+                        self._zone_items, self._outer_zone_items,
+                        self._zone_frames, self._outer_zone_frames,
+                        self._zone_targets, self._outer_zone_targets,
+                        self._zone_arrows, self._outer_zone_arrows):
+            items.extend(mapping.values())
+        for item in items:
+            if item and dpg.does_item_exist(item):
+                try:
+                    dpg.configure_item(item, show=False)
+                except Exception:
+                    pass
+        self._last_zone_bounds = None
+        self._active_zone = None
+        self._active_scope = None
 
     def hide(self):
         for item in (self._rect, self._inner):
@@ -1179,14 +1796,35 @@ class DockDropPreview:
                     dpg.configure_item(item, show=False)
                 except Exception:
                     pass
+        self._hide_guides()
         self._last_rect = None
+        self._last_inset = None
 
     def destroy(self):
         layer = self._layer
         self._layer = None
+        self._scrim = None
+        self._panel = None
         self._rect = None
         self._inner = None
+        self._center_shadow = None
+        self._center_item = None
+        self._center_frame = None
+        self._zone_shadows = {}
+        self._outer_zone_shadows = {}
+        self._zone_items = {}
+        self._outer_zone_items = {}
+        self._zone_frames = {}
+        self._outer_zone_frames = {}
+        self._zone_targets = {}
+        self._outer_zone_targets = {}
+        self._zone_arrows = {}
+        self._outer_zone_arrows = {}
         self._last_rect = None
+        self._last_inset = None
+        self._last_zone_bounds = None
+        self._active_zone = None
+        self._active_scope = None
         if layer and dpg.does_item_exist(layer):
             try:
                 dpg.delete_item(layer)

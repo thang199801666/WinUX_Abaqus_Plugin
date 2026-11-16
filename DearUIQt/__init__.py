@@ -1,4 +1,4 @@
-"""DearUIQt — reusable Qt-style desktop GUI library backed by Dear PyGui.
+"""DearUIQt: reusable Qt-style desktop GUI library backed by Dear PyGui.
 
 New code should prefer the structured namespaces ``core``, ``gui``, ``widgets``,
 ``layouts`` and ``modelview``.  Top-level exports are retained for source
@@ -10,27 +10,32 @@ _LAZY_EXPORTS = {
     # Core
     "Qt": ".core", "QPoint": ".core", "QPointF": ".core", "QSize": ".core",
     "QRect": ".core", "QMargins": ".core", "QSizePolicy": ".core",
-    "QCoreApplication": ".core", "QObject": ".core", "QEvent": ".core",
-    "QCloseEvent": ".core", "QKeyEvent": ".core", "QMouseEvent": ".core",
+    "QCoreApplication": ".core", "QEventLoop": ".core", "QObject": ".core", "QEvent": ".core",
+    "QCloseEvent": ".core", "QKeyEvent": ".gui", "QMouseEvent": ".gui", "QWheelEvent": ".gui",
     "QChildEvent": ".core", "QPointer": ".core", "Signal": ".core",
     "QInputTarget": ".core", "QItemInputBinding": ".core", "QGlobalInputBinding": ".core", "SignalConnection": ".core",
-    "QSignalBlocker": ".core", "QMetaObject": ".core", "QTimer": ".core",
+    "QSignalBlocker": ".core", "QMetaObject": ".core", "QTimer": ".core", "QElapsedTimer": ".core", "QDeadlineTimer": ".core",
     "QThread": ".core", "QRunnable": ".core", "QFuture": ".core",
     "QFutureWatcher": ".core", "QThreadPool": ".core", "QtConcurrent": ".core",
-    "QProcess": ".core",
+    "QProcess": ".core", "QSocketNotifier": ".core", "QPerformancePolicy": ".core",
     "QModelIndex": ".core", "QPersistentModelIndex": ".core",
     "QAbstractItemModel": ".core", "QAbstractTableModel": ".core",
     "QAbstractListModel": ".core", "QItemSelectionRange": ".core",
     "QItemSelection": ".core", "QItemSelectionModel": ".core",
 
     # GUI / actions
-    "QAction": ".gui", "QActionGroup": ".gui",
+    "QGuiEventType": ".gui", "isGuiEventType": ".gui",
+    "QAction": ".gui", "QActionGroup": ".gui", "QUndoCommand": ".gui", "QUndoStack": ".gui", "QEditTransaction": ".gui", "QPropertyEditCommand": ".gui", "QPropertyEditController": ".gui", "QKeySequence": ".gui", "QShortcut": ".gui",
     "QPen": ".gui", "QBrush": ".gui", "QPainter": ".gui", "QPaintLayer": ".gui",
     "QFont": ".gui", "QFontDatabase": ".gui", "QTexture": ".gui", "QTextureRegistry": ".gui",
     "QCursor": ".gui", "QClipboard": ".gui", "QFontMetrics": ".gui", "QScreen": ".gui",
+    "metrics_for_dpi": ".gui", "metrics_for_screen": ".gui", "metrics_for_backend": ".gui",
+    "logical_dpi_for_backend": ".gui", "dpi_scale_for_backend": ".gui", "sync_backend_dpi": ".gui",
     "QPalette": ".gui", "QStyle": ".gui", "QProxyStyle": ".gui", "QStyleFactory": ".gui",
     "QtFusionPalette": ".gui", "QtFusionMetrics": ".gui",
     "QStandardItem": ".gui", "QStandardItemModel": ".gui",
+    "QWindowHost": ".gui", "QWindowHostState": ".gui", "QPopupSurface": ".gui",
+    "QLifecycleTransitionRecord": ".gui",
 
     # Widgets
     "QApplication": ".widgets", "QWidget": ".widgets", "QRetainedItem": ".widgets", "QCanvas": ".widgets", "QToolTip": ".widgets", "QFrame": ".widgets",
@@ -45,9 +50,9 @@ _LAZY_EXPORTS = {
     "QMenuBar": ".widgets", "QComboBox": ".widgets", "QtComboBox": ".widgets",
     "QAbstractScrollArea": ".widgets", "QScrollArea": ".widgets", "QScroller": ".widgets", "QToolBar": ".widgets",
     "QStatusBar": ".widgets", "QSeparator": ".widgets", "QSpacer": ".widgets", "ColorField": ".widgets", "QColorField": ".widgets",
-    "DialogBase": ".widgets", "DialogCode": ".widgets", "QtDialog": ".widgets", "QDialog": ".widgets",
+    "DialogBase": ".widgets", "DialogCode": ".widgets", "QtDialog": ".widgets", "QDialog": ".widgets", "QFontDialog": ".widgets", "QFontSelection": ".widgets",
     "DockWidget": ".widgets", "QDockWidget": ".widgets", "DockManager": ".widgets",
-    "DockDropPreview": ".widgets", "DockLayoutTree": ".widgets",
+    "DockDropPreview": ".widgets", "DockLayoutTree": ".widgets", "QDockWindowLifecycle": ".docking", "QDockWidgetStateController": ".docking", "QDockTabGroupController": ".docking", "QDockCommand": ".docking", "QDockCommandHistory": ".docking", "QMainWindowDockCommandBus": ".docking", "QDockDropTargetResolver": ".docking", "QDockPreviewController": ".docking", "QDockDropController": ".docking", "QDockTransition": ".docking", "QDockCommitTransaction": ".docking", "QDockFloatTransaction": ".docking",
     "ToolWindow": ".widgets", "QToolWindow": ".widgets",
 
     # Layouts
@@ -62,7 +67,7 @@ _LAZY_EXPORTS = {
     "QAbstractItemView": ".modelview", "QTableView": ".modelview", "QTableWidget": ".modelview", "QTableWidgetItem": ".modelview",
     "QListView": ".modelview", "QListWidget": ".modelview", "QListWidgetItem": ".modelview", "QHeaderView": ".modelview",
     "QTreeItem": ".modelview", "QTreeView": ".modelview", "QTreeWidget": ".modelview", "QTreeWidgetItem": ".modelview",
-    "QAbstractItemDelegate": ".modelview", "QStyledItemDelegate": ".modelview", "QStandardItem": ".modelview", "QStandardItemModel": ".modelview", "QtDataGridView": ".modelview",
+    "QAbstractItemDelegate": ".modelview", "QStyledItemDelegate": ".modelview", "QItemEditorLifecycle": ".modelview", "QStyleOptionViewItem": ".modelview", "QStandardItem": ".modelview", "QStandardItemModel": ".modelview", "QtDataGridView": ".modelview",
     "QtListView": ".modelview", "QtGridColumn": ".modelview", "QtGridRow": ".modelview",
     "QtListItem": ".modelview", "QtSelectionMode": ".modelview",
     "QtItemViewState": ".modelview",
@@ -70,8 +75,25 @@ _LAZY_EXPORTS = {
     # Themes / styling resources
     "QTheme": ".themes",
 
+    # Notifications (inert until explicitly configured by an application)
+    "NotificationKind": ".notifications", "DismissReason": ".notifications",
+    "QNotificationAction": ".notifications", "QNotificationRequest": ".notifications",
+    "QNotificationTheme": ".notifications", "QNotificationCenter": ".notifications",
+    "QNotificationManager": ".notifications", "QNotification": ".notifications",
+
     # Higher-level / utilities
     "StandaloneUiHost": ".runtime", "QGuiRuntime": ".runtime", "RibbonBar": ".ribbon",
+    "RibbonTab": ".ribbon", "RibbonContextGroup": ".ribbon", "RibbonGroup": ".ribbon", "RibbonButton": ".ribbon",
+    "RibbonMenuButton": ".ribbon", "RibbonSplitButton": ".ribbon",
+    "RibbonCommandTemplate": ".ribbon", "RibbonGroupTemplate": ".ribbon",
+    "RibbonTabTemplate": ".ribbon", "RibbonTemplate": ".ribbon",
+    "RibbonTemplateInstance": ".ribbon", "RibbonTemplateFactory": ".ribbon",
+    "RibbonAdaptivePolicy": ".ribbon", "RibbonDisplayTemplate": ".ribbon", "RibbonDisplayTemplateFactory": ".ribbon",
+    "RibbonVisualStyle": ".ribbon", "RibbonVisualStyleFactory": ".ribbon",
+    "RibbonAppearanceTemplate": ".ribbon", "RibbonAppearanceTemplateFactory": ".ribbon",
+    "RibbonGroupLayout": ".ribbon", "RibbonAdaptiveLayout": ".ribbon",
+    "QAbstractEventDispatcher": ".core", "QEventDispatcher": ".core",
+    "QDebouncer": ".core",
     "RibbonResources": ".contracts", "LatestCallQueue": ".dispatch",
     "DpgScrollerArrowOverlay": ".backends.dearpygui", "SharedScrollerMetrics": ".backends.dearpygui",
     "SharedScrollerPalette": ".backends.dearpygui",
@@ -90,7 +112,7 @@ for _name in (
     _LAZY_EXPORTS[_name] = ".qt"
 
 __all__ = list(_LAZY_EXPORTS)
-__version__ = "1.36.3"
+__version__ = "1.156.0"
 
 
 def __getattr__(name):

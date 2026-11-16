@@ -18,6 +18,7 @@ from DearUIQt.gui import (
 )
 from DearUIQt.widgets import QLineEdit, QFrame, QMenu
 from DearUIQt.modelview import QTableWidget, QTableWidgetItem
+from DearUIQt.modelview.spreadsheet import CellRange, SpreadsheetClipboard, SpreadsheetAdapter, SpreadsheetController
 from DearUIQt.themes import worksheet_theme_spec
 
 from ...services.reference_charts import ReferenceTableModel
@@ -89,9 +90,8 @@ class ReferenceDataTable:
     at the active cell instead of two persistent editors per row.
     """
 
-    ROW_NUMBER_WIDTH = 32
-    VALUE_COLUMN_WIDTH = 150
-    TABLE_WIDTH = ROW_NUMBER_WIDTH + (2 * VALUE_COLUMN_WIDTH) + 18
+    ROW_NUMBER_WIDTH = 48  # Leave room for five-digit row numbers in imported curves.
+    VALUE_COLUMN_WIDTH = 105  # preferred/minimum visual width; columns stretch at runtime
     PASTE_TRAILING_ROWS = 5
 
     # A single population turn may use only a small piece of the GUI frame.
@@ -129,12 +129,19 @@ class ReferenceDataTable:
         self._active_position = None
         self.cells = _ReferenceCellEditorAccess(self)
 
-        # Excel-like row selection is independent from the transient X/Y cell
-        # editor. Clicking the row-number gutter selects whole rows; Ctrl-click
-        # toggles rows and Shift-click extends from an anchor. Ctrl+C copies
-        # exactly those selected X/Y rows as tab-delimited text.
+        # Rectangular cell selection and whole-row gutter selection coexist
+        # with a single transient editor (double-click/F2). Clipboard ranges
+        # use TSV so Excel and other spreadsheet applications interoperate.
         self._selected_rows = set()
         self._selection_anchor = None
+        self._cell_anchor = None
+        self._cell_extent = None
+        self._painted_cells = set()
+        self._drag_origin = None
+        self._dragging_cells = False
+        self._left_press_active = False
+        self._last_cell_click = None
+        self._keyboard_owned = False
 
         self._frame = QFrame(
             parent=parent, width=-1, height=int(height), frame_shape=QFrame.NoFrame,
@@ -143,6 +150,10 @@ class ReferenceDataTable:
         self._theme = worksheet_theme_spec().createObject(parent=self._frame)
         self._frame.setTheme(self._theme)
         self._clipboard = QClipboard(backend=self._frame.backend)
+        self._spreadsheet_adapter = SpreadsheetAdapter(
+            lambda: (self.model.row_count, 2), self._spreadsheet_cell_text,
+            write=self._spreadsheet_write_cells)
+        self._spreadsheet = SpreadsheetController(self._spreadsheet_adapter, self._clipboard)
 
         # The worksheet now behaves like a plain spreadsheet pane: mouse-wheel,
         # scrollbar and keyboard navigation remain available, but the redundant
@@ -165,6 +176,9 @@ class ReferenceDataTable:
         self._key_binding.onKeyPress(Qt.Key_PageDown, self._key_pressed, user_data=Qt.Key_PageDown)
         self._key_binding.onKeyPress(Qt.Key_Home, self._key_pressed, user_data=Qt.Key_Home)
         self._key_binding.onKeyPress(Qt.Key_End, self._key_pressed, user_data=Qt.Key_End)
+        for key in (Qt.Key_A, Qt.Key_X, Qt.Key_Delete, Qt.Key_Backspace,
+                    Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down, Qt.Key_Tab, Qt.Key_F2):
+            self._key_binding.onKeyPress(key, self._key_pressed, user_data=key)
         # One global click binding is cheaper than one native handler registry
         # per cell and still lets the table use a single delegate-style editor.
         # Mouse work is intentionally deferred to button release. DearPyGui
@@ -173,20 +187,25 @@ class ReferenceDataTable:
         # press can cancel a combo/list popup elsewhere in the dialog. Qt-like
         # release routing lets the native control finish its own gesture first.
         self._key_binding.onMouseRelease(Qt.LeftButton, self._mouse_left_released)
+        self._key_binding.onMouseClick(Qt.LeftButton, self._mouse_left_pressed)
+        self._key_binding.onMouseDrag(Qt.LeftButton, self._mouse_left_dragged, threshold=4)
         self._key_binding.onMouseRelease(Qt.RightButton, self._mouse_right_released)
         self._key_binding.activate()
 
+        # Keep the spreadsheet context menu deliberately compact.  Selection
+        # semantics already decide whether Copy/Cut/Clear targets the current
+        # cell, a rectangular selection, or selected rows, so separate menu
+        # entries for each variant only duplicate the same commands and make
+        # the popup unnecessarily tall.  Less-common commands remain available
+        # through their normal keyboard shortcuts/API without occupying menu
+        # space.
         self._context_menu = QMenu([
-            {"id": "paste", "label": "Paste", "action": "paste"},
-            {"id": "copy_cell", "label": "Copy cell", "action": "copy_cell"},
-            {"id": "copy_table", "label": "Copy selected row(s)", "action": "copy_table"},
+            {"id": "cut", "label": "Cut", "action": "cut", "shortcut": "Ctrl+X"},
+            {"id": "copy", "label": "Copy", "action": "copy", "shortcut": "Ctrl+C"},
+            {"id": "paste", "label": "Paste", "action": "paste", "shortcut": "Ctrl+V"},
             {"label": "---"},
-            {"id": "clear_cell", "label": "Clear cell", "action": "clear_cell"},
-            {"id": "clear_row", "label": "Clear row", "action": "clear_row"},
-            {"id": "clear_all", "label": "Clear all data", "action": "clear_all"},
-            {"label": "---"},
-            {"id": "add_rows", "label": "Add 10 rows", "action": "add_rows"},
-        ], after=self.after, min_width=170, parent_window=menu_parent)
+            {"id": "clear", "label": "Clear", "action": "clear", "shortcut": "Del"},
+        ], after=self.after, min_width=138, parent_window=menu_parent)
         self._context_menu.triggered.connect(self._context_action)
 
         self._create_table()
@@ -200,17 +219,31 @@ class ReferenceDataTable:
     def _create_table(self):
         self._table_widget = QTableWidget(
             0, 3, parent=self._frame,
-            width=self.TABLE_WIDTH, height=-1,
-            sizing_policy=QTableWidget.FixedFit, scroll_x=False, scroll_y=True,
+            width=-1, height=-1,
+            sizing_policy=QTableWidget.StretchProportional, scroll_x=False, scroll_y=True,
             freeze_rows=1, freeze_columns=1, resizable=True, row_background=True,
             grid_lines=True, saved_settings=False)
-        self._table_widget.setHorizontalHeaderLabels(("#", "X", "Y"))
+        self._table_widget.setHorizontalHeaderLabels(("No.", "X", "Y"))
         self._table_widget.setColumnWidth(0, self.ROW_NUMBER_WIDTH)
         self._table_widget.setColumnResizable(0, False)
-        self._table_widget.setColumnWidth(1, self.VALUE_COLUMN_WIDTH)
-        self._table_widget.setColumnWidth(2, self.VALUE_COLUMN_WIDTH)
+        # Match QHeaderView::Stretch semantics: row numbers stay compact while
+        # X/Y consume the entire remaining viewport equally. This keeps the
+        # worksheet flush with the editor pane at every dialog size.
+        self._table_widget.setColumnStretch(1, 1.0)
+        self._table_widget.setColumnStretch(2, 1.0)
         self._table_widget.setTheme(self._theme)
         self.table = self._table_widget.tag
+
+        # QTableWidget owns the real native Y scroll range, while the outer
+        # worksheet frame provides stable viewport geometry.  Register that
+        # pair with DearUIQt's shared scroller overlay so this sheet gets the
+        # exact same thumb/arrows/hover animation as File List and the other
+        # application scroll surfaces.  Styling mvTable alone only changes the
+        # stock Dear ImGui gutter and cannot produce the app scrollbar chrome.
+        from DearUIQt.backends.shared_scrollers import register_scroll_surface
+        register_scroll_surface(
+            self._table_widget.backend, self._table_widget.tag,
+            viewport=self._frame.tag)
 
     def _schedule_population_from(self, start=0):
         """Schedule a complete native-table sync without blocking this turn."""
@@ -297,6 +330,11 @@ class ReferenceDataTable:
                     item.setText(text)
         if row in getattr(self, "_selected_rows", set()):
             self._set_row_highlight(row, True)
+        bounds = self.selected_range
+        if bounds is not None and bounds[0] <= row <= bounds[2]:
+            for column in range(bounds[1], bounds[3] + 1):
+                self._highlight_cell(row, column, True)
+                self._painted_cells.add((row, column))
 
     def _populate_batch(self, generation):
         if self._closed or generation != self._population_generation:
@@ -377,6 +415,9 @@ class ReferenceDataTable:
     def _activate_editor(self, row, column, *, focus=True):
         if self._closed:
             return None
+        if focus and not self._frame.isVisible():
+            self._pending_focus = (int(row), int(column))
+            return None
         row, column = int(row), int(column)
         if column not in (0, 1) or not 0 <= row < self.model.row_count:
             return None
@@ -401,6 +442,7 @@ class ReferenceDataTable:
         self._active_editor = editor
         self._active_position = (row, column)
         if focus:
+            self._keyboard_owned = True
             editor.setFocus()
         return editor
 
@@ -492,6 +534,9 @@ class ReferenceDataTable:
         if not 0 <= row < self.model.row_count:
             return False
         self._commit_active_editor()
+        self.clear_cell_selection()
+        self._table_widget.setFocus()
+        self._keyboard_owned = True
         current = set(self._selected_rows)
         anchor = self._selection_anchor
         if shift and anchor is not None:
@@ -521,7 +566,11 @@ class ReferenceDataTable:
             table_left = float(
                 self._table_widget.backend.get_item_rect_min(self._table_widget.tag)[0])
         except Exception:
-            return None
+            native_number = self._table_widget.nativeItem(row, 0)
+            try:
+                table_left = float(self._table_widget.backend.get_item_rect_min(native_number)[0]) - 4
+            except Exception:
+                return None
         native_x = self._table_widget.nativeItem(row, 1)
         if native_x is not None:
             try:
@@ -536,16 +585,134 @@ class ReferenceDataTable:
     def copy_selected_rows(self):
         if self._closed:
             return False
+        if self.selected_range is not None:
+            return self.copy_selection()
         self._read_inputs()
         rows = [row for row in sorted(self._selected_rows)
                 if 0 <= row < self.model.row_count]
         if not rows:
             self.on_error("Select one or more rows using the # column, then copy.")
             return False
-        text = "\n".join(
-            "\t".join(map(str, self.model.row_text(row))) for row in rows)
-        self._clipboard.setText(text)
+        text = SpreadsheetClipboard.dumps(self.model.row_text(row) for row in rows)
+        if not self._clipboard.setText(text):
+            self.on_error("Clipboard is busy. Try copying again.")
+            return False
         return True
+
+    @property
+    def selected_range(self):
+        if self._cell_anchor is None or self._cell_extent is None:
+            return None
+        return CellRange.between(self._cell_anchor, self._cell_extent).bounds
+
+    def _highlight_cell(self, row, column, selected):
+        try:
+            backend = self._table_widget.backend
+            if selected:
+                backend.highlight_table_cell(self.table, row, column + 1, QtFusionPalette.SELECTION_ACTIVE)
+            else:
+                backend.unhighlight_table_cell(self.table, row, column + 1)
+        except (AttributeError, RuntimeError, SystemError):
+            pass
+
+    def _paint_cell_selection(self):
+        bounds = self.selected_range
+        cells = set()
+        if bounds is not None:
+            top, left, bottom, right = bounds
+            cells = {(row, column)
+                     for row in range(top, min(bottom + 1, self._table_widget.rowCount()))
+                     for column in range(left, right + 1)}
+        for row, column in self._painted_cells - cells:
+            self._highlight_cell(row, column, False)
+        for row, column in cells - self._painted_cells:
+            self._highlight_cell(row, column, True)
+        self._painted_cells = cells
+
+    def clear_cell_selection(self):
+        self._cell_anchor = self._cell_extent = None
+        self._paint_cell_selection()
+
+    def select_range(self, anchor, extent=None, *, focus=True):
+        if self._closed:
+            return False
+        anchor = tuple(map(int, anchor))
+        extent = tuple(map(int, extent or anchor))
+        if any(not (0 <= row < self.model.row_count and 0 <= column < 2)
+               for row, column in (anchor, extent)):
+            return False
+        self._commit_active_editor()
+        self.clear_row_selection()
+        self._cell_anchor, self._cell_extent = anchor, extent
+        self.current_cell = extent
+        self._paint_cell_selection()
+        if focus:
+            self._table_widget.setFocus()
+            self._keyboard_owned = True
+        return True
+
+    def copy_selection(self):
+        if self._closed:
+            return False
+        bounds = self.selected_range
+        if bounds is None:
+            if self._selected_rows:
+                return self.copy_selected_rows()
+            bounds = (*self.current_cell, *self.current_cell)
+        self._read_inputs()
+        top, left, bottom, right = bounds
+        commands = self._sheet_commands()
+        commands.select((top, left), (bottom, right))
+        copied = commands.copy()
+        if not copied:
+            self.on_error("Clipboard is busy. Try copying again.")
+        return bool(copied)
+
+    def clear_selection(self):
+        if self._closed:
+            return
+        self._read_inputs()
+        bounds = self.selected_range
+        if bounds is not None:
+            top, left, bottom, right = bounds
+            rows = range(top, bottom + 1)
+        elif self._selected_rows:
+            rows = sorted(self._selected_rows)
+            top, bottom, left, right = min(rows), max(rows), 0, 1
+        else:
+            top, left = self.current_cell
+            bottom, right, rows = top, left, (top,)
+        self._sheet_commands().adapter.write_cells(
+            {(row, column): "" for row in rows for column in range(left, right + 1)})
+        self._sync_loaded_range(top, bottom)
+        self.qt_model.notify_cells_changed(top, bottom, left, right)
+        self._changed()
+
+    def cut_selection(self):
+        if self.copy_selection():
+            self.clear_selection()
+
+    def _spreadsheet_cell_text(self, row, column):
+        return self.model.cell_text(row, column)
+
+    def _sheet_commands(self):
+        commands = getattr(self, '_spreadsheet', None)
+        if commands is None or commands.clipboard is not self._clipboard:
+            self._spreadsheet_adapter = SpreadsheetAdapter(
+                lambda: (self.model.row_count, 2), self._spreadsheet_cell_text,
+                write=self._spreadsheet_write_cells)
+            commands = self._spreadsheet = SpreadsheetController(self._spreadsheet_adapter, self._clipboard)
+        return commands
+
+    def _spreadsheet_write_cells(self, changes):
+        for (row, column), text in changes.items():
+            self.model.set_cell_text(row, column, text)
+
+    def select_all(self):
+        last = self.model.row_count - 1
+        while last > 0 and not any(str(value).strip() for value in self.model.row_text(last)):
+            last -= 1
+        self.select_range((0, 0), (last, 1))
 
     # ------------------------------------------------------------------
     # Pointer hit testing / native scrolling
@@ -582,12 +749,27 @@ class ReferenceDataTable:
             return None
 
     def _table_under_mouse(self, point=None):
+        if self._closed or not self._frame.isVisible():
+            return False
         table = getattr(self, "_table_widget", None)
         if table is None:
             return False
         point = self._pointer_position() if point is None else point
         if self._point_in_native_rect(table.backend, table.tag, point):
             return True
+        if point is not None:
+            row = self._row_at_pointer(point[1])
+            if row is not None:
+                try:
+                    left = float(table.backend.get_item_rect_min(table.nativeItem(row, 0))[0]) - 4
+                    y_native = table.nativeItem(row, 2)
+                    y_left = float(table.backend.get_item_rect_min(y_native)[0])
+                    y_width = float(table.backend.get_item_rect_size(y_native)[0])
+                    right = y_left + max(1.0, y_width)
+                    if left <= point[0] < right:
+                        return True
+                except Exception:
+                    pass
         editor = self._active_editor
         return bool(editor is not None and self._point_in_native_rect(
             editor.backend, editor.tag, point))
@@ -641,12 +823,38 @@ class ReferenceDataTable:
                 table_left = 0.0
             x_start = table_left + self.ROW_NUMBER_WIDTH
         if y_start is None:
-            y_start = x_start + self.VALUE_COLUMN_WIDTH
+            try:
+                table_left = float(backend.get_item_rect_min(self._table_widget.tag)[0])
+                table_width = float(backend.get_item_rect_size(self._table_widget.tag)[0])
+                editable_width = max(2.0, table_width - self.ROW_NUMBER_WIDTH)
+                y_start = table_left + self.ROW_NUMBER_WIDTH + (editable_width * 0.5)
+            except Exception:
+                y_start = x_start + self.VALUE_COLUMN_WIDTH
         if x < x_start:
             return None
         return (row, 0 if x < y_start else 1)
 
     def _mouse_left_released(self, *_args):
+        if not self._left_press_active:
+            return
+        self._left_press_active = False
+        end = self._cell_at_pointer()
+        delta = QCursor.dragDelta(Qt.LeftButton, backend=self._frame.backend)
+        if (self._drag_origin is not None and end is not None
+                and end != self._drag_origin
+                and (self._dragging_cells or abs(delta.x()) >= 4 or abs(delta.y()) >= 4)):
+            self.after(1, self.select_range, self._drag_origin, end)
+            self._drag_origin = None
+            self._dragging_cells = False
+            self._last_cell_click = None
+            return
+        if self._dragging_cells:
+            self._mouse_left_dragged()
+            self._drag_origin = None
+            self._dragging_cells = False
+            self._last_cell_click = None
+            return
+        self._drag_origin = None
         row = self._row_header_at_pointer()
         if row is not None:
             ctrl = QKeyboard.isControlDown(backend=self._frame.backend)
@@ -660,18 +868,47 @@ class ReferenceDataTable:
             # Excel-like split of responsibilities: row numbers select whole
             # rows, while X/Y cells remain directly editable. Keep all focus
             # changes out of the global release callback itself.
-            self.after(1, self._activate_clicked_cell, *position)
+            shift = QKeyboard.isShiftDown(backend=self._frame.backend)
+            self.after(1, self._activate_clicked_cell, *position, shift)
+
+    def _mouse_left_pressed(self, *_args):
+        self._dragging_cells = False
+        self._drag_origin = self._cell_at_pointer()
+        row = self._row_header_at_pointer()
+        self._left_press_active = self._drag_origin is not None or row is not None
+        if (self._drag_origin is None and row is None
+                and not popup_input_active()):
+            self._keyboard_owned = False
+
+    def _mouse_left_dragged(self, *_args):
+        if self._drag_origin is None or self._closed or popup_input_active():
+            return
+        position = self._cell_at_pointer()
+        if position is None or (position == self._drag_origin and not self._dragging_cells):
+            return
+        # Do not mutate the table tree in a native mouse callback. Capture the
+        # endpoints now; delegate teardown/focus/highlighting runs on the UI queue.
+        self._dragging_cells = True
+        self.after(1, self.select_range, self._drag_origin, position)
 
     def _select_row_deferred(self, row, ctrl=False, shift=False):
         if self._closed:
             return
         self.select_row(row, ctrl=bool(ctrl), shift=bool(shift))
 
-    def _activate_clicked_cell(self, row, column):
+    def _activate_clicked_cell(self, row, column, shift=False):
         if self._closed:
             return
-        self.clear_row_selection()
-        self._activate_editor(row, column)
+        position = (row, column)
+        previous = self._last_cell_click
+        now = perf_counter()
+        self._last_cell_click = (position, now)
+        if not shift and previous and previous[0] == position and now - previous[1] < .35:
+            self._activate_editor(row, column)
+            self._last_cell_click = None
+        else:
+            anchor = self._cell_anchor if shift and self._cell_anchor is not None else position
+            self.select_range(anchor, position)
 
     def _mouse_right_released(self, *_args):
         row = self._row_header_at_pointer()
@@ -682,6 +919,10 @@ class ReferenceDataTable:
         if position is None:
             return
         self.current_cell = position
+        bounds = self.selected_range
+        if bounds is None or not (bounds[0] <= position[0] <= bounds[2]
+                                  and bounds[1] <= position[1] <= bounds[3]):
+            self.after(1, self.select_range, position)
         self.after(1, self._open_context_menu, position)
 
     def _open_row_context_menu(self, row):
@@ -760,6 +1001,14 @@ class ReferenceDataTable:
         action = str(action or "")
         if action == "paste":
             self.after(1, self.paste_clipboard)
+        elif action == "copy":
+            self.copy_selection()
+        elif action == "cut":
+            self.after(1, self.cut_selection)
+        elif action == "select_all":
+            self.after(1, self.select_all)
+        elif action in ("clear", "clear_selection"):
+            self.after(1, self.clear_selection)
         elif action == "copy_cell":
             self.copy_cell()
         elif action == "copy_table":
@@ -782,10 +1031,43 @@ class ReferenceDataTable:
             return None
 
     def owns_keyboard(self):
-        return self.focused_position() is not None
+        return (not self._closed and self._frame.isVisible()
+                and (self._keyboard_owned or self.focused_position() is not None
+                     or self._table_widget.hasFocus()))
 
     def _key_pressed(self, _sender, _native_key, qt_key=None):
         ctrl = QKeyboard.isControlDown(backend=self._frame.backend)
+        if not self.owns_keyboard() or popup_input_active():
+            return
+        editing = self.focused_position()
+        if editing is None:
+            if ctrl and qt_key in (Qt.Key_C, Qt.Key_X, Qt.Key_V, Qt.Key_A):
+                command = {Qt.Key_C: self.copy_selection, Qt.Key_X: self.cut_selection,
+                           Qt.Key_V: self.paste_clipboard, Qt.Key_A: self.select_all}[qt_key]
+                self.after(1, command)
+                return
+            if qt_key in (Qt.Key_Delete, Qt.Key_Backspace):
+                self.after(1, self.clear_selection)
+                return
+            if qt_key == Qt.Key_F2:
+                self.after(1, self._activate_editor, *self.current_cell)
+                return
+            shifts = {Qt.Key_Left: (0, -1), Qt.Key_Right: (0, 1),
+                      Qt.Key_Up: (-1, 0), Qt.Key_Down: (1, 0),
+                      Qt.Key_Tab: (0, 1), Qt.Key_Return: (1, 0), Qt.Key_Enter: (1, 0)}
+            if qt_key in shifts:
+                dr, dc = shifts[qt_key]
+                shift = QKeyboard.isShiftDown(backend=self._frame.backend)
+                if shift and qt_key in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter):
+                    dr, dc = -dr, -dc
+                row, column = self.current_cell
+                target = (max(0, min(self.model.row_count - 1, row + dr)), max(0, min(1, column + dc)))
+                if qt_key == Qt.Key_Tab:
+                    target = divmod(max(0, min(self.model.row_count * 2 - 1, row * 2 + column + dc)), 2)
+                anchor = self._cell_anchor if shift and qt_key not in (Qt.Key_Tab, Qt.Key_Return, Qt.Key_Enter) else target
+                self.after(1, self.select_range, anchor or target, target)
+                self.after(1, self._scroll_to_row, target[0])
+                return
         # Whole-row selection intentionally commits/closes the transient cell
         # editor, so Ctrl+C must work even when no X/Y editor currently owns
         # keyboard focus.  The binding is scoped to this worksheet instance.
@@ -796,15 +1078,16 @@ class ReferenceDataTable:
         if position is None:
             return
         row, column = position
-        if qt_key == Qt.Key_C and ctrl:
-            self.copy_selected_rows()
-        elif qt_key == Qt.Key_V and ctrl:
+        if qt_key == Qt.Key_V and ctrl:
             text = self._clipboard.text()
             if any(separator in text for separator in ("\t", "\n", "\r", ",", ";")):
                 self.after(1, self.paste_text, text, position)
         elif qt_key in (Qt.Key_Return, Qt.Key_Enter):
             target = max(0, row + (-1 if QKeyboard.isShiftDown(backend=self._frame.backend) else 1))
             self.after(1, self.move_cell, target, column)
+        elif qt_key == Qt.Key_Tab:
+            index = max(0, row * 2 + column + (-1 if QKeyboard.isShiftDown(backend=self._frame.backend) else 1))
+            self.after(1, self.move_cell, *divmod(index, 2))
         elif qt_key == Qt.Key_PageUp:
             self.after(1, self._scroll_page, -1)
         elif qt_key == Qt.Key_PageDown:
@@ -818,6 +1101,9 @@ class ReferenceDataTable:
         if self._closed:
             return False
         row, column = int(row), int(column)
+        if not self._frame.isVisible():
+            self._pending_focus = (row, column)
+            return False
         if row >= self.model.row_count:
             return False
         if row >= self._table_widget.rowCount():
@@ -860,6 +1146,8 @@ class ReferenceDataTable:
         if self._closed:
             return
         self._read_inputs()
+        if position is None and self.selected_range is not None:
+            position = self.selected_range[:2]
         row, column = position if position is not None else self.current_cell
         try:
             pasted_rows = self.model.paste(text, row, column)
@@ -876,7 +1164,8 @@ class ReferenceDataTable:
         self.qt_model.notify_cells_changed(row, last_row)
         self._extend_population_target()
         self._changed()
-        self.after(1, self.focus_cell, row, column)
+        width = max((len(values) for values in self.model._read_clipboard_rows(text)), default=1)
+        self.select_range((row, column), (last_row, min(1, column + width - 1)))
 
     def paste_clipboard(self):
         self.paste_text(self._clipboard.text())
@@ -937,6 +1226,7 @@ class ReferenceDataTable:
     def reset(self):
         self._read_inputs()
         self.clear_row_selection()
+        self.clear_cell_selection()
         self.model = ReferenceTableModel()
         self.qt_model.reset_worksheet(self.model)
         self.current_cell = (0, 0)
@@ -946,6 +1236,7 @@ class ReferenceDataTable:
     def load_series(self, series):
         self._read_inputs()
         self.clear_row_selection()
+        self.clear_cell_selection()
         self.model.load_series(series)
         self.qt_model.reset_worksheet()
         self.current_cell = (0, 0)
@@ -972,6 +1263,11 @@ class ReferenceDataTable:
     def to_series(self, name):
         self._read_inputs()
         return self.model.to_series(name)
+
+    def to_points(self):
+        """Commit the active cell and return validated numeric XY points."""
+        self._read_inputs()
+        return self.model.to_points()
 
     def setVisible(self, visible):
         self._frame.setVisible(bool(visible))

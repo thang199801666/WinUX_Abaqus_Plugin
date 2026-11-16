@@ -4,7 +4,7 @@ Implementation lives in this package. ``DearUIQt.qt`` is a legacy facade only.
 """
 from .._lazy import resolve, namespace_dir
 _EXPORTS = {
-    "QApplication": "..core.application", "QWidget": ".widget", "QRetainedItem": ".retained", "QCanvas": ".canvas", "QViewportCanvas": ".canvas", "QToolTip": ".tooltip",
+    "QApplication": "..core.application", "QWidget": ".widget", "QRetainedItem": ".retained", "QCanvas": ".canvas", "QViewportCanvas": ".canvas", "QPaintGroup": ".canvas", "QToolTip": ".tooltip",
     "QPlotWidget": ".plot", "QPlotAxis": ".plot", "QLineSeries": ".plot",
     "QFrame": ".containers", "QMainWindow": ".windows", "QNativeWindow": ".native_window", "QInlineEditPanel": ".inline_edit",
     "QLabel": ".buttons", "QPushButton": ".buttons", "QToolButton": ".buttons", "QImageView": ".image",
@@ -23,7 +23,7 @@ _EXPORTS = {
     "QToolBar": ".tool_bar", "QStatusBar": ".tool_bar",
     "QSplitterHandle": "..layouts.splitter",
     "QSeparator": ".primitives", "QSpacer": ".primitives",
-    "QDialog": "..dialogs", "QtDialog": "..dialogs", "QtTable": "..dialogs", "DialogBase": "..dialogs", "DialogCode": "..dialogs",
+    "QDialog": "..dialogs", "QtDialog": "..dialogs", "QtTable": "..dialogs", "DialogBase": "..dialogs", "DialogCode": "..dialogs", "QFontDialog": "..dialogs", "QFontSelection": "..dialogs",
     "QDockWidget": "..docking", "DockWidget": "..docking", "DockManager": "..docking",
     "DockDropPreview": "..docking", "DockLayoutTree": "..docking",
     "QToolWindow": "..tool_window", "ToolWindow": "..tool_window",

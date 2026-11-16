@@ -10,11 +10,11 @@ from __future__ import annotations
 
 from ..backends import dpg
 
-from ..gui.palette import QtFusionPalette
+from ..gui.palette import QtFusionPalette, color_scheme
 from ..backends.dearpygui import dpg_window_rect, add_dpg_scroller_style
 from ..core.object import Qt, Signal
 from .widget import QWidget
-from ..gui.style import METRICS
+from ..gui.style import METRICS, metrics_for_backend
 
 
 _SHELL_THEME = "dearuiqt.qt_combo.shell.normal"
@@ -28,8 +28,10 @@ _DISABLED_COMBO_THEME = "dearuiqt.qt_combo.native.disabled"
 
 
 def _shell_theme(*, focused=False, disabled=False):
-    tag = (_DISABLED_SHELL_THEME if disabled else
-           (_FOCUSED_SHELL_THEME if focused else _SHELL_THEME))
+    metrics = metrics_for_backend(dpg)
+    base = (_DISABLED_SHELL_THEME if disabled else
+            (_FOCUSED_SHELL_THEME if focused else _SHELL_THEME))
+    tag = '{}.{}.dpi{}'.format(base, color_scheme().lower(), metrics.control_height)
     if dpg.does_item_exist(tag):
         return tag
     p = QtFusionPalette
@@ -41,7 +43,7 @@ def _shell_theme(*, focused=False, disabled=False):
             dpg.add_theme_color(dpg.mvThemeCol_Border, border)
             dpg.add_theme_style(dpg.mvStyleVar_WindowPadding, 0, 0)
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 0)
-            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 2)
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, metrics.frame_rounding)
             dpg.add_theme_style(dpg.mvStyleVar_ChildBorderSize, 1)
     return tag
 
@@ -61,11 +63,15 @@ def _editor_clip_theme():
 
 
 def _input_theme(*, disabled=False):
-    tag = _DISABLED_INPUT_THEME if disabled else _INPUT_THEME
+    metrics = metrics_for_backend(dpg)
+    base = _DISABLED_INPUT_THEME if disabled else _INPUT_THEME
+    tag = '{}.{}.dpi{}'.format(base, color_scheme().lower(), metrics.control_height)
     if dpg.does_item_exist(tag):
         return tag
     p = QtFusionPalette
-    bg = p.BUTTON_DISABLED if disabled else p.BASE
+    # The shell/native combo paints the surface; a square editor fill would
+    # cover its rounded left corners. Input geometry and hit testing stay native.
+    bg = (0, 0, 0, 0)
     text = p.TEXT_DISABLED if disabled else p.TEXT
     with dpg.theme(tag=tag):
         with dpg.theme_component(dpg.mvInputText, enabled_state=not disabled):
@@ -77,20 +83,22 @@ def _input_theme(*, disabled=False):
             cursor_role = getattr(dpg, "mvThemeCol_InputTextCursor", None)
             if cursor_role is not None:
                 dpg.add_theme_color(cursor_role, p.TEXT_DISABLED if disabled else p.TEXT)
-            dpg.add_theme_color(dpg.mvThemeCol_TextSelectedBg, (0, 120, 215, 115))
+            dpg.add_theme_color(dpg.mvThemeCol_TextSelectedBg, p.HIGHLIGHT[:3] + (115,))
             dpg.add_theme_style(
                 dpg.mvStyleVar_FramePadding,
-                METRICS.frame_pad_x - METRICS.border_size,
-                METRICS.combo_editor_frame_pad_y,
+                metrics.frame_pad_x - metrics.border_size,
+                metrics.combo_editor_frame_pad_y,
             )
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, max(0, metrics.frame_rounding - metrics.border_size))
             dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
     return tag
 
 
 def _combo_theme(*, disabled=False):
     """Style the full-width native combo that owns the popup and arrow."""
-    tag = _DISABLED_COMBO_THEME if disabled else _COMBO_THEME
+    metrics = metrics_for_backend(dpg)
+    base = _DISABLED_COMBO_THEME if disabled else _COMBO_THEME
+    tag = '{}.{}.dpi{}'.format(base, color_scheme().lower(), metrics.control_height)
     if dpg.does_item_exist(tag):
         return tag
     p = QtFusionPalette
@@ -119,9 +127,9 @@ def _combo_theme(*, disabled=False):
             dpg.add_theme_color(dpg.mvThemeCol_Header, p.SELECTION_ACTIVE)
             dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, p.SELECTION_ACTIVE_HOVER)
             dpg.add_theme_color(dpg.mvThemeCol_HeaderActive, p.SELECTION_ACTIVE_PRESSED)
-            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 2,
-                                METRICS.editor_frame_pad_y - METRICS.border_size)
-            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 0)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, max(1, metrics.border_size + 1),
+                                metrics.editor_frame_pad_y - metrics.border_size)
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, max(0, metrics.frame_rounding - metrics.border_size))
             dpg.add_theme_style(dpg.mvStyleVar_FrameBorderSize, 0)
             dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 0, 2)
             dpg.add_theme_style(dpg.mvStyleVar_SelectableTextAlign, 0.0, 0.5)
@@ -148,6 +156,10 @@ class ImGuiComboBox:
 
     def __init__(self, items=(), default_value=None, width=-1,
                  callback=None, parent=None, editable=True, tag=None):
+        self._metrics = metrics_for_backend(dpg)
+        self.ARROW_WIDTH = self._metrics.arrow_width
+        self.CONTROL_HEIGHT = self._metrics.control_height
+        self.POPUP_ROW_HEIGHT = self._metrics.popup_row_height
         self.items = [str(item) for item in items]
         self.callback = callback
         self.editable = bool(editable)
@@ -182,7 +194,7 @@ class ImGuiComboBox:
 
         self._editor_right_reserve = max(
             self.ARROW_WIDTH,
-            self.CONTROL_HEIGHT - 2 * METRICS.border_size,
+            self.CONTROL_HEIGHT - 2 * self._metrics.border_size,
         ) + 1
 
         # Full-width native BeginCombo.  Do NOT use no_preview=True: Dear ImGui
@@ -210,7 +222,7 @@ class ImGuiComboBox:
             parent=self.shell,
             pos=(1, 1),
             width=-self._editor_right_reserve,
-            height=self.CONTROL_HEIGHT - 2 * METRICS.border_size,
+            height=self.CONTROL_HEIGHT - 2 * self._metrics.border_size,
             border=False,
             no_scrollbar=True,
             no_scroll_with_mouse=True,
@@ -222,7 +234,7 @@ class ImGuiComboBox:
             parent=self._editor_clip,
             default_value=self._value,
             width=-1,
-            height=self.CONTROL_HEIGHT - 2 * METRICS.border_size,
+            height=self.CONTROL_HEIGHT - 2 * self._metrics.border_size,
             readonly=not self.editable,
             callback=self._input_changed,
             on_enter=False,
@@ -242,6 +254,36 @@ class ImGuiComboBox:
         self._install_geometry_handlers()
         self._install_handlers()
         self._refresh_shell_theme()
+        try:
+            from ..backends import get_backend
+            from ..gui.dpi import register_dpi_participant
+            register_dpi_participant(self, get_backend())
+        except Exception:
+            pass
+
+    def _dpi_changed(self, old_dpi, new_dpi):
+        del old_dpi, new_dpi
+        self._metrics = metrics_for_backend(dpg)
+        self.ARROW_WIDTH = self._metrics.arrow_width
+        self.CONTROL_HEIGHT = self._metrics.control_height
+        self.POPUP_ROW_HEIGHT = self._metrics.popup_row_height
+        self._editor_right_reserve = max(
+            self.ARROW_WIDTH, self.CONTROL_HEIGHT - 2 * self._metrics.border_size) + 1
+        for item, theme in ((self.shell, _shell_theme()), (self.button, _combo_theme()),
+                            (self._editor_clip, _editor_clip_theme()), (self.input, _input_theme())):
+            try:
+                if item and dpg.does_item_exist(item):
+                    dpg.bind_item_theme(item, theme)
+            except Exception:
+                pass
+        try:
+            if self.shell and dpg.does_item_exist(self.shell):
+                dpg.configure_item(self.shell, height=self.CONTROL_HEIGHT)
+        except Exception:
+            pass
+        self._sync_geometry()
+        self._refresh_shell_theme()
+        return True
 
     # ------------------------------------------------------------------ API
     def current_text(self):
@@ -353,6 +395,16 @@ class ImGuiComboBox:
         # only to suppress dialog default actions while the native combo is in
         # its activation/selection flow.
         return bool(self._native_popup_hint)
+
+    def refreshTheme(self):
+        """Rebind the legacy editable combo to the current color scheme."""
+        if self.shell and dpg.does_item_exist(self.shell):
+            self._refresh_shell_theme()
+        if self.input and dpg.does_item_exist(self.input):
+            dpg.bind_item_theme(self.input, _input_theme(disabled=not self.enabled))
+        if self.button and dpg.does_item_exist(self.button):
+            dpg.bind_item_theme(self.button, _combo_theme(disabled=not self.enabled))
+        return True
 
     def open_popup(self):
         if self.enabled and self.button and dpg.does_item_exist(self.button):
@@ -472,7 +524,7 @@ class ImGuiComboBox:
                     self._editor_clip,
                     pos=(1, 1),
                     width=-self._editor_right_reserve,
-                    height=self.CONTROL_HEIGHT - 2 * METRICS.border_size,
+                    height=self.CONTROL_HEIGHT - 2 * self._metrics.border_size,
                 )
             except Exception:
                 pass
@@ -481,7 +533,7 @@ class ImGuiComboBox:
                 dpg.configure_item(
                     self.input,
                     width=-1,
-                    height=self.CONTROL_HEIGHT - 2 * METRICS.border_size,
+                    height=self.CONTROL_HEIGHT - 2 * self._metrics.border_size,
                 )
             except Exception:
                 pass
@@ -567,6 +619,12 @@ class ImGuiComboBox:
             self.callback(self.input, value, self)
 
     def destroy(self):
+        try:
+            from ..backends import get_backend
+            from ..gui.dpi import unregister_dpi_participant
+            unregister_dpi_participant(self, get_backend())
+        except Exception:
+            pass
         for item in (
             self._handlers,
             self._input_handlers,
@@ -672,8 +730,32 @@ class QComboBox(QWidget):
         if self._choice_field is not None:
             self._install_choice_input()
 
+    def refreshTheme(self):
+        """Refresh both the combo field and an already-created popup."""
+        if self._legacy is not None:
+            self._legacy.refreshTheme()
+        if self._choice_field is not None:
+            self._choice_field.refreshTheme()
+        if self._choice_popup is not None:
+            self._choice_popup.refreshTheme()
+        refresh = getattr(self, "_refresh_style", None)
+        if callable(refresh):
+            refresh()
+        return True
+
     def _layout_tag(self):
         return self.tag
+
+    def _apply_typography_geometry(self):
+        if self._choice_field is not None:
+            self._choice_field.applyMetrics(self.controlMetrics())
+        self.updateGeometry()
+
+    def _apply_dpi_geometry(self, old_dpi, new_dpi):
+        if self._legacy is not None:
+            self._legacy._dpi_changed(old_dpi, new_dpi)
+        if self._choice_field is not None:
+            self._choice_field.applyMetrics(self.controlMetrics())
 
     def _native_changed(self, sender=None, value=None, user_data=None):
         old = str(self._properties.get("value", ""))
@@ -851,6 +933,27 @@ class QComboBox(QWidget):
     def isEnabled(self):
         return bool(self._properties.get("enabled", True))
 
+    def _choice_anchor_rect(self, screen=False):
+        """Anchor to the painted editor, including its one-pixel field border.
+
+        Reconstructing a child-window position through table cells loses native
+        caption/table offsets. The editor's rendered rect already contains them.
+        """
+        field = self._choice_field
+        try:
+            if screen:
+                from ..gui.placement import item_screen_rect
+                left, top, _, _ = item_screen_rect(self.backend, field.button)
+            else:
+                left, top = self.backend.get_item_rect_min(field.button)
+            width, height = self.backend.get_item_rect_size(field.button)
+            if width <= 0 or height <= 0:
+                return None
+            left, top = float(left) - 1, float(top) - 1
+            return left, top, left + field._width, top + field.height
+        except (AttributeError, KeyError, RuntimeError, TypeError, ValueError):
+            return dpg_window_rect(self.backend, self.tag, clip=True)
+
     def showPopup(self):
         if self._legacy is not None:
             return self._legacy.showPopup()
@@ -858,9 +961,16 @@ class QComboBox(QWidget):
             if not self.isEnabled() or not self._items or not self.isVisible():
                 return False
             from .combo_popup import ComboPopup
+            from ..backends.native_windows import NativeWindowBackend
+            native = NativeWindowBackend(self.backend).isEnabled()
+            # An embedded ImGui child cannot paint above a sibling native edit
+            # HWND (Rich Edit, or any other hosted Windows control). Keep QObject
+            # ownership/modal input with this combo, but give native dropdowns
+            # their own popup surface. Non-native hosts retain embedded choices.
+            popup_parent = None if native else self._choice_popup_parent
             if self._choice_popup is None:
                 self._choice_popup = ComboPopup(backend=self.backend, parent=self,
-                                                parent_window=self._choice_popup_parent)
+                                                parent_window=popup_parent)
                 self._choice_popup.triggered.connect(self._choice_activated)
                 self._choice_popup.cancelled = self._choice_field.focus
                 self._choice_popup.highlighted = self.highlighted.emit
@@ -870,39 +980,36 @@ class QComboBox(QWidget):
             field.syncGeometry()
             popup = self._choice_popup
             popup.configureChoices(self._items, field._width, self._max_visible_items)
-            rect = dpg_window_rect(self.backend, self.tag, clip=True)
+            rect = self._choice_anchor_rect(screen=native and popup_parent is None)
             if rect is None:
                 return False
             left, top, right, bottom = rect
             height = self.backend.get_item_configuration(popup.tag)["height"]
-            # Multi-viewport coordinates are desktop coordinates. Constrain to
-            # the owning viewport, not an assumed (0, 0) desktop origin.
-            from ..backends.native_windows import NativeWindowBackend
-            native = NativeWindowBackend(self.backend).isEnabled()
-            if self._choice_popup_parent is not None:
-                bounds = dpg_window_rect(self.backend, self._choice_popup_parent) or rect
+            # Embedded choices stay within their dialog; native dropdowns use
+            # the owning control's screen anchor and the monitor work area.
+            if popup_parent is not None:
+                bounds = dpg_window_rect(self.backend, popup_parent) or rect
                 available = max(top - bounds[1], bounds[3] - bottom)
-                rows = max(1, int((available - 2) // popup.ROW_HEIGHT))
+                rows = max(1, int((available - 2 * popup.WINDOW_PAD_Y) // popup.ROW_HEIGHT))
                 if rows < min(len(self._items), self._max_visible_items):
                     popup.configureChoices(self._items, field._width, rows)
                     height = self.backend.get_item_configuration(popup.tag)["height"]
-            elif native:
-                owner = self.tag
-                while True:
-                    parent = self.backend.get_item_info(owner).get("parent")
-                    if not parent:
-                        break
-                    owner = parent
-                bounds = dpg_window_rect(self.backend, owner) or rect
-            else:
-                bounds = (0, 0, self.backend.get_viewport_client_width(),
-                          self.backend.get_viewport_client_height())
-            x = max(bounds[0], min(left, bounds[2] - field._width))
-            y = bottom if bottom + height <= bounds[3] else max(bounds[1], top - height)
-            shown = popup.popup()
-            position = ((x - bounds[0], y - bounds[1])
-                        if self._choice_popup_parent is not None else (x, y))
-            self.backend.set_item_pos(popup.tag, tuple(map(int, position)))
+            def live_anchor():
+                if self._deleted or not self.isVisible():
+                    return None
+                from ..gui.placement import visible_item_screen_rect
+                screen_rect = visible_item_screen_rect(self.backend, self.tag)
+                if screen_rect is None:
+                    return None
+                rect = self._choice_anchor_rect(
+                    screen=native and popup_parent is None)
+                if rect is not None:
+                    popup.resizeToAnchor(rect[2] - rect[0])
+                return rect
+            shown = popup.popupBelow(
+                (left, top, right, bottom),
+                global_position=native and popup_parent is None,
+                anchor_provider=live_anchor)
             popup.selectRow(max(0, self.currentIndex()))
             return shown
         try:
@@ -917,7 +1024,7 @@ class QComboBox(QWidget):
             return self._choice_popup.hide()
 
     def setPopupParent(self, parent):
-        """Keep a history popup inside its native/modal dialog's render tree."""
+        """Set the embedded popup host; native hosts use an unclipped popup HWND."""
         self.hidePopup()
         if self._choice_popup is not None:
             self._choice_popup.delete()

@@ -1,6 +1,7 @@
 """Low-overhead UI heartbeat watchdog for long-running WinUx sessions."""
 
 from __future__ import annotations
+from winux_runtime.logging_policy import trim_log_tail
 
 import json
 import os
@@ -10,7 +11,25 @@ import time
 import traceback
 from pathlib import Path
 
+from DearUIQt.core import QObject, QThread, Signal, Qt
+
 from ..diagnostics import get_log_paths, log_event
+
+
+class _UIHangWatchdogWorker(QObject):
+    """QObject worker that owns the watchdog loop on a QThread."""
+
+    def __init__(self, watchdog, thread):
+        super().__init__()
+        self.finished = Signal(self)
+        self._watchdog = watchdog
+        self._thread = thread
+
+    def run(self):
+        try:
+            self._watchdog._loop(self._thread)
+        finally:
+            self.finished.emit()
 
 
 class UIHangWatchdog:
@@ -33,12 +52,19 @@ class UIHangWatchdog:
         self._last_report = 0.0
         self._closed = threading.Event()
         self._providers = {}
-        self._thread = threading.Thread(
-            target=self._loop,
-            name="winux-ui-watchdog",
-            daemon=True,
-        )
-        self._thread.start()
+        self._health_providers = {}
+        self._health_last_report = {}
+        self._health_state = {}
+        thread = QThread(name="winux-ui-watchdog", daemon=True)
+        worker = _UIHangWatchdogWorker(self, thread)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run, receiver=worker)
+        worker.finished.connect(thread.quit, connection_type=Qt.DirectConnection)
+        thread.finished.connect(worker.deleteLater, receiver=worker)
+        thread.finished.connect(thread.deleteLater)
+        self._thread = thread
+        self._worker = worker
+        thread.start()
 
     def beat(self):
         with self._lock:
@@ -54,12 +80,102 @@ class UIHangWatchdog:
         with self._lock:
             self._providers.pop(str(name), None)
 
+    def add_health_provider(self, name, callback, repeat_seconds=60.0,
+                            breach_checks=2, recovery_checks=2):
+        """Register a read-only health snapshot checked by the watchdog thread.
+
+        Providers may return ``threshold_breached`` or
+        ``idle_render_threshold_breached``.  Breaches are rate-limited and only
+        logged; checking them never pumps UI events or forces a render.
+        """
+        if callable(callback):
+            with self._lock:
+                if not hasattr(self, "_health_state"):
+                    self._health_state = {}
+                key = str(name)
+                self._health_providers[key] = (
+                    callback, max(5.0, float(repeat_seconds)),
+                    max(1, int(breach_checks)), max(1, int(recovery_checks)))
+                self._health_state[key] = {
+                    "bad": 0, "good": 0, "latched": False,
+                }
+
+    def remove_health_provider(self, name):
+        with self._lock:
+            key = str(name)
+            self._health_providers.pop(key, None)
+            self._health_last_report.pop(key, None)
+            self._health_state.pop(key, None)
+
+    @staticmethod
+    def _health_breached(value):
+        if not isinstance(value, dict):
+            return False
+        if "threshold_breached" in value:
+            return bool(value.get("threshold_breached"))
+        if "idle_render_threshold_breached" in value:
+            return bool(value.get("idle_render_threshold_breached"))
+        if "within_threshold" in value:
+            return not bool(value.get("within_threshold"))
+        return False
+
+    def _check_health_providers(self, now):
+        with self._lock:
+            providers = tuple(self._health_providers.items())
+            last_reports = dict(self._health_last_report)
+            state_store = getattr(self, "_health_state", {})
+            health_state = {key: dict(value) for key, value in state_store.items()}
+        for name, (provider, repeat_seconds, breach_checks, recovery_checks) in providers:
+            try:
+                value = provider()
+            except Exception:
+                continue
+            breached = self._health_breached(value)
+            state = health_state.get(name, {"bad": 0, "good": 0, "latched": False})
+            if breached:
+                state["bad"] = int(state.get("bad", 0)) + 1
+                state["good"] = 0
+                if state["bad"] >= breach_checks:
+                    state["latched"] = True
+            else:
+                state["good"] = int(state.get("good", 0)) + 1
+                state["bad"] = 0
+                if state["good"] >= recovery_checks:
+                    state["latched"] = False
+            with self._lock:
+                self._health_state[name] = dict(state)
+            if not state.get("latched"):
+                continue
+            if now - float(last_reports.get(name, 0.0) or 0.0) < repeat_seconds:
+                continue
+            with self._lock:
+                self._health_last_report[name] = now
+            try:
+                payload = dict(value) if isinstance(value, dict) else {"value": value}
+                payload["watchdog_hysteresis"] = {
+                    "bad_checks": int(state.get("bad", 0)),
+                    "good_checks": int(state.get("good", 0)),
+                    "breach_checks": int(breach_checks),
+                    "recovery_checks": int(recovery_checks),
+                    "latched": True,
+                }
+                rendered = json.dumps(payload, default=str, sort_keys=True)
+            except Exception:
+                rendered = repr(value)
+            log_event("UI watchdog health threshold breached [{}]: {}".format(
+                name, rendered))
+
     def close(self):
         self._closed.set()
+        thread = self._thread
+        if thread is not None:
+            thread.requestInterruption()
 
-    def _loop(self):
-        while not self._closed.wait(self.check_interval_seconds):
+    def _loop(self, thread):
+        while (not thread.isInterruptionRequested() and
+               not self._closed.wait(self.check_interval_seconds)):
             now = time.monotonic()
+            self._check_health_providers(now)
             with self._lock:
                 stalled_for = now - self._last_beat
                 last_report = self._last_report
@@ -82,16 +198,12 @@ class UIHangWatchdog:
 
         # Cap the diagnostic file without rotating from the potentially hung UI
         # thread. Keep the newest 1 MiB when the file grows beyond 4 MiB.
-        try:
-            if path.exists() and path.stat().st_size > 4 * 1024 * 1024:
-                with path.open("rb") as handle:
-                    handle.seek(max(0, path.stat().st_size - 1024 * 1024))
-                    tail = handle.read()
-                with path.open("wb") as handle:
-                    handle.write(b"[WinUx hang log truncated; recent tail follows]\n")
-                    handle.write(tail)
-        except Exception:
-            pass
+        trim_log_tail(
+            str(path),
+            max_bytes=1024 * 1024,
+            keep_bytes=256 * 1024,
+            marker=b"[WinUx hang log truncated; recent tail follows]\n",
+        )
 
         thread_names = {
             thread.ident: thread.name

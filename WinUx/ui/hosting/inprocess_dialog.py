@@ -40,7 +40,13 @@ def _qt_owner(view):
 def register_inprocess_dialog(view, dialog):
     _registry(view).add(dialog)
     if isinstance(dialog, QObject):
-        owner = _qt_owner(view)
+        # The registry tracks shutdown lifetime; it must not replace an
+        # explicit visual/QObject owner with the application's registry root.
+        # Nested selectors need their launching tool for both modal input and
+        # native activation, not just for cleanup.
+        requested = getattr(dialog, "_requested_parent", None)
+        owner = (requested if isinstance(requested, QObject)
+                 and requested is not dialog and not requested._deleted else _qt_owner(view))
         if dialog.parent is not owner:
             dialog.setParent(owner)
     return dialog

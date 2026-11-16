@@ -20,6 +20,8 @@ import json
 import os
 import zlib
 from pathlib import Path
+
+from winux_runtime.logging_policy import trim_log_tail
 import subprocess
 import sys
 import tempfile
@@ -50,7 +52,9 @@ _SNAPSHOT_COMPRESS_MIN_CHARS = 32 * 1024
 # Server Notepad is a persistent tool rather than a transient QDialog, but its
 # parent-side IPC/stream/reap work still belongs to the shared worker runtime.
 # Do not manufacture reader/stream/timer threads per editor instance.
-_NOTEPAD_IO_POOL = QThreadPool(maxThreadCount=6, maxPending=64, name="notepad-io")
+_NOTEPAD_IO_POOL = QThreadPool.taskLane(
+    "notepad-io", category="server.notepad", owner="ServerNotepadDialog",
+    maxThreadCount=6, maxPending=64)
 
 
 def _detect_eol(text):
@@ -136,13 +140,14 @@ class ServerNotepadDialog:
     # Process lifecycle / IPC
     # ------------------------------------------------------------------
     def _start_process(self):
-        script = Path(__file__).resolve().parents[1] / "services" / "server_notepad_process.py"
+        script = Path(__file__).resolve().parents[1] / "services" / "server_notepad" / "process.py"
         log_dir = Path(tempfile.gettempdir()) / "WinUx" / "logs"
         try:
             log_dir.mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
         self._stderr_path = str(log_dir / "server_notepad.log")
+        trim_log_tail(self._stderr_path, max_bytes=256 * 1024, keep_bytes=64 * 1024)
 
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
         child_env = os.environ.copy()
@@ -171,6 +176,7 @@ class ServerNotepadDialog:
                 childLabel="server-notepad",
             )
             register_child_process(self._process, "server-notepad")
+            self._process.finished.connect(self._on_process_finished)
         except Exception:
             if log_handle is not None:
                 try:
@@ -190,6 +196,34 @@ class ServerNotepadDialog:
         self._startup_started_at = time.monotonic()
         self._arm_startup_watchdog()
 
+
+    def _on_process_finished(self, _exit_code):
+        """Handle child termination from QProcess on the application event loop."""
+        process = self._process
+        unexpected = not self._closed.is_set()
+        self._mark_closed(unexpected=unexpected)
+        if process is not None:
+            try:
+                unregister_child_process(process)
+            except Exception:
+                pass
+
+    @staticmethod
+    def _process_is_running(process):
+        if process is None:
+            return False
+        try:
+            if process.isMonitoring():
+                return process.isRunning()
+        except Exception:
+            pass
+        # Background/test environments without an application scheduler retain
+        # the bounded compatibility probe. UI-owned processes use cached state.
+        try:
+            return process.poll() is None
+        except Exception:
+            return False
+
     def _arm_startup_watchdog(self, timeout=10.0):
         """Fail a half-started child without allocating a timer thread."""
         self._startup_watchdog_generation += 1
@@ -201,7 +235,7 @@ class ServerNotepadDialog:
                 return
             process = self._process
             elapsed = max(0.0, time.monotonic() - self._startup_started_at)
-            if process is None or process.poll() is not None:
+            if process is None or not self._process_is_running(process):
                 detail = "Server Notepad exited before its window became ready."
             else:
                 detail = (
@@ -295,7 +329,7 @@ class ServerNotepadDialog:
             # Normal child exit should release the strong registry reference
             # immediately instead of waiting for the next global registry scan.
             try:
-                if process is not None and process.poll() is not None:
+                if process is not None and not self._process_is_running(process):
                     unregister_child_process(process)
             except Exception:
                 pass
@@ -397,7 +431,7 @@ class ServerNotepadDialog:
     def _write_encoded_locked(self, encoded):
         process = self._process
         if (self._closed.is_set() or process is None or
-                process.poll() is not None or process.stdin is None):
+                not self._process_is_running(process) or process.stdin is None):
             self._closed.set()
             return False
         process.stdin.write(encoded)
@@ -539,7 +573,7 @@ class ServerNotepadDialog:
         return (
             not self._closed.is_set()
             and process is not None
-            and process.poll() is None
+            and self._process_is_running(process)
         )
 
     def queue_open(self, path):
@@ -616,7 +650,7 @@ class ServerNotepadDialog:
         if process is None:
             self._closed.set()
             return
-        if process.poll() is None:
+        if self._process_is_running(process):
             self._send("close")
 
             def terminate_later():

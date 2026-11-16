@@ -2,16 +2,36 @@
 
 from __future__ import annotations
 
+import time
+
 from .backends import dpg
 
 from .gui.palette import QtFusionMetrics, QtFusionPalette
 
 
-TOOLTIP_DELAY = 0.45
+TOOLTIP_DELAY = 0.5
 TOOLTIP_WRAP_WIDTH = 420
 
 _TOOLTIP_THEME = None
 _TOOLTIP_THEME_BACKEND = None
+
+
+class TooltipHoverDelay:
+    """Per-target dwell timer for manually populated/reused tooltip surfaces."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self._target = None
+        self._started = None
+
+    def ready(self, target, *, now=None):
+        now = time.monotonic() if now is None else now
+        if target != self._target or self._started is None:
+            self._target, self._started = target, now
+            return False
+        return now - self._started >= TOOLTIP_DELAY
 
 
 def tooltip_theme(*, backend=None):
@@ -30,8 +50,8 @@ def tooltip_theme(*, backend=None):
             backend.add_theme_color(backend.mvThemeCol_Text, p.TEXT)
             backend.add_theme_color(backend.mvThemeCol_Border, p.TOOLTIP_BORDER)
             backend.add_theme_color(backend.mvThemeCol_Separator, p.BORDER_LIGHT)
-            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 7, 5)
-            backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 5, 3)
+            backend.add_theme_style(backend.mvStyleVar_WindowPadding, 8, 5)
+            backend.add_theme_style(backend.mvStyleVar_ItemSpacing, 4, 2)
             backend.add_theme_style(backend.mvStyleVar_WindowRounding, QtFusionMetrics.POPUP_ROUNDING)
             backend.add_theme_style(backend.mvStyleVar_PopupRounding, QtFusionMetrics.POPUP_ROUNDING)
             backend.add_theme_style(backend.mvStyleVar_WindowBorderSize, 1)
@@ -51,6 +71,13 @@ def add_styled_tooltip(parent, text, *, delay=TOOLTIP_DELAY, backend=None):
     return tag
 
 
+def invalidate_tooltip_theme_cache():
+    """Forget the cached palette resource after a Light/Dark scheme change."""
+    global _TOOLTIP_THEME, _TOOLTIP_THEME_BACKEND
+    _TOOLTIP_THEME = None
+    _TOOLTIP_THEME_BACKEND = None
+
+
 def reset_tooltip_runtime_resources():
     """Forget the theme tag after a Dear PyGui context is destroyed."""
     global _TOOLTIP_THEME, _TOOLTIP_THEME_BACKEND
@@ -61,7 +88,9 @@ def reset_tooltip_runtime_resources():
 __all__ = [
     "TOOLTIP_DELAY",
     "TOOLTIP_WRAP_WIDTH",
+    "TooltipHoverDelay",
     "add_styled_tooltip",
+    "invalidate_tooltip_theme_cache",
     "reset_tooltip_runtime_resources",
     "tooltip_theme",
 ]

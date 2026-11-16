@@ -83,3 +83,5 @@ __all__ = [
     "RendererBackend", "BackendCapabilities", "BackendCapabilityError",
     "backend_capabilities", "require_backend_capability",
 ]
+
+from .native_windows import NativeTopLevelWindow

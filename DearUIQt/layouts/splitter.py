@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from ..core.object import Qt, Signal
-from ..gui.style import bind_theme, splitter_hitbox_theme, splitter_theme
+from ..gui.style import bind_theme, splitter_hitbox_theme, splitter_theme, metrics_for_backend
 from ..widgets.widget import QWidget
 
 
@@ -17,10 +17,14 @@ class QSplitterHandle(QWidget):
     """
 
     def __init__(self, orientation=Qt.Horizontal, *, parent=None, after=None,
-                 backend=None, handle_width=7, line_width=1, visible=True):
+                 backend=None, handle_width=None, line_width=1, visible=True):
         if orientation not in (Qt.Horizontal, Qt.Vertical):
             raise ValueError("splitter handle orientation must be Qt.Horizontal or Qt.Vertical")
         backend, options = self._construction(parent, backend)
+        metrics = metrics_for_backend(backend)
+        self._dpi_auto_handle_width = handle_width is None
+        if handle_width is None:
+            handle_width = metrics.splitter_grab_width
         self._orientation = orientation
         self._handle_width = max(1, int(handle_width))
         self._line_width = max(1, int(line_width))
@@ -47,7 +51,17 @@ class QSplitterHandle(QWidget):
         return self._handle_width
 
     def setHandleWidth(self, width):
+        self._dpi_auto_handle_width = False
         self._handle_width = max(1, int(width))
+
+    def _apply_dpi_geometry(self, _old_dpi, _new_dpi):
+        if self._dpi_auto_handle_width:
+            self._handle_width = max(1, self.controlMetrics().splitter_grab_width)
+
+    def _refresh_style(self, *_args):
+        if self._line_tag is not None:
+            bind_theme(self.backend, self._line_tag, splitter_theme, active=False)
+        bind_theme(self.backend, self.tag, splitter_hitbox_theme)
 
     def lineWidth(self):
         return self._line_width
@@ -107,10 +121,14 @@ class QSplitter(QWidget):
     """
 
     def __init__(self, orientation=Qt.Horizontal, *, parent=None, after=None,
-                 backend=None, handle_width=5):
+                 backend=None, handle_width=None):
         if orientation not in (Qt.Horizontal, Qt.Vertical):
             raise ValueError("splitter orientation must be Qt.Horizontal or Qt.Vertical")
         backend, options = self._construction(parent, backend)
+        metrics = metrics_for_backend(backend)
+        self._dpi_auto_handle_width = handle_width is None
+        if handle_width is None:
+            handle_width = metrics.splitter_handle_width
         tag = backend.add_child_window(
             width=-1, height=-1, border=False,
             no_scrollbar=True, no_scroll_with_mouse=True, **options)
@@ -148,7 +166,16 @@ class QSplitter(QWidget):
         return self._handle_width
 
     def setHandleWidth(self, width):
+        self._dpi_auto_handle_width = False
         width = max(1, int(width))
+        if width != self._handle_width:
+            self._handle_width = width
+            self._layout_children()
+
+    def _apply_dpi_geometry(self, _old_dpi, _new_dpi):
+        if not self._dpi_auto_handle_width:
+            return
+        width = max(1, self.controlMetrics().splitter_handle_width)
         if width != self._handle_width:
             self._handle_width = width
             self._layout_children()

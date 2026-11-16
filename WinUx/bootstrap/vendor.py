@@ -37,13 +37,6 @@ def configure_package_vendor(package_dir=None):
     )
     if vendor_dir and vendor_dir not in sys.path:
         sys.path.insert(0, vendor_dir)
-    from winux_native_runtime import native_runtime_path
-    native = native_runtime_path(os.path.dirname(package_dir))
-    if native:
-        if native in sys.path:
-            sys.path.remove(native)
-        sys.path.insert(0, native)
-
     dll_handles = []
     add_dll_directory = getattr(os, "add_dll_directory", None)
     if vendor_dir and os.name == "nt" and add_dll_directory is not None:

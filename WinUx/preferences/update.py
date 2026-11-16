@@ -7,21 +7,14 @@ so Settings and startup agree on the default repository and legacy migration.
 from __future__ import annotations
 
 from .storage import JsonPreferenceStore
-from winux_update_providers import update_preferences
+from winux_runtime.update.providers import update_preferences
 
 class UpdatePreferences:
-    DEFAULT_PROVIDER = "auto"
+    DEFAULT_PROVIDER = "github"
     DEFAULT_CHANNEL = "stable"
-    DEFAULT_LEGACY_SOURCE = (
-        r"S:\WinUx"
-    )
-    VALID_PROVIDERS = {"auto", "github", "folder"}
+    DEFAULT_LEGACY_SOURCE = ""
+    VALID_PROVIDERS = {"github"}
     VALID_CHANNELS = {"stable", "beta"}
-    LEGACY_DEPRECATION_NOTE = (
-        "S: drive updates are in compatibility mode. Existing users remain supported, "
-        "but new deployments should use public GitHub Releases. S: will move to fallback-only "
-        "and be retired after the migration window."
-    )
     CHANNEL_DESCRIPTIONS = {
         "stable": "Stable installs only non-prerelease GitHub Releases.",
         "beta": "Beta installs the newest semantic version, including GitHub prereleases.",
@@ -61,6 +54,7 @@ class UpdatePreferences:
         # include_credentials is retained as a compatibility no-op; GitHub is public.
         data = self._store.load()
         provider = str(data.get("update_provider", self.DEFAULT_PROVIDER)).strip().lower()
+        # Migrate historical folder/S: settings silently to GitHub-only updates.
         if provider not in self.VALID_PROVIDERS:
             provider = self.DEFAULT_PROVIDER
         channel = str(data.get("update_channel", self.DEFAULT_CHANNEL)).strip().lower()
@@ -76,7 +70,7 @@ class UpdatePreferences:
             "provider": provider,
             "github_repository": repository,
             "channel": channel,
-            "legacy_source": str(data.get("update_source", "") or ""),
+            "legacy_source": "",
         }
         return result
 
@@ -100,11 +94,8 @@ class UpdatePreferences:
             # Persist the opt-out instead of restoring the built-in repository.
             data["github_repository"] = ""
 
-        legacy_source = str(legacy_source or "").strip().strip('"')
-        if legacy_source:
-            data["update_source"] = legacy_source
-        else:
-            # Blank means use the bootstrap's default shared-folder location.
-            data.pop("update_source", None)
+        # S:/shared-folder update settings are obsolete for normal app launches.
+        # Remove stale persisted values so future bootstrap runs never probe them.
+        data.pop("update_source", None)
         self._store.save(data)
         return self.load()

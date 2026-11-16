@@ -22,9 +22,12 @@ from ..gui.palette import QtFusionMetrics, QtFusionPalette
 from ..tooltip import add_styled_tooltip
 from .dock_widget import DockDropPreview
 from .layout_tree import DockLayoutTree
+from .tab_group import QDockTabGroupController
+from .command import QDockCommand
 
 
 class DockManager:
+    _qt_accepts_dock_command_object = True
     """Manage a QMainWindow-like split/tab tree of ``DockWidget`` instances.
 
     A host window may expose one or more shared dock sites around a central view.
@@ -127,6 +130,7 @@ class DockManager:
         self.on_tab_order_changed = on_tab_order_changed
         self._entries: "OrderedDict[str, Dict[str, object]]" = OrderedDict()
         self._layout_tree = DockLayoutTree()
+        self._tab_group_controller = QDockTabGroupController(self)
         # State for docks created after restore_state(), mirroring
         # QMainWindow::restoreDockWidget. Entries are keyed by objectName.
         self._pending_restore: Dict[str, Dict[str, object]] = {}
@@ -464,6 +468,96 @@ class DockManager:
         dock = getattr(window, "dock", None)
         return dock if dock is not None else window
 
+    @classmethod
+    def _window_state_controller(cls, window):
+        dock = cls._dock_interface(window)
+        getter = getattr(dock, "stateController", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter()
+        except Exception:
+            return None
+
+    def dock_topology(self, key):
+        """Return canonical semantic topology metadata for one registered dock."""
+        resolved = self._resolve_key(key)
+        if resolved is None:
+            return None
+        topology = self._layout_tree.topology_for(resolved)
+        entry = self._entries.get(str(resolved)) or {}
+        topology["floating"] = bool(entry.get("floating"))
+        return topology
+
+    dockTopology = dock_topology
+
+    def _sync_window_topology(self, key):
+        key = str(key)
+        entry = self._entries.get(key)
+        if entry is None:
+            return False
+        controller = self._window_state_controller(entry.get("window"))
+        adopter = getattr(controller, "adoptTopology", None) if controller is not None else None
+        if not callable(adopter):
+            return False
+        try:
+            return bool(adopter(self._layout_tree.topology_for(key)))
+        except Exception:
+            return False
+
+    def _sync_all_window_topology(self):
+        changed = False
+        for key in tuple(self._entries):
+            changed = self._sync_window_topology(key) or changed
+        try:
+            changed = bool(self._tab_group_controller.sync()) or changed
+        except Exception:
+            pass
+        return changed
+
+    def tab_group_controller(self):
+        """Return the retained QTabBar-like controller for dock groups."""
+        return self._tab_group_controller
+
+    tabGroupController = tab_group_controller
+
+    def execute_tab_command(self, command, **payload):
+        """Execute one semantic QTabBar/QDockWidget interaction command.
+
+        ``command`` may be a legacy string or the shared :class:`QDockCommand`
+        object used by QMainWindow and native transition diagnostics.
+        """
+        item = QDockCommand.coerce(command, payload, source="tab-manager")
+        command = item.command()
+        payload = item.payload()
+        if command == "activate":
+            return self.raise_dock_widget(payload.get("key"))
+        if command == "move":
+            return self.reorder_dock_widget(
+                payload.get("key"), payload.get("index", 0))
+        if command == "dock":
+            key = payload.get("key")
+            target = payload.get("targetKey")
+            zone = payload.get("zone") or "center"
+            if bool(payload.get("grouped")):
+                return self.dock_group_relative(target, key, zone)
+            return self.dock_relative(target, key, zone)
+        if command == "detach":
+            key = str(payload.get("key"))
+            position = payload.get("position")
+            anchor = payload.get("dragAnchor")
+            if bool(payload.get("grouped")):
+                keys = payload.get("keys")
+                if keys is None:
+                    keys = self._layout_tree.group_keys(key)
+                return self._request_group_tearoff(keys, position, anchor)
+            return self._request_drag_tearoff(key, position, anchor)
+        if command == "cancel":
+            return self.cancel_active_drag()
+        return False
+
+    executeTabCommand = execute_tab_command
+
     def _resolve_key(self, dock_or_key):
         """Resolve a registry key from either the key or a dock/host object."""
         if isinstance(dock_or_key, (str, int)):
@@ -645,6 +739,7 @@ class DockManager:
             self.raise_dock_widget(key)
         else:
             self._ensure_active()
+            self._sync_all_window_topology()
         return key
 
     # Qt-style convenience alias.
@@ -655,12 +750,20 @@ class DockManager:
         entry = self._entries.pop(key, None)
         if entry is None:
             return False
+        controller = self._window_state_controller(entry.get("window"))
+        clear = getattr(controller, "clearTopology", None) if controller is not None else None
+        if callable(clear):
+            try:
+                clear()
+            except Exception:
+                pass
         self._layout_tree.remove(key)
         if self._active_key == key:
             self._active_key = None
         self._tabs_dirty = True
         self._last_layout_size = (0, 0)
         self._ensure_active(notify=True)
+        self._sync_all_window_topology()
         return True
 
     unregister_dock = remove_dock_widget
@@ -717,12 +820,14 @@ class DockManager:
                 self.raise_dock_widget(key)
             else:
                 self._ensure_active(notify=True)
+            self._sync_all_window_topology()
             return True
         setter = getattr(window, "setVisible", None)
         if callable(setter):
             setter(True)
         self.set_floating(key, False)
         self.raise_dock_widget(key)
+        self._sync_all_window_topology()
         return True
 
     restoreDockWidget = restore_dock_widget
@@ -771,6 +876,7 @@ class DockManager:
                     self.tab_position = self._tab_positions.get(area, self.tab_position)
                     self._tabs_dirty = True
                     self._last_layout_size = (0, 0)
+                    self._sync_all_window_topology()
                     return changed or bool(targets)
 
         changed = False
@@ -795,6 +901,7 @@ class DockManager:
             self.tab_position = self._tab_positions.get(area, self.tab_position)
         self._tabs_dirty = True
         self._last_layout_size = (0, 0)
+        self._sync_all_window_topology()
         return changed or any(
             self._normalize_area(self._entries[target].get("area")) == area
             for target in targets if target in self._entries)
@@ -821,6 +928,7 @@ class DockManager:
         self._tabs_dirty = True
         self._last_layout_size = (0, 0)
         self.raise_dock_widget(second)
+        self._sync_all_window_topology()
         return True
 
     tabifyDockWidget = tabify_dock_widget
@@ -859,6 +967,7 @@ class DockManager:
         self._tabs_dirty = True
         self._last_layout_size = (0, 0)
         self._notify_active_changed()
+        self._sync_all_window_topology()
         return True
 
     splitDockWidget = split_dock_widget
@@ -905,6 +1014,7 @@ class DockManager:
         self._tabs_dirty = True
         self._last_layout_size = (0, 0)
         self._notify_active_changed()
+        self._sync_all_window_topology()
         return True
 
     dockRelative = dock_relative
@@ -958,6 +1068,7 @@ class DockManager:
         self._tabs_dirty = True
         self._last_layout_size = (0, 0)
         self._notify_active_changed()
+        self._sync_all_window_topology()
         return True
 
     dockGroupRelative = dock_group_relative
@@ -984,7 +1095,12 @@ class DockManager:
         if entry is None:
             return False
         floating = bool(floating)
+        changed = bool(entry.get("floating")) != floating
         entry["floating"] = floating
+        # DockManager owns topology while QDockWidgetStateController owns the
+        # retained logical top-level state.  Keep both synchronized even when
+        # callers use DockManager directly instead of QMainWindow's facade.
+        self._apply_window_floating(entry.get("window"), floating)
         if floating and self._active_key == key:
             self._active_key = None
         self._tabs_dirty = True
@@ -993,6 +1109,7 @@ class DockManager:
             self.raise_dock_widget(key)
         else:
             self._ensure_active(notify=True)
+            self._sync_all_window_topology()
         return True
 
     def raise_dock_widget(self, key):
@@ -1015,6 +1132,7 @@ class DockManager:
         self._last_layout_size = (0, 0)
         if changed:
             self._notify_active_changed()
+        self._sync_all_window_topology()
         return True
 
     activate = raise_dock_widget
@@ -1112,7 +1230,7 @@ class DockManager:
             # The button click generated by the mouse release belongs to a tab
             # drag/reorder/tear-off gesture, not to a second activation.
             return
-        self.raise_dock_widget(key)
+        self._tab_group_controller.activateTab(key)
         # Apply immediately so the newly selected dock appears in the same UI
         # turn instead of waiting for the next viewport resize/layout cycle.
         width, height = self._last_layout_size
@@ -1126,14 +1244,13 @@ class DockManager:
 
     def tab_order(self):
         """Return visible QTabBar order for the globally active dock group."""
+        self._tab_group_controller.sync()
         active = self._active_key
-        group = self._layout_tree.group_keys(active) if active is not None else ()
-        if not group:
-            return self.visible_docked_keys()
-        return tuple(
-            key for key in group if key in self._entries
-            and not bool(self._entries[key].get("floating"))
-            and self._window_requested_visible(self._entries[key].get("window")))
+        if active is not None:
+            visible = self._tab_group_controller.visibleTabs(active)
+            if visible:
+                return visible
+        return self.visible_docked_keys()
 
     def reorder_dock_widget(self, key, index):
         """Move one tab within its current tabified dock group."""
@@ -1179,6 +1296,7 @@ class DockManager:
         callback = self.on_tab_order_changed
         if callable(callback):
             callback(tuple(self._layout_tree.group_keys(key)))
+        self._sync_all_window_topology()
         return True
 
     move_tab = reorder_dock_widget
@@ -1752,8 +1870,10 @@ class DockManager:
             return (40.0, 10.0)
         try:
             hx, hy = map(float, dpg.get_item_rect_min(handle))
+            hw, _ = map(float, dpg.get_item_rect_size(handle))
             return (max(0.0, float(mouse[0]) - hx),
-                    max(0.0, float(mouse[1]) - hy))
+                    max(0.0, float(mouse[1]) - hy),
+                    max(1.0, hw))
         except Exception:
             return (40.0, 10.0)
 
@@ -1785,7 +1905,7 @@ class DockManager:
         self._title_drag_grouped = grouped
         self._title_drag_outside = False
         self._title_drag_started = True
-        self.raise_dock_widget(self._title_drag_key)
+        self._tab_group_controller.activateTab(self._title_drag_key)
         return True
 
     def _reset_title_drag(self, *, release_capture=True):
@@ -1847,17 +1967,23 @@ class DockManager:
             return False
         accepted = True
         for index, key in enumerate(keys):
-            anchor = (float(drag_anchor[0]) + 12.0 * index,
-                      float(drag_anchor[1]) + 12.0 * index)
+            if isinstance(drag_anchor, (tuple, list)) and len(drag_anchor) >= 3:
+                anchor = (float(drag_anchor[0]) + 12.0 * index,
+                          float(drag_anchor[1]) + 12.0 * index,
+                          float(drag_anchor[2]))
+            else:
+                anchor = (float(drag_anchor[0]) + 12.0 * index,
+                          float(drag_anchor[1]) + 12.0 * index)
             if not self._request_drag_tearoff(key, mouse, anchor):
                 accepted = False
         return accepted
 
     def _tearoff_title_drag(self, key, mouse):
-        """Detach one title-dragged dock, preserving the pointer anchor."""
+        """Detach one title-dragged dock through the semantic command path."""
         drag_anchor = self._title_drag_anchor(key, mouse)
         self._reset_title_drag()
-        return self._request_drag_tearoff(key, mouse, drag_anchor)
+        return self._tab_group_controller.detachTab(
+            key, mouse, drag_anchor, grouped=False)
 
     def _update_title_interaction(self, down, mouse, pressed_now):
         """Drive QDockWidget-title dragging, including GroupedDragging."""
@@ -1902,24 +2028,21 @@ class DockManager:
                 else dict(self._tab_drop_target))
             self._reset_title_drag()
             if drop_target is not None:
-                if grouped:
-                    self.dock_group_relative(
-                        drop_target.get("target_key"), key,
-                        drop_target.get("zone") or "center")
-                else:
-                    self.dock_relative(
-                        drop_target.get("target_key"), key,
-                        drop_target.get("zone") or "center")
+                self._tab_group_controller.dockTab(
+                    key, drop_target.get("target_key"),
+                    drop_target.get("zone") or "center", grouped=grouped)
                 width, height = previous_layout_size
                 if width > 0 and height > 0:
                     self.layout(width, height, force=True)
             elif outside:
                 entry = self._entries.get(str(key))
                 if grouped:
-                    self._request_group_tearoff(group_keys, mouse, drag_anchor)
+                    self._tab_group_controller.detachTab(
+                        key, mouse, drag_anchor, grouped=True, keys=group_keys)
                 elif (entry is not None
                         and self._window_user_floatable(entry.get("window"))):
-                    self._request_drag_tearoff(key, mouse, drag_anchor)
+                    self._tab_group_controller.detachTab(
+                        key, mouse, drag_anchor, grouped=False)
             return True
 
         if not down and self._title_press_key is not None:
@@ -1939,20 +2062,33 @@ class DockManager:
         self._tab_drag_outside = False
         self._tab_drag_insert_index = self._tab_insert_index_at(
             mouse, self._tab_drag_key)
+        try:
+            self._tab_group_controller.sync()
+            self._tab_group_controller.beginDrag(
+                self._tab_drag_key, mouse,
+                grouped=bool(self._dock_options & self.GroupedDragging))
+            self._tab_group_controller.updateDrag(
+                mouse, self._tab_drag_insert_index, outside=False)
+        except Exception:
+            pass
         self._suppress_click_key = self._tab_drag_key
         self._suppress_click_until_frame = self._frame_count() + 3
         acquire_pointer_input(self._tab_drag_owner)
-        self.raise_dock_widget(self._tab_drag_key)
+        self._tab_group_controller.activateTab(self._tab_drag_key)
         if self._tab_drag_insert_index is not None:
             self._show_insert_marker(
                 self._tab_drag_insert_index, self._tab_drag_key)
         return True
 
-    def _reset_tab_drag(self, *, release_capture=True):
+    def _reset_tab_drag(self, *, release_capture=True, result="completed"):
         if release_capture:
             release_pointer_input(self._tab_drag_owner)
         self._clear_tab_drop_target()
         self._hide_insert_marker()
+        try:
+            self._tab_group_controller.endDrag(result)
+        except Exception:
+            pass
         self._tab_press_key = None
         self._tab_press_pos = None
         self._tab_drag_key = None
@@ -1971,7 +2107,7 @@ class DockManager:
             cancelled = True
         if self._tab_drag_started or self._tab_press_key is not None:
             key = self._tab_drag_key or self._tab_press_key
-            self._reset_tab_drag()
+            self._reset_tab_drag(result="cancelled")
             if key is not None:
                 self._suppress_click_key = str(key)
                 self._suppress_click_until_frame = self._frame_count() + 3
@@ -2083,6 +2219,12 @@ class DockManager:
                 if index is not None:
                     self._tab_drag_insert_index = index
                     self._show_insert_marker(index, self._tab_drag_key)
+            try:
+                self._tab_group_controller.updateDrag(
+                    mouse, self._tab_drag_insert_index,
+                    outside=self._tab_drag_outside)
+            except Exception:
+                pass
 
         if (not down and self._tab_mouse_was_down
                 and self._tab_drag_started and self._tab_drag_key is not None):
@@ -2098,6 +2240,8 @@ class DockManager:
                 drag_anchor = (
                     max(0.0, mouse[0] - button_rect[0]),
                     max(0.0, mouse[1] - button_rect[1]),
+                    max(1.0, float(button_rect[2])),
+                    max(1.0, float(button_rect[3])),
                 )
             else:
                 drag_anchor = (40.0, 10.0)
@@ -2105,16 +2249,17 @@ class DockManager:
             self._suppress_click_key = key
             self._suppress_click_until_frame = frame + 2
             if drop_target is not None:
-                self.dock_relative(
-                    drop_target.get("target_key"), key,
-                    drop_target.get("zone") or "center")
+                self._tab_group_controller.dockTab(
+                    key, drop_target.get("target_key"),
+                    drop_target.get("zone") or "center", grouped=False)
                 width, height = previous_layout_size
                 if width > 0 and height > 0:
                     self.layout(width, height, force=True)
             elif outside:
-                self._request_drag_tearoff(key, mouse, drag_anchor)
+                self._tab_group_controller.detachTab(
+                    key, mouse, drag_anchor, grouped=False)
             elif index is not None:
-                self.reorder_dock_widget(key, index)
+                self._tab_group_controller.moveTab(key, index)
                 width, height = self._last_layout_size
                 if width > 0 and height > 0:
                     self.layout(width, height, force=True)
@@ -2174,6 +2319,10 @@ class DockManager:
         return view
 
     def _rebuild_tabs(self, width):
+        try:
+            self._tab_group_controller.sync()
+        except Exception:
+            pass
         """Compatibility helper rebuilding the active dock's tab group."""
         active = self._active_key or self._ensure_active()
         keys = self._layout_tree.group_keys(active) if active is not None else ()
@@ -2201,21 +2350,14 @@ class DockManager:
         self._last_layout_groups = tuple(dict(group) for group in groups)
         self._sync_split_handle_views(details["handles"])
 
-        # Start hidden; each visible layout leaf re-enables exactly one dock
-        # per tab group. Split siblings remain visible simultaneously.
-        for key, entry in self._entries.items():
-            if bool(entry.get("floating")):
-                continue
-            window = entry.get("window")
-            root = getattr(window, "root", None)
-            if root is None or not dpg.does_item_exist(root):
-                continue
-            dpg.configure_item(root, show=False)
-            effective = getattr(window, "_set_effective_visibility", None)
-            if callable(effective):
-                effective(False)
-
+        # Do not pessimistically hide every dock before revealing the active
+        # leaves.  That old two-pass approach produced hide->show churn, emitted
+        # visibilityChanged twice for still-active docks, and forced Dear PyGui
+        # to invalidate the same subtree repeatedly during dock/undock.  Resolve
+        # the desired state once and only touch visibility when it actually
+        # changes.
         used_tab_groups = set()
+        laid_out_keys = set()
         current_tab_position = self.tabPosition(self.dock_area)
         self.tab_position = current_tab_position
         for group in groups:
@@ -2255,12 +2397,15 @@ class DockManager:
                 root = getattr(window, "root", None)
                 if root is None or not dpg.does_item_exist(root):
                     continue
+                laid_out_keys.add(key)
                 requested_visible = self._window_requested_visible(window)
                 is_active = bool(key == active and requested_visible)
-                dpg.configure_item(root, show=is_active)
-                effective = getattr(window, "_set_effective_visibility", None)
-                if callable(effective):
-                    effective(is_active)
+                previous_effective = getattr(window, "_effective_visible", None)
+                if previous_effective is None or bool(previous_effective) != is_active:
+                    dpg.configure_item(root, show=is_active)
+                    effective = getattr(window, "_set_effective_visibility", None)
+                    if callable(effective):
+                        effective(is_active)
                 if not is_active:
                     continue
                 dpg.configure_item(
@@ -2268,6 +2413,22 @@ class DockManager:
                 resize = getattr(window, "resize", None)
                 if callable(resize):
                     resize(gw, content_h)
+
+        # Requested-hidden docks are not part of layout_details(). Make sure a
+        # dock that was visible in the previous topology is hidden exactly once.
+        for key, entry in self._entries.items():
+            if key in laid_out_keys or bool(entry.get("floating")):
+                continue
+            window = entry.get("window")
+            root = getattr(window, "root", None)
+            if root is None or not dpg.does_item_exist(root):
+                continue
+            previous_effective = getattr(window, "_effective_visible", None)
+            if previous_effective is None or bool(previous_effective):
+                dpg.configure_item(root, show=False)
+                effective = getattr(window, "_set_effective_visibility", None)
+                if callable(effective):
+                    effective(False)
 
         self._hide_unused_tab_views(used_tab_groups)
         self._tabs_dirty = False
@@ -2449,6 +2610,7 @@ class DockManager:
         self._ensure_active(notify=True)
         self._tabs_dirty = True
         self._last_layout_size = (0, 0)
+        self._sync_all_window_topology()
         return True
 
     # QMainWindow spelling for callers that deliberately use the Qt API
